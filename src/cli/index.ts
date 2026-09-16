@@ -20,7 +20,7 @@ import { makeModel } from '../agent/llm.js'
 import { cmdTranslateItem, tryAutoTranslateCfg, makeDaemonTranslateRunItem } from './translateItemCommand.js'
 import { makeRealFetchSourceSub } from './fetchSourceSub.js'
 import {
-  checkAssrt, checkOpenSubtitles, checkZimuku, checkLlm, checkTmdb, checkMediaRoots,
+  checkAssrt, checkOpenSubtitles, checkZimuku, checkLlm, checkTmdb, checkMediaRoots, checkStagingHusks,
   checkDatabase, checkStuckJobs, checkMountCapabilities, checkJimaku, checkR3sub, checkSubdl, checkSubhd,
   formatDoctorReport, overallOk, withTimeout, relevantSourceForDoctor, type DoctorResult,
 } from './doctor.js'
@@ -956,6 +956,9 @@ async function cmdDoctor() {
     }
   }
   results.push(checkMediaRoots(mediaRootsForDoctor, isDirWritable, mediaRootsSource))
+  // 与上一行同源（DB media_roots 表优先、env 种子兜底）：报告里的"沙盒残留"查的必须是
+  // 当前真正生效的那份清单，否则用户会在一个没在用的根上看到 0 条残留而误以为健康。
+  results.push(checkStagingHusks(mediaRootsForDoctor))
 
   {
     // R2D-11 同源修正:挂载能力也探"真正生效的" DB 根(mediaRootsForDoctor),而不是 env 种子 roots

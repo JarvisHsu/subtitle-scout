@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { join } from 'node:path'
 import { openDb } from './db.js'
 import {
   runSubtitleWorkDir, buildSubtitleTask, listSubtitleQueue, subtitleJobId,
@@ -839,7 +840,7 @@ describe('C15 对称性：电影与剧集在同一失败下计数行为一致', 
    *  真拿到 null 的那天说明 buildSubtitleTask 对已识别作品也不发身份了，那是个该当场
    *  失败的回归，不该被一个静默的类型断言吞掉。 */
   const realItemId = (it: SubtitleQueueItem, fileIndex = 0): string => {
-    const id = buildSubtitleTask(it, 'zh').targets[fileIndex].itemId
+    const id = buildSubtitleTask(it, 'zh', []).targets[fileIndex].itemId
     expect(id).not.toBeNull()
     return id!
   }
@@ -1105,5 +1106,63 @@ describe('translate_after_attempts（翻译触发阈值可配 · registry 待办
     expect(clampTranslateAfterAttempts('100')).toBe(7)
     expect(clampTranslateAfterAttempts('1')).toBe(1)
     expect(clampTranslateAfterAttempts('30')).toBe(30)
+  })
+})
+
+describe('buildSubtitleTask — stagingRoot 接线（沙盒必须挂在配置媒体根一级）', () => {
+  // 独立 describe：C15 那组的 db fixture 与 mediaRoots 无关。fixture 必须补齐
+  // SubtitleQueueItem 的**全部**字段（recheckAfter / subRecheckAt 也在内），否则
+  // 缺字段会被 tsc 当场报出来。
+  const mkItemAt = (dir: string, season: number | null = null, episode: number | null = null): SubtitleQueueItem => ({
+    workId: 'tmdb:603',
+    title: 'The Matrix',
+    originalTitle: null,
+    year: 1999,
+    overview: null,
+    chineseTitles: [],
+    mediaType: season == null ? 'movie' : 'tv',
+    backdropPath: null,
+    files: [{
+      path: join(dir, 'The.Matrix.1999.mkv'),
+      filename: 'The.Matrix.1999.mkv',
+      season, episode,
+      dir,
+      durationSec: null,
+      embeddedLangs: null,
+      recheckAfter: null,
+      subRecheckAt: null,
+    }],
+  })
+
+  it('媒体根命中时 stagingRoot = 命中根（不是 INNER 沙盒根 mediaRoot）', () => {
+    const item = mkItemAt('/media/Show')
+    const task = buildSubtitleTask(item, 'zh', ['/media'])
+    expect(task.mediaRoot).toBe('/media/Show')   // INNER 根：装机收窄用
+    expect(task.stagingRoot).toBe('/media')      // OUTER 根：沙盒挂这一级
+  })
+
+  it('🔴 mediaRoots 为空时 stagingRoot 键**缺席**（且不打误导性错误日志）', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const task = buildSubtitleTask(mkItemAt('/media/Show'), 'zh', [])
+    expect('stagingRoot' in task).toBe(false)
+    expect(spy).not.toHaveBeenCalled()
+    spy.mockRestore()
+  })
+
+  it('嵌套配置根时取最长命中', () => {
+    expect(buildSubtitleTask(mkItemAt('/media/TV/Show'), 'zh', ['/media', '/media/TV']).stagingRoot).toBe('/media/TV')
+  })
+
+  it('媒体根非空但一个都不命中 → 退化为 mediaRoot 且有告警（真正意外的情形）', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const task = buildSubtitleTask(mkItemAt('/elsewhere/Show'), 'zh', ['/media'])
+    expect(task.stagingRoot).toBe('/elsewhere/Show')
+    expect(spy).toHaveBeenCalled()
+    spy.mockRestore()
+  })
+
+  it('jobId 与 in-flight 集合登记的目录名同源（字节一致）', () => {
+    const task = buildSubtitleTask(mkItemAt('/media/Show', 1, 1), 'zh', ['/media'])
+    expect(task.jobId).toBe(subtitleJobId('tmdb:603'))
   })
 })

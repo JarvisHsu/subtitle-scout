@@ -1,6 +1,7 @@
 import { MIGRATIONS } from '../v2/db.js'
 import { sourcesForLanguages, type SourceId } from '../core/sourceRegistry.js'
 import type { MountCapabilities } from '../files/mountCapabilities.js'
+import { findStagingHusks } from '../files/stagingSandbox.js'
 
 export interface DoctorResult {
   name: string
@@ -229,6 +230,54 @@ export function checkMediaRoots(
     }
   }
   return { name: 'media-roots', ok: true, detail: `${roots.length} 个媒体根目录全部可写${sourceSuffix}` }
+}
+
+/** 报告样例上限：残留可能是几十上百条，报告里列全了会把其余检查项挤出屏幕。 */
+const MAX_LISTED_HUSKS = 5
+
+/** 只读检查：媒体根下**任意深度**的空壳沙盒（只剩一个 `.ignore` 标记的
+ *  `.subtitle-staging` / `.subtitle-translate` 目录）。这些是任务收尾没做干净、或历史版本
+ *  遗留的净残留——用户看到的"视频目录里多了个隐藏文件夹"就是它。
+ *
+ *  **绝不删除**（design D5）：删除的时机与并发保护（bootTime、10 分钟活性窗口、单实例前提）
+ *  是 files/stagingSandbox.gcOrphans 的契约，而 doctor 在有别的进程正在跑的时候被调用是常态
+ *  （用户排障时第一件事就是跑它），不具备那些前提。修复动作就是"重启 watch"——boot GC 会收干净。
+ *
+ *  空 roots 按既有惯例返回 skip（同 checkMediaRoots 的空值口径）：没有媒体根就没有沙盒，
+ *  这不是"检查通过"也不是"检查失败"。
+ *
+ *  @param find 遍历实现的可测接缝（doctor.ts 的既有惯例，同 checkMediaRoots 的 isWritable）。
+ *              生产省略 = files/stagingSandbox.ts 的 findStagingHusks。 */
+export function checkStagingHusks(
+  roots: string[], find: (roots: string[]) => string[] = findStagingHusks,
+): DoctorResult {
+  if (roots.length === 0) {
+    return {
+      name: 'staging-husks', ok: true, skip: true,
+      detail: 'MEDIA_ROOTS 未配置，跳过（无媒体根则无沙盒）',
+    }
+  }
+  let husks: string[]
+  try {
+    husks = find(roots)
+  } catch (e) {
+    return {
+      name: 'staging-husks', ok: false, detail: `遍历媒体根失败：${String(e)}`,
+      hint: '通常是挂载不可达或权限不足；确认媒体根可读后重跑 doctor。',
+    }
+  }
+  if (husks.length === 0) {
+    return { name: 'staging-husks', ok: true, detail: `${roots.length} 个媒体根下没有沙盒残留` }
+  }
+  const sample = husks.slice(0, MAX_LISTED_HUSKS)
+  const more = husks.length > sample.length ? `（另有 ${husks.length - sample.length} 个未列出）` : ''
+  return {
+    name: 'staging-husks', ok: false,
+    detail: `发现 ${husks.length} 个沙盒残留（只剩 .ignore 标记的空目录，不是你的文件）：` +
+      `${sample.join('、')}${more}`,
+    hint: '重启 watch：启动回收（gcOrphans）会清掉它们。若正在跑翻译/字幕任务，先等它跑完再重启，' +
+      '以免中断在飞行中的工作台。',
+  }
 }
 
 export function formatDoctorReport(results: DoctorResult[]): string {

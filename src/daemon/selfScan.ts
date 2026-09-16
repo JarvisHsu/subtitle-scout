@@ -1,5 +1,6 @@
 import { readdirSync, type Dirent } from 'node:fs'
 import { join, extname } from 'node:path'
+import { isJunkDirName } from '../core/mediaContext.js'
 
 /**
  * B1: self-hosted periodic filesystem scan + diff detection.
@@ -9,7 +10,7 @@ import { join, extname } from 'node:path'
  * 类型——去 Jellyfin 化 T4 把它的唯一生产调用点（daemon.ts 的 B2 self-scan refresh-bridge）
  * 折叠进了 v2/ingest.ts 的统一 ingest 心跳（daemon.ts 头注释："机械 scan()...+ B2 self-scan
  * refresh-bridge 两条独立分支"已删除），production 自此零调用点，随死器官处决整体删除。
- * 本文件仍导出的 walkVideoFiles/isVideoFile（内部）/isJunkDir（内部）/
+ * 本文件仍导出的 walkVideoFiles/isVideoFile（内部）/
  * SELF_SCAN_DEFAULT_INTERVAL_MS 是活体——v2/ingest.ts、v2/realignLibraryPort.ts、
  * v2/daemonV2.ts 仍在用同一份遍历实现（走盘）。至于那个心跳间隔常量：第 7 步 B 组删掉
  * v2/daemon.ts 与 cli/index.ts 的 ingestEveryMs 之后，它已无生产消费者——详见常量自身的
@@ -34,27 +35,15 @@ function isVideoFile(path: string): boolean {
 }
 
 /**
- * Directory names the walk must never descend into:
- *  - dot-dirs (`.`-prefixed) — matches the convention src/files/orphanScanner.ts (`name.startsWith('.')`)
- *    used to establish before that module was deleted in the R-6 dead-organ purge; covers this
- *    codebase's own `.subtitle-staging/` and `.realign-build/` housekeeping dirs along with
- *    anything else hidden.
- *  - `@`-prefixed dirs — covers Synology-style `@eaDir` per-directory thumbnail caches and similar
- *    NAS vendor housekeeping junk that isn't dot-prefixed but is exactly the same kind of "not
- *    actually part of the library" noise.
- * Nothing in this codebase currently exports an equivalent junk-dir predicate to reuse, so this is
- * a fresh, self-scan-local helper.
- */
-function isJunkDir(name: string): boolean {
-  return name.startsWith('.') || name.startsWith('@') || name.startsWith('#')
-}
-
-/**
  * Default recursive walker: plain node:fs, no dependency. Same "skip and warn on unreadable
  * subtree rather than abort the whole pass" behavior as scripts/live-recognize.ts's walk(), plus
- * the isJunkDir exclusion that script doesn't need (a one-shot evidence run over an
+ * the isJunkDirName exclusion that script doesn't need (a one-shot evidence run over an
  * operator-chosen root doesn't loop back over its own daemon-created staging/build dirs forever;
  * a recurring self-scan tick would, without this).
+ *
+ * 2026-09-16 整合：垃圾目录判据原先在本文件内私有（isJunkDir），现已提到 core/mediaContext.ts
+ * 的 isJunkDirName —— stagingSandbox 的 findStagingHusks 需要同一个剪枝谓词，而它对
+ * `daemon/` 有依赖禁忌（见 patches §0 分层实测）。判据逐字等价，本文件不再保留副本。
  *
  * Exported (去 Jellyfin 化 P3, design §P3) so v2/ingest.ts's `makeIngestPass` and
  * v2/realignLibraryPort.ts can reuse the exact same walk — one filesystem-walking implementation,
@@ -76,7 +65,7 @@ function walk(dir: string, out: string[]): void {
     return
   }
   for (const entry of entries) {
-    if (isJunkDir(entry.name)) continue
+    if (isJunkDirName(entry.name)) continue
     const full = join(dir, entry.name)
     if (entry.isDirectory()) {
       walk(full, out)

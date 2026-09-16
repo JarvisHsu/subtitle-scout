@@ -183,8 +183,13 @@ export function assertDirSafe(dir: string, roots: string[]): void {
  *  未配置 MEDIA_ROOTS 的开发态/测试态，此时 isUnderRoots 自己也把"空=不限制"当特例，containingRoot
  *  在这种输入下必然返回 null）——安全退化为 dir 本身并 console.error 告警：这批任务的 staging
  *  目录不再受 gcOrphans 保护，但不阻塞派发（宁可退化保护，不阻塞主流程）。
- *  Exported (Task 12): the unidentified-scope runner derives its stagingRoot identically. */
-export function stagingRootFor(dir: string, roots: string[], jobId: number): string {
+ *  Exported (Task 12): the unidentified-scope runner derives its stagingRoot identically.
+ *
+ *  2026-09-16：jobId 放宽为 `number | string`——它只出现在下面那条告警文案里。字幕巡检路径
+ *  （v2/subtitleScheduler.ts 的 buildSubtitleTask）的 jobId 是 `subtitle:${workId}` 这样的
+ *  字符串（见该函数与 subtitleJobId 的注释），而 jobs 表那两条路径传的是自增整数 id。
+ *  放开的是"能打印什么"，不是判据——三条既有调用点的类型检查结果不变。 */
+export function stagingRootFor(dir: string, roots: string[], jobId: number | string): string {
   const root = containingRoot(dir, roots)
   if (!root) {
     console.error(

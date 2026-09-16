@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
-import { checkAssrt, checkOpenSubtitles, checkZimuku, checkJimaku, checkR3sub, checkSubdl, checkSubhd, checkLlm, checkTmdb, checkMediaRoots, formatDoctorReport, overallOk, withTimeout, checkDatabase, checkStuckJobs, checkMountCapabilities, relevantSourceForDoctor } from './doctor.js'
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { checkAssrt, checkOpenSubtitles, checkZimuku, checkJimaku, checkR3sub, checkSubdl, checkSubhd, checkLlm, checkTmdb, checkMediaRoots, checkStagingHusks, formatDoctorReport, overallOk, withTimeout, checkDatabase, checkStuckJobs, checkMountCapabilities, relevantSourceForDoctor } from './doctor.js'
 import { MIGRATIONS } from '../v2/db.js'
 
 describe('doctor 远端三项', () => {
@@ -140,6 +143,52 @@ describe('doctor 本地两项', () => {
   it('skip 分支与失败分支同样带上 source 标注', () => {
     expect(checkMediaRoots([], () => true, 'db').detail).toContain('db')
     expect(checkMediaRoots(['/ro'], () => false, 'env seed').detail).toContain('env seed')
+  })
+})
+
+describe('checkStagingHusks', () => {
+  it('roots 为空 → skip（不算失败，同 checkMediaRoots 口径）', () => {
+    const r = checkStagingHusks([], () => ['/should/never/be/used'])
+    expect(r).toMatchObject({ name: 'staging-husks', ok: true, skip: true })
+  })
+
+  it('无空壳 → ✓', () => {
+    const r = checkStagingHusks(['/a', '/b'], () => [])
+    expect(r).toMatchObject({ name: 'staging-husks', ok: true })
+    expect(r.detail).toContain('2 个媒体根')
+    expect(r.skip).toBeUndefined()
+  })
+
+  it('有空壳 → ✗，详情里带条数与样例路径', () => {
+    const r = checkStagingHusks(['/a'], () => ['/a/Show/.subtitle-staging'])
+    expect(r).toMatchObject({ name: 'staging-husks', ok: false })
+    expect(r.detail).toContain('1 个沙盒残留')
+    expect(r.detail).toContain('/a/Show/.subtitle-staging')
+    expect(r.hint).toContain('重启 watch')
+  })
+
+  it('样例超过上限时只列前 5 条并注明剩余数量', () => {
+    const husks = Array.from({ length: 8 }, (_, i) => `/a/d${i}/.subtitle-staging`)
+    const r = checkStagingHusks(['/a'], () => husks)
+    expect(r.detail).toContain('8 个沙盒残留')
+    expect(r.detail).toContain('/a/d4/.subtitle-staging')
+    expect(r.detail).not.toContain('/a/d5/.subtitle-staging')
+    expect(r.detail).toContain('另有 3 个未列出')
+  })
+
+  it('遍历抛错 → ✗ 而不是让 doctor 整体崩掉', () => {
+    const r = checkStagingHusks(['/a'], () => { throw new Error('mount gone') })
+    expect(r).toMatchObject({ name: 'staging-husks', ok: false })
+    expect(r.detail).toContain('mount gone')
+  })
+
+  it('真接缝：默认参数就是 findStagingHusks（空目录 → ✓），不是 stub', () => {
+    const root = mkdtempSync(join(tmpdir(), 'doctor-husk-'))
+    expect(checkStagingHusks([root])).toMatchObject({ ok: true })
+    mkdirSync(join(root, '.subtitle-staging'), { recursive: true })
+    writeFileSync(join(root, '.subtitle-staging', '.ignore'),
+      'subtitle-scout staging area — media servers should not scan this directory\n')
+    expect(checkStagingHusks([root])).toMatchObject({ ok: false })
   })
 })
 

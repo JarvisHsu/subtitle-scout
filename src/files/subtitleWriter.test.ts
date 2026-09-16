@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname, basename } from 'node:path'
 import AdmZip from 'adm-zip'
 import { loadSevenZip } from './sevenZip.js'
 import * as iconv from 'iconv-lite'
@@ -92,6 +92,25 @@ describe('writeSubtitle', () => {
     expect(r.path).toBe(join(dir, 'The.Matrix.1999.1080p.BluRay.x264.zh-Hans.srt'))
     expect(existsSync(r.path)).toBe(true)
     expect(r.encoding).toBe('utf-8')
+  })
+
+  it('🔴 安装不在视频目录里新建任何子目录（用户问题三：字幕与视频同目录，不生成子目录）', async () => {
+    const dir = outDir()
+    writeFileSync(join(dir, 'The.Matrix.1999.1080p.BluRay.x264.mkv'), 'video-bytes')
+    const before = readdirSync(dir, { withFileTypes: true }).map(e => e.name).sort()
+
+    const r = asWritten(await writeSubtitle({
+      artifact: Buffer.from('1\n00:00:01,000 --> 00:00:02,000\n你好\n'),
+      artifactFilename: 'sub.srt',
+      videoFilename: 'The.Matrix.1999.1080p.BluRay.x264.mkv',
+      langTag: 'zh-Hans',
+      outDir: dir,
+    }))
+
+    expect(dirname(r.path)).toBe(dir) // 与视频**同目录**
+    const after = readdirSync(dir, { withFileTypes: true })
+    expect(after.filter(e => e.isDirectory())).toEqual([])                       // 零新建子目录
+    expect(after.map(e => e.name).sort()).toEqual([...before, basename(r.path)].sort()) // 只多一个字幕文件
   })
 
   // A2: langTag was typed 'zh-Hans' | 'zh-Hant' — locked out any non-Chinese language at the type

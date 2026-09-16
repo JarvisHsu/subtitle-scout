@@ -18,7 +18,7 @@ import { clusterDueNow, clusterEarliestRetryAt } from './backoffCluster.js'
 import { recordFound } from './notificationsRepo.js'
 import { targetKey } from './subtitleTargets.js'
 import type { RunsRepo } from './runsRepo.js'
-import { capDetail } from './findSubtitleWorkerTask.js'
+import { capDetail, stagingRootFor } from './findSubtitleWorkerTask.js'
 
 export interface SubtitleQueueItem {
   workId: string
@@ -182,11 +182,33 @@ export function subtitleJobId(workId: string): string {
   return `subtitle:${workId}`
 }
 
-/** 组装 FindSubtitleTask（一个作品的一簇）。 */
-export function buildSubtitleTask(item: SubtitleQueueItem, targetLanguage: string): FindSubtitleTask {
+/** 组装 FindSubtitleTask（一个作品的一簇）。
+ *
+ *  `mediaRoots` = **配置媒体根**清单（`deps.mediaRoots` / daemon 的 `currentRoots()`）。
+ *  它只用来推导 `stagingRoot`——试错沙盒必须挂在配置根一级，`gcOrphans` 才扫得到
+ *  （见 files/stagingSandbox.ts 的 allocate 头注释与 design D1）。
+ *
+ *  第三参**必填**：只有 2 处调用点（生产 :353 + 测试 realItemId 助手）。必填的意义是让
+ *  "你没有告诉它根在哪"在**编译期**暴露，而不是像本次缺陷那样退化成运行期静默降级
+ *  （消费方 `task.stagingRoot ?? task.mediaRoot` 会把缺失咽下去）。 */
+export function buildSubtitleTask(
+  item: SubtitleQueueItem, targetLanguage: string, mediaRoots: string[],
+): FindSubtitleTask {
   // INNER 沙盒根：所有文件所在目录的公共祖先（同一作品通常同根，安全）
   const dirs = item.files.map(f => f.dir)
   const mediaRoot = commonDir(dirs)
+  // jobId 只算一次，与下面返回体里的 jobId 字段共用同一个值——必须与 daemon 侧
+  // (this as any).inFlightStagingJobIds 登记的目录名**字节一致**（见 subtitleJobId 注释）。
+  const jobId = subtitleJobId(item.workId)
+  // 🔴 试错沙盒根 ≠ INNER 沙盒根。mediaRoot（上一步的公共祖先，如 /media/Show）是**装机**
+  // 收窄用的；沙盒必须挂在**配置媒体根**（如 /media）一级，否则 gcOrphans 的非递归扫描
+  // 永远够不到它（allocate 的 mkdir 与 cleanup 的 rm 都用这个值，两边必须同一个）。
+  //
+  // mediaRoots 为空（未配置 MEDIA_ROOTS 的开发态/测试态）时**不调用** stagingRootFor：
+  // 那个函数在无命中时必然 console.error（containingRoot 对空数组恒返回 null），
+  // 而"没配根"是合法的退化态，不该每组装一个任务就打一条误导性错误日志。此时不写
+  // stagingRoot 键，消费方走既有 `task.stagingRoot ?? task.mediaRoot` 兜底。
+  const stagingRoot = mediaRoots.length > 0 ? stagingRootFor(mediaRoot, mediaRoots, jobId) : undefined
   // 🔴 2026-08-08 实测修正：itemId 必须从 work_id 派生（tmdb:95897/s1e1），不能传 null——
   // findSubtitleWorker 的 prompt 对 itemId:null 渲染"unidentified — identify first"，worker 会
   // 直接 no_safe_match 跳过而不搜索（Overflow 2 步退出的根因）。新架构里文件已识别（work_id
@@ -206,8 +228,12 @@ export function buildSubtitleTask(item: SubtitleQueueItem, targetLanguage: strin
     embeddedTmdbId: null,
   }))
   return {
-    jobId: subtitleJobId(item.workId),
+    jobId,
     mediaRoot,
+    // 条件展开而不是 `stagingRoot: stagingRoot`：TS 的 strict 不拦"值为 undefined 的可选键"，
+    // 而我们要的是**键缺席**——两个消费方（findSubtitleWorker.ts:182 的 `??`、以及
+    // schemas 里那段"为什么它必须保持可选"的论证）都以"键不在"为契约。
+    ...(stagingRoot !== undefined ? { stagingRoot } : {}),
     workUnitKind: 'work-dir',
     title: item.title,
     originalTitle: item.originalTitle,
@@ -349,8 +375,17 @@ export async function runSubtitleWorkDir(
    *  缺席=HANDOFF_THRESHOLD（R10 默认 7）。daemon 每次派发新鲜读 settings（同 targetLanguage/
    *  hardsubMode 的既有先例），改设置下一个任务即生效，不用重启。 */
   handoffThreshold: number = HANDOFF_THRESHOLD,
+  /** 配置媒体根清单，透传给 buildSubtitleTask 推导 stagingRoot（P5）。
+   *
+   *  **尾置可选**：本函数有 74 个测试调用点（subtitleScheduler.test.ts 56 / daemonV2.test.ts 12 /
+   *  notificationsWiring.test.ts 6；另有 30 处是注释/文档里的无括号提及，不受签名影响，
+   *  故"要动的处数"是 74 而不是无括号计数），绝大多数与沙盒位置无关，收成 options 对象要动
+   *  全部 75 个调用点、收益只是美观。代价是**新增调用点可能再次忘记传**——这正是本次缺陷的
+   *  形状，故缓解手段是 §2 的 T6：在 daemon 层断言"组装出来的任务 stagingRoot 命中配置根"。
+   *  生产侧只有 daemonV2.ts:1057 一个调用点。默认 `[]` = 既有行为（不写 stagingRoot 键）。 */
+  mediaRoots: string[] = [],
 ): Promise<import('../agent/findSubtitleWorker.schemas.js').FindSubtitleBatchReport | null> {
-  const task = buildSubtitleTask(item, targetLanguage)
+  const task = buildSubtitleTask(item, targetLanguage, mediaRoots)
   const runKey = `job-subtitle:${item.workId}`
   const now = Date.now()
   // 🔴 巡检模型（spec 2026-08-08）：全部"明天"（24h）——瞬时故障在日巡检下

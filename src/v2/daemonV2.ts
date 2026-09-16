@@ -1072,6 +1072,10 @@ export class ScoutDaemonV2 {
             })
           },
           this.deps.translateAfterAttempts?.(),
+          // 用 currentRoots()（巡检中取本轮快照、巡检外现取）而不是 this.deps.roots 启动快照——
+          // 与同文件既有的守备目录读取口径一致。用户经 dashboard 增删守备目录后，下一轮巡检
+          // 组装出来的 stagingRoot 就该按新清单算，否则新根下的沙盒又落到回收扫描层之外。
+          this.currentRoots(),
         )
         // R-F10 found ①：**找到并装上了字幕**——这一条就是通知页的数据源，也是整条通道里
         // 用户唯一真正想要的那个信号（"找到了什么"）。

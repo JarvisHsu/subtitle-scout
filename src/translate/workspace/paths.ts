@@ -1,8 +1,13 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { WorkspacePaths } from './types.js'
+import { TRANSLATE_STAGING_DIRNAME } from '../../core/mediaContext.js'
 
-export const TRANSLATE_STAGING_DIRNAME = '.subtitle-translate'
+// 再导出：本模块的公开 API 逐字不变（paths.test.ts 的 `import { TRANSLATE_STAGING_DIRNAME }`
+// 照旧可用），但字面量只剩 core/mediaContext.ts 一份定义。原因见那边的注释与 design D6：
+// 这一串字符现在有三个消费者（本模块、files/stagingSandbox.ts 的 gcOrphans 与 findStagingHusks），
+// 任何一处改格式而另一处没改，回收会静默停止工作。
+export { TRANSLATE_STAGING_DIRNAME }
 
 export function workspacePaths(stagingBase: string, jobId: string): WorkspacePaths {
   const jobRoot = join(stagingBase, TRANSLATE_STAGING_DIRNAME, jobId)

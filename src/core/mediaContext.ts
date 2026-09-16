@@ -114,3 +114,31 @@ export function sweepWriteProbes(
   }
   return removed
 }
+
+/** 目录名是否应当被"媒体树遍历"剪枝（不进去）：点前缀 = 隐藏目录（含本仓自己的
+ *  `.subtitle-staging` / `.subtitle-translate` / `.realign-build`）；`@` 前缀 = 群晖
+ *  `@eaDir` 这类 NAS 厂商的缩略图/元数据目录；`#` 前缀 = 同类回收站/临时目录。
+ *
+ *  **全仓唯一一份定义**（2026-09-16 合并）：此前只有 `daemon/selfScan.ts` 的私有
+ *  `isJunkDir`，它的注释自己写着"本仓没有任何地方导出等价的判据可以复用"。空壳遍历
+ *  （`files/stagingSandbox.ts` 的 `findStagingHusks`）成为第二个消费者后，两份逐字相同的
+ *  判据就是下一次静默分叉的种子，故上提到这里。`selfScan.ts` 与 `stagingSandbox.ts` 都导入它。
+ *
+ *  放这一层的理由：`core/mediaContext.ts` 是最底层的路径/文件系统约定模块，`files/` 与
+ *  `v2/` 都已从它导入；放这里不产生任何新的层间方向。若改成从 `daemon/selfScan.ts` 导出，
+ *  就凭空造出 `files/ → daemon/` 这条当前不存在的边。
+ *
+ *  与 `isVideoFile` 无关：本函数只回答"要不要进去"，不回答"里面有没有视频"。 */
+export function isJunkDirName(name: string): boolean {
+  return name.startsWith('.') || name.startsWith('@') || name.startsWith('#')
+}
+
+/** 字幕试错沙盒的目录名（`<媒体根>/.subtitle-staging/<jobId>/`）。见 files/stagingSandbox.ts。 */
+export const STAGING_DIRNAME = '.subtitle-staging'
+
+/** 翻译工作台的目录名（`<媒体根>/.subtitle-translate/<jobId>/`）。单一真相点：
+ *  `translate/workspace/paths.ts` 从这里再导出（它自身的 workspacePaths/ensureWorkspaceLayout
+ *  内部用法不变），`files/stagingSandbox.ts` 的 gcOrphans / findStagingHusks 也从这里导入。
+ *  此前这一串字面量在两处各写一份——任何一侧改了格式，另一侧的回收会**静默**停止工作
+ *  （工作台无界堆积，且不会有任何测试变红）。 */
+export const TRANSLATE_STAGING_DIRNAME = '.subtitle-translate'

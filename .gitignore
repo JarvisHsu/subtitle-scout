@@ -35,6 +35,10 @@ docs/diagrams/*
 !docs/diagrams/architecture.html
 !docs/diagrams/architecture.png
 !docs/diagrams/share-card.png
+
+# OpenSpec 变更工作区（proposal/design/tasks/spec 增量/补丁清单）同样是内部设计记录，
+# 不随公开仓。仓内无任何引用：README、CI、package.json 都不提它。
+openspec/
 jellyfin-config/
 cache/
 

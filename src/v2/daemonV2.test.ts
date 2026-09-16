@@ -12,6 +12,10 @@ import { PARSER_VERSION } from './scanner.js'
 // 用真实队列函数做断言，不在测试里复述工作台谓词——复述等于测试自己也维护一份实现，
 // 两份一漂移就是假绿（C27 这个 bug 的核心恰恰是"谓词组合起来构成卡死态"）。
 import { listSubtitleQueue, subtitleJobId, runSubtitleWorkDir, RETRY_LATER_STREAK_CAP } from './subtitleScheduler.js'
+// 端到端接线断言（T6）：直接对传给 subtitleWorker 的那个 task 求值。用**生产类型**而不是
+// 手写形状——手写一份 { mediaRoot, stagingRoot, jobId } 的局部 interface 就等于测试自己维护
+// 第二份契约，两份一漂移就是假绿（同 subtitleJobId / listSubtitleQueue 的既有理由）。
+import type { FindSubtitleTask } from '../agent/findSubtitleWorker.schemas.js'
 import { RunsRepo } from './runsRepo.js'
 import { traceBus } from '../core/traceBus.js'
 // C21 用例 7b 端到端：用真实的抓源腿 locate 验"回填的产出真能被消费方读出来"，
@@ -3585,6 +3589,37 @@ describe('ScoutDaemonV2 · C34 gcStaging 的 in-flight 集合', () => {
     expect(sawInFlight).toEqual([subtitleJobId('tmdb:7')])
     // 跑完必须摘掉，否则这个 jobId 会永久免疫 GC → 沙盒垃圾无界堆积
     expect([...((daemon as any).inFlightStagingJobIds as Set<string>)]).toEqual([])
+    db.close()
+  })
+
+  it('🔴 字幕任务的 stagingRoot 必须落在配置媒体根一级（否则沙盒永远不被 gcOrphans 回收）', async () => {
+    const db = openDb(':memory:')
+    db.prepare(`INSERT INTO works (id, title, media_type, created_at, updated_at) VALUES (?,?,?,?,?)`)
+      .run('tmdb:7', 'Show', 'tv', 1000, 1000)
+    db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, work_id, needs_subtitle, season, episode, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run('/media/Show/E01.mkv', '/media/Show', 'E01.mkv', BIG, 1000, '/media/Show', 'tmdb:7', 1, 1, 1, 1000)
+
+    let sawTask: FindSubtitleTask | null = null
+    const subtitleWorker = vi.fn(async (task: FindSubtitleTask) => {
+      sawTask = task
+      return { installed: [], no_safe_match: [], retry_later: [], hardsub_assumed: [] }
+    })
+    const daemon = new ScoutDaemonV2(mkDeps(db, {
+      roots: ['/media'], ...fakeFs({ '/media': ['/media/Show/E01.mkv'] }),
+      writableRoots: new Map([['/media', true]]),
+      subtitleWorker: subtitleWorker as any,
+      fileExists: (p: string) => p === '/media/Show/E01.mkv',
+    }))
+    await (daemon as any).runInspection(new AbortController().signal)
+
+    expect(sawTask).not.toBeNull()
+    expect(sawTask!.mediaRoot).toBe('/media/Show')  // INNER 根
+    // 🔴 本变更的全部意义就在这一行：沙盒必须挂配置根一级。改动前它是 undefined
+    //（消费方退化成 task.mediaRoot = /media/Show，于是沙盒建在视频目录里、
+    //  gcOrphans 的根一级扫描永远够不到 → 用户看到的隐藏文件夹）。
+    expect(sawTask!.stagingRoot).toBe('/media')
+    expect(sawTask!.jobId).toBe(subtitleJobId('tmdb:7'))
     db.close()
   })
 
