@@ -238,6 +238,9 @@ export interface InstallOptions {
 /** install() 的成功结果:文件已落在 finalPath。 */
 export interface InstallResult {
   path: string
+  /** C-1 修复：本次装盘顺带清理掉的重复品（或删除失败的报告）。绝大多数装盘为空数组——
+   *  只有真的撞上"网盘后端把冲突文件改名成 (1)"才会非空。 */
+  cleanup?: InstallCleanupNote[]
 }
 
 /** install() 的冲突结果(H1,2026-07-18 数据安全审计):finalPath 已存在(用户手放字幕、或
@@ -247,6 +250,96 @@ export interface InstallResult {
 export interface InstallConflict {
   conflict: true
   path: string
+}
+
+/** install() 成功、但顺带清理掉了一个自己制造的重复品。调用方据此留一行日志即可，
+ *  不需要做任何补偿动作（清理是幂等的，失败也不影响装盘结论）。 */
+export interface InstallCleanupNote {
+  /** 被删掉的重复文件绝对路径。 */
+  removed: string
+  /** 删除失败时的人工处置提示；成功时为 undefined。 */
+  warning?: string
+}
+
+/** 网盘后端(C-1 修复,2026-09-17 生产实案)在"目标重名"时**不会覆盖**，而是把自己新收的
+ *  那份改名成 `<base>(1)<ext>` 另存——于是同一集出现两份内容相同的字幕。
+ *
+ *  ── 它怎么绕过 install() 的"绝不覆盖"防线 ────────────────────────────────────
+ *  install() 靠 `existsSync(normalizedFinal)` 判冲突。这个判断在本地盘上够用，但在本部署的
+ *  rclone 挂载上不够，因为挂载参数是：
+ *      --vfs-cache-mode writes --dir-cache-time 5m --vfs-cache-max-age 1h
+ *  ① `--dir-cache-time 5m`：**目录项缓存 5 分钟**。前一次 install 刚 rename 就位、后端还没回写
+ *     完（生产实测：首次上传 `context canceled`，第三次重试 20 秒后才 `Copied (new)`），
+ *     后一次 install 的 existsSync 就可能读到**陈旧缓存**返回 false。
+ *  ② `--vfs-cache-mode writes`：写先进本地缓存、**异步上传**，把上面那个窗口进一步拉长。
+ *  于是第二次 rename 照样发出去，后端发现重名 → 改名成 `(1)` 存下来。
+ *  这正是 install() 第 276-280 行注释里承认的 TOCTOU 窗口——注释判断"风险极低（agent 单线程
+ *  顺序执行）"，但**这里窗口不是微秒级而是分钟级**，且重复派发（见 #1 记录）保证了真的会撞。
+ *
+ *  ── 为什么清理是安全的 ──────────────────────────────────────────────────────
+ *  删除前**逐字节比对**：只有内容与刚落盘的 finalPath 完全一致才删。`(1)` 里若装的是你手放的
+ *  另一份字幕（内容不同），一个字节都不动，只回一句提示交给人判断。因此本函数**不可能**删掉
+ *  与已装文件内容不同的东西。
+ *
+ *  只认 `<base>(<n>)<ext>` 且 n 是纯数字的相邻兄弟；不会去匹配任何别的命名形态。
+ *  额外记录：`--dir-cache-time 5m` 也让**删除**可能被缓存挡住，所以删除失败是预期内的，
+ *  函数只报告、不抛错——装盘结论不受影响。 */
+export function cleanupNumberedDuplicates(finalPath: string): InstallCleanupNote[] {
+  const notes: InstallCleanupNote[] = []
+  let base = finalPath
+  let ext = ''
+  const dot = finalPath.lastIndexOf('.')
+  const slash = Math.max(finalPath.lastIndexOf('/'), finalPath.lastIndexOf('\\'))
+  if (dot > slash) {
+    base = finalPath.slice(0, dot)
+    ext = finalPath.slice(dot)
+  }
+  let entries: string[]
+  try {
+    entries = readdirSync(dirname(finalPath))
+  } catch {
+    return notes // 列不出目录（云盘抖动等）→ 无事可做，绝不影响装盘结论
+  }
+  let finalSize: number
+  let finalData: Buffer
+  try {
+    finalData = readFileSync(finalPath)
+    finalSize = finalData.length
+  } catch {
+    return notes // 读不到刚落盘的文件 → 无从比对，不做任何删除
+  }
+  const re = new RegExp(`^${escapeRegExp(base.slice(base.lastIndexOf('/') + 1))}\\((\\d+)\\)${escapeRegExp(ext)}$`)
+  for (const name of entries) {
+    if (!re.test(name)) continue
+    const dup = join(dirname(finalPath), name)
+    try {
+      const dupData = readFileSync(dup)
+      // 大小先挡一道（省掉大文件的白读），再逐字节比对——两者都相等才算"自己制造的重复品"。
+      if (dupData.length !== finalSize || !dupData.equals(finalData)) continue
+      unlinkSync(dup)
+      notes.push({ removed: dup })
+    } catch (e) {
+      notes.push({
+        removed: dup,
+        warning:
+          `重复字幕清理失败（可能与云盘目录缓存有关，可稍后手动删除）：${dup} — ` +
+          `${e instanceof Error ? e.message : String(e)}`,
+      })
+    }
+  }
+  return notes
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** 装盘成功后的收尾：跑一次重复品校验，**只在真的产生了记录时才**把 `cleanup` 挂上结果。
+ *  刻意不无条件带一个空数组——绝大多数装盘没有重复品，让返回形状在这种情况下与本次改动
+ *  之前逐字段一致，避免为了一个罕见情形去动所有调用方（以及它们的精确匹配断言）。 */
+function withCleanup(finalPath: string): InstallResult {
+  const cleanup = cleanupNumberedDuplicates(finalPath)
+  return cleanup.length > 0 ? { path: finalPath, cleanup } : { path: finalPath }
 }
 
 /** 原子安装:沙盒里胜出的文件 rename 进媒体目录。文件名一律 NFC 归一化(群晖 SMB 的
@@ -273,14 +366,21 @@ export async function install(
       return { conflict: true, path: normalizedFinal }
     }
     try {
-      // H1 承诺"绝不覆盖"——存在即返回 conflict。注意:existsSync→renameSync 之间存在微秒级
-      // TOCTOU 窗口,窗口内出现的同名文件会被 rename 静默覆盖(POSIX rename 语义)。实际风险
-      // 极低(agent 单线程顺序执行,窗口内恰好有人手放同名字幕的概率接近零),且冲突路径已
-      // 有 existsSync 前置短路兜底。未来如需彻底消除窗口,可改用 linkSync(存在即 EEXIST
-      // 失败)+unlinkSync,但会改变函数签名(返回错误而非 InstallConflict),需调用方适配。
+      // H1 承诺"绝不覆盖"——存在即返回 conflict。注意:existsSync→renameSync 之间存在窗口,
+      // 窗口内出现的同名文件会被 rename 静默覆盖(POSIX rename 语义)。
+      //
+      // C-1(2026-09-17 生产实案)修正上面这条注释的风险判断:**在 rclone WebDAV 挂载上这个窗口
+      // 不是微秒级**。挂载参数 `--dir-cache-time 5m`(目录项缓存 5 分钟) + `--vfs-cache-mode writes`
+      // (异步上传)让"刚 rename 就位、后端还没回写完"成为常态——生产实测首次上传 `context
+      // canceled`、第三次重试 20 秒后才 `Copied (new)`。在此期间后一次 install 的 existsSync 会
+      // 读到陈旧缓存返回 false,rename 照样发出去,后端发现重名便把新的那份**改名成 (1)** 另存
+      // (不是覆盖)。于是同一集出现两份内容相同的字幕。
+      //
+      // 防线加法(不改这里"绝不覆盖"的承诺,那是数据安全底线):装盘成功后做一次兄弟文件校验,
+      // 把内容逐字节相同的 `(1)` 重复品清掉——详见 cleanupNumberedDuplicates 的头注释。
       renameSync(stagedPath, normalizedFinal)
       fsyncDirBestEffort(dirname(normalizedFinal))
-      return { path: normalizedFinal }
+      return withCleanup(normalizedFinal)
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code
       if (code === 'EXDEV') {
@@ -289,7 +389,7 @@ export async function install(
         }
         copyThenRenameSameDir(stagedPath, normalizedFinal)
         fsyncDirBestEffort(dirname(normalizedFinal))
-        return { path: normalizedFinal }
+        return withCleanup(normalizedFinal)
       }
       lastError = e
       if (code && RETRYABLE_CODES.has(code) && attempt < delaysMs.length) {

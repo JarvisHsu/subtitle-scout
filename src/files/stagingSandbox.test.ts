@@ -5,7 +5,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { allocate, cleanup, install, gcOrphans, findStagingHusks, isStagingHusk, probeStagingPlacement, PLACEMENT_PROBE_PREFIX } from './stagingSandbox.js'
+import { allocate, cleanup, install, gcOrphans, findStagingHusks, isStagingHusk, probeStagingPlacement, PLACEMENT_PROBE_PREFIX, cleanupNumberedDuplicates } from './stagingSandbox.js'
 
 // Finding 4: production code has no call sites for install() yet, so defaulting this to
 // a short ladder everywhere retries are exercised keeps this suite fast without touching
@@ -503,6 +503,89 @@ describe('install — conflict detection (H1, 2026-07-18 数据安全审计: ren
 
     expect(result).toEqual({ conflict: true, path: finalPath })
     expect(readFileSync(finalPath, 'utf8')).toBe('RACE WINNER content — must survive')
+  })
+})
+
+// C-1 修复（2026-09-17 生产实案）：网盘后端在同一路径被写第二次时**不覆盖**，而是把自己新收的
+// 那份改名成 `<base>(1)<ext>` 另存 → 同一集出现两份内容相同的字幕。根因是 rclone 挂载的
+// `--dir-cache-time 5m` + `--vfs-cache-mode writes` 让 install() 的 existsSync 前置检查读到
+// 陈旧目录缓存，于是 TOCTOU 窗口从"微秒级"变成"分钟级"。
+describe('install — 重复品清理 (C-1, 网盘后端把冲突文件改名成 (1))', () => {
+  it('落盘后存在内容相同的 <base>(1)<ext> → 装盘成功并把它清掉', async () => {
+    const root = mediaRoot()
+    const stagedDir = allocate('job-1', root)
+    const stagedPath = join(stagedDir, 'candidate.srt')
+    writeFileSync(stagedPath, 'SAME content')
+    const finalPath = join(root, 'Show.S01E01.zh-Hans.srt')
+    // 模拟后端加的那份：内容与即将落盘的字幕逐字节相同
+    writeFileSync(join(root, 'Show.S01E01.zh-Hans(1).srt'), 'SAME content')
+
+    const result = await install(stagedPath, finalPath)
+
+    expect('conflict' in result).toBe(false)
+    expect(result).toEqual({
+      path: finalPath,
+      cleanup: [{ removed: join(root, 'Show.S01E01.zh-Hans(1).srt') }],
+    })
+    expect(existsSync(join(root, 'Show.S01E01.zh-Hans(1).srt'))).toBe(false)
+    expect(readFileSync(finalPath, 'utf8')).toBe('SAME content')
+  })
+
+  it('误删防线：内容不同的 (1) 文件一个字节都不动，仅报告交人判断', async () => {
+    const root = mediaRoot()
+    const stagedDir = allocate('job-1', root)
+    const stagedPath = join(stagedDir, 'candidate.srt')
+    writeFileSync(stagedPath, 'OUR content')
+    const finalPath = join(root, 'Show.S01E01.zh-Hans.srt')
+    // 用户手放的、恰好同名的另一份字幕：内容不同 → 绝不能被我们删掉
+    const userFile = join(root, 'Show.S01E01.zh-Hans(1).srt')
+    writeFileSync(userFile, 'USER content — must survive')
+
+    const result = await install(stagedPath, finalPath)
+
+    expect(existsSync(userFile)).toBe(true)
+    expect(readFileSync(userFile, 'utf8')).toBe('USER content — must survive')
+    if ('cleanup' in result && result.cleanup) {
+      expect(result.cleanup.every((n) => n.removed !== userFile || n.warning !== undefined)).toBe(true)
+    }
+  })
+
+  it('多个编号 (1)(2)(3) 中只删内容相同的那些', async () => {
+    const root = mediaRoot()
+    const stagedDir = allocate('job-1', root)
+    const stagedPath = join(stagedDir, 'candidate.srt')
+    writeFileSync(stagedPath, 'SAME')
+    const finalPath = join(root, 'Show.S01E01.zh-Hans.srt')
+    writeFileSync(join(root, 'Show.S01E01.zh-Hans(1).srt'), 'SAME')
+    writeFileSync(join(root, 'Show.S01E01.zh-Hans(2).srt'), 'DIFFERENT')
+    writeFileSync(join(root, 'Show.S01E01.zh-Hans(3).srt'), 'SAME')
+
+    await install(stagedPath, finalPath)
+
+    expect(existsSync(join(root, 'Show.S01E01.zh-Hans(1).srt'))).toBe(false)
+    expect(existsSync(join(root, 'Show.S01E01.zh-Hans(3).srt'))).toBe(false)
+    expect(existsSync(join(root, 'Show.S01E01.zh-Hans(2).srt'))).toBe(true)
+  })
+
+  it('无重复品时结果形状与改动前完全一致（不带 cleanup 字段）', async () => {
+    const root = mediaRoot()
+    const stagedDir = allocate('job-1', root)
+    const stagedPath = join(stagedDir, 'candidate.srt')
+    writeFileSync(stagedPath, 'x')
+    const finalPath = join(root, 'Show.S01E01.zh-Hans.srt')
+
+    const result = await install(stagedPath, finalPath)
+
+    expect(result).toEqual({ path: finalPath })
+    expect('cleanup' in result).toBe(false)
+  })
+
+  it('cleanupNumberedDuplicates 可独立调用；目录不可读时返回空表而不抛', () => {
+    const root = mediaRoot()
+    const finalPath = join(root, 'nope.srt')
+    writeFileSync(finalPath, 'x')
+    expect(cleanupNumberedDuplicates(join(root, 'not-a-dir', 'x.srt'))).toEqual([])
+    expect(cleanupNumberedDuplicates(finalPath)).toEqual([])
   })
 })
 
