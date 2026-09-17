@@ -4,7 +4,7 @@
 // 写库门（防幻觉）：agent 报的 tmdbId 必须通过 verifyEvidence 机械核验才落库。
 // 404 终态：getDetails 返回 null → last_error='tmdb-404'，永不重试（spec-gap B2）。
 import type { ScoutDb } from './db.js'
-import { verifyEvidence, titleFromDir, type TmdbEvidence } from './identify.js'
+import { verifyEvidence, titleFromDir, hasSeasonToken, IDENTIFY_GATE_VERSION, type TmdbEvidence } from './identify.js'
 import { parseFilename } from '../recognition/parseFilename.js'
 import type { IdentifyWorkerDeps, IdentifyReport, WorkDirFacts } from '../agent/identifyWorker.js'
 
@@ -60,10 +60,22 @@ export function listIdentifyQueue(db: ScoutDb, now: number): IdentifyQueueItem[]
     FROM files
     WHERE work_id IS NULL
       AND (next_retry_at IS NULL OR next_retry_at <= ?)
-      AND (last_error IS NULL OR last_error != 'tmdb-404')
+      -- D-4（2026-09-18）：404 终态**可失效**。原谓词是纯 last_error != 'tmdb-404'，
+      -- 于是写入 404 的行从此再也不进队列——本次修好了产生假 404 的机制（推定类型单向、
+      -- 查不到就判 404），但库里已存在的假 404 行一行都不会重跑，等于改了门而生产库原封不动。
+      -- 现在多一条出口：**该行的 gate 版本落后于当前门**（或从未盖过戳）时重新入队一次。
+      -- 🔴 identify_gate_version IS NULL 必须显式写：它归一成「未盖戳=最旧」，
+      --    不能只靠 identify_gate_version < ?——NULL 参与比较在三值逻辑里是 unknown，
+      --    永远选不中存量行（v45 头注释记的同一个坑）。
+      AND (
+        last_error IS NULL
+        OR last_error != 'tmdb-404'
+        OR identify_gate_version IS NULL
+        OR identify_gate_version < ?
+      )
     GROUP BY work_dir
     ORDER BY MIN(attempt), MIN(id)
-  `).all(now) as Array<{ work_dir: string; file_count: number; with_season: number }>
+  `).all(now, IDENTIFY_GATE_VERSION) as Array<{ work_dir: string; file_count: number; with_season: number }>
 
   return rows.map(r => {
     const dirName = r.work_dir.slice(r.work_dir.lastIndexOf('/') + 1)
@@ -113,11 +125,34 @@ export async function runIdentifyWorkDir(
   // 绑定不应依赖 agent 自觉——改为 scheduler 自动执行：report 确认身份后，用文件列表 + TMDB
   // 详情自动绑定（season/episode 取 confidence 值 + 单季推导）。agent 只负责"确认身份"。
   const writeIdentified = async (input: { tmdbId: string; isTv: boolean; title: string; files: Array<{ filename: string; season: number | null; episode: number | null }> }) => {
-    // 先查 TMDB 详情做核验
-    const mediaType = input.isTv ? 'tv' : 'movie'
-    const details = await deps.worker.tmdb.getDetails(mediaType, input.tmdbId)
+    // 先查 TMDB 详情做核验——**双向**（D-4，2026-09-18）。
+    //
+    // 🔴 曾经是单向：`getDetails(input.isTv ? 'tv' : 'movie', id)` 返回 null 就直接判
+    // `tmdb-404`，把"我们猜错了类型"写成了"TMDB 上确实没有这部作品"。而 `isTv` 是
+    // `hasSeasonDirs || seasons.length > 0` 机械推断出来的——扁平文件目录（文件名是
+    // `01.mp4`、季集全 NULL）且**没有**季子目录时恒判 movie，于是拿一个 TV id 去查 movie 端点
+    // → null → 落 404 **终态**，被队列谓词 `last_error != 'tmdb-404'` **永久排除**，
+    // 界面上一个字都不显示。生产实案：`[爱情公寓][全1-5季+电影+番外篇…]` 15 个文件。
+    //
+    // 现在：推定类型只决定**先查哪个**，两个都 null 才判 404。这让 `tmdb-404` 恢复其应有语义
+    // （"TMDB 上两种类型都查过、确实没有"），而不是"我们猜错了类型"。
+    // 代价：只在**首次查询为 null** 时多一次 API 调用，命中正常路径时零增量。
+    const firstType: 'tv' | 'movie' = input.isTv ? 'tv' : 'movie'
+    const otherType: 'tv' | 'movie' = input.isTv ? 'movie' : 'tv'
+    let mediaType = firstType
+    let details = await deps.worker.tmdb.getDetails(firstType, input.tmdbId)
     if (!details) {
-      // 404 终态：作品真不在 TMDB
+      details = await deps.worker.tmdb.getDetails(otherType, input.tmdbId)
+      if (details) {
+        mediaType = otherType
+        console.error(
+          `[identify-scheduler] ${facts.workDir}: 推定类型 ${firstType} 查不到，改用 ${otherType} 命中——` +
+            `机械推断只决定查询顺序，不再决定结论（D-4）`,
+        )
+      }
+    }
+    if (!details) {
+      // 两种类型都查过 → 这才是真·404
       return { ok: false as const, error: 'tmdb-404' }
     }
     const evidence: TmdbEvidence = {
@@ -139,6 +174,8 @@ export async function runIdentifyWorkDir(
       //   文件名  = 「The.Expanse.S01E01.2015.2160p.AMZN.WEB-DL.DDP5.1.H265.HDR.DV.2Audio-年糕.mkv」
       // 目录名里**没有** "theexpanse"（D-2 的 CJK 门也救不了它），只有文件名能证明身份。
       fileTitles: highConfidenceFileTitles(facts.files),
+      // D-4：目录名里的季/集标记（`全1-5季` 等）= "这是剧集"的独立结构证据。
+      dirHasSeasonToken: hasSeasonToken(facts.dirName),
       // 🔴 2026-08-08 实测：必须用 titleFromDir 清洗后的标题（去掉年份/花括号），
       // 不能传原始 dirName——带年份的目录名会让 normalize 后的字符串多出年份数字导致
       // 永不匹配（Chainsaw Man Reze Arc 的 ': ' vs '- ' 差异 + 年份 2025 实测踩中）。
@@ -249,14 +286,14 @@ export async function runIdentifyWorkDir(
       // 按文件名匹配绑定（同一 work_dir 下的文件）
       const byFilename = new Map(facts.files.map(f => [f.filename, f]))
       const stmt = deps.db.prepare(`
-        UPDATE files SET work_id = ?, season = ?, episode = ?, attempt = 0, next_retry_at = NULL, last_error = NULL, updated_at = ?
+        UPDATE files SET work_id = ?, season = ?, episode = ?, attempt = 0, next_retry_at = NULL, last_error = NULL, identify_gate_version = ?, updated_at = ?
         WHERE work_dir = ? AND filename = ?
       `)
       let written = 0
       for (const f of input.files) {
         const target = byFilename.get(f.filename)
         if (!target) continue
-        stmt.run(`tmdb:${input.tmdbId}`, f.season, f.episode, now, facts.workDir, f.filename)
+        stmt.run(`tmdb:${input.tmdbId}`, f.season, f.episode, IDENTIFY_GATE_VERSION, now, facts.workDir, f.filename)
         written++
       }
       return written
@@ -290,16 +327,27 @@ export async function runIdentifyWorkDir(
   if (report.tmdbId !== null) {
     const writeResult = await writeIdentified({
       tmdbId: report.tmdbId,
-      isTv: facts.hasSeasonDirs || facts.seasons.length > 0,
+      // D-4：类型推断加上"目录名里的季/集标记"这一条。原判据是
+      // `hasSeasonDirs || seasons.length > 0`，对**扁平文件目录**（`01.mp4`、季集全 NULL）
+      // 恒假 → 判 movie → 拿 TV id 去查 movie 端点 → null → 落 `tmdb-404` 终态。
+      // 生产实案 `[爱情公寓][全1-5季+电影+番外篇…]`：目录名里的 `全1-5季` 已经说明是剧集。
+      // 注意这只影响**先查哪个类型**（writeIdentified 已改双向核验），所以即使这里判错，
+      // 也不会再造出假 404——两层是互补的。
+      isTv: facts.hasSeasonDirs || facts.seasons.length > 0 || hasSeasonToken(facts.dirName),
       title: report.title ?? '',
       files: facts.files.map(f => ({ filename: f.filename, season: f.season, episode: f.episode })),
     })
     if (!writeResult.ok) {
       const attempt = (deps.db.prepare('SELECT MAX(attempt) a FROM files WHERE work_dir = ?').get(facts.workDir) as { a: number }).a
+      // 🔴 D-4：这条失败路径**能写 `last_error='tmdb-404'`**，而队列谓词给了"gate 版本落后"
+      // 的行一条重新入队的出口——所以这里**必须同时盖当前版本戳**，否则该行会在每轮巡检里
+      // 被反复重新入队、反复白跑一次识别 agent（付费 LLM），变成一个热循环。
+      // 盖戳后收敛：重跑仍判 404 → 版本已是当前 → 谓词恒假 → 不再重试。
+      // （catch 路径与下面 'identify-failed' 路径不产生 404，本就不受该谓词限制，故不盖戳。）
       deps.db.prepare(`
-        UPDATE files SET attempt = ?, next_retry_at = ?, last_error = ?, updated_at = ?
+        UPDATE files SET attempt = ?, next_retry_at = ?, last_error = ?, identify_gate_version = ?, updated_at = ?
         WHERE work_dir = ?
-      `).run(attempt + 1, now + retryDelayMs(attempt + 1), writeResult.error, now, facts.workDir)
+      `).run(attempt + 1, now + retryDelayMs(attempt + 1), writeResult.error, IDENTIFY_GATE_VERSION, now, facts.workDir)
       return { ...report, reason: `${report.reason} [bind failed: ${writeResult.error}]` }
     }
     console.error(`[identify-scheduler] bound ${writeResult.written}/${facts.fileCount} files of ${facts.workDir} to tmdb:${report.tmdbId}`)

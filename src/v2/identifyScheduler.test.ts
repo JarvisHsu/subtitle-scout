@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { openDb } from './db.js'
-import { runIdentifyWorkDir, type IdentifySchedulerDeps } from './identifyScheduler.js'
+import { runIdentifyWorkDir, listIdentifyQueue, type IdentifySchedulerDeps } from './identifyScheduler.js'
+import { IDENTIFY_GATE_VERSION } from './identify.js'
 import type { IdentifyReport } from '../agent/identifyWorker.js'
 
 function mkDeps(db: ReturnType<typeof openDb>, runIdentifyImpl: () => Promise<IdentifyReport>): IdentifySchedulerDeps {
@@ -394,5 +395,130 @@ describe('runIdentifyWorkDir · works.backdrop_path 落库（v42 / R-F13 写入�
     expect(row.backdrop_path).toBe('/bd.jpg')
     expect(row.backdrop_checked_at).toBe(first.backdrop_checked_at)   // 凭据也不许丢
     db.close()
+  })
+})
+
+// D-4（2026-09-18）：媒体类型**双向**核验 + 404 终态**可失效**。
+// 生产实案 `[爱情公寓][全1-5季+电影+番外篇][国语中字][4K高码][203G]`：扁平文件（`01.mp4`、
+// 季集全 NULL）+ 无季子目录 → 机械推断成 movie → 拿 TV id 去查 movie 端点 → null → 落
+// `tmdb-404` **终态**，被队列谓词永久排除，界面上一个字都不显示。
+describe('D-4 · 媒体类型双向核验（推定类型只决定查询顺序）', () => {
+  function seedFlatShow(db: ReturnType<typeof openDb>, workDir: string) {
+    // 扁平目录：文件名是 01.mp4（无季集）、无季子目录 —— 正是会被推成 movie 的形状
+    for (const n of ['01.mp4', '02.mp4']) {
+      db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, updated_at)
+                  VALUES (?,?,?,?,?,?,?)`)
+        .run(`${workDir}/${n}`, workDir, n, 100, 1000, workDir, 1000)
+    }
+  }
+
+  it('🔴 movie 查不到但 tv 查得到 → 用 tv 绑定成功，不落 404（生产实案形状）', async () => {
+    const db = openDb(':memory:')
+    const workDir = '/media/quark/影视/[爱情公寓] (2020)'   // 刻意不含季标记：类型推断会先猜 movie，从而压到「回退」路径
+    seedFlatShow(db, workDir)
+    const calls: string[] = []
+    const deps: IdentifySchedulerDeps = {
+      db,
+      runIdentify: async () => ({ tmdbId: '95897', title: 'iPartment', reason: 'ok' }),
+      worker: {
+        model: {} as any,
+        tmdb: {
+          search: async () => [],
+          // 关键：movie 端点查不到，tv 端点查得到 —— 旧实现只看 movie 就判 404 了
+          getDetails: async (mediaType: string) => {
+            calls.push(mediaType)
+            if (mediaType !== 'tv') return null
+            // 真实 getDetails 会带回中文译名——标题门靠它匹配目录名里的 [爱情公寓]
+            return { id: 95897, title: 'iPartment', originalTitle: 'iPartment', year: 2020, genreIds: [], chineseTitles: ['爱情公寓'] } as any
+          },
+        } as any,
+      },
+    }
+    const report = await runIdentifyWorkDir(deps, {
+      workDir, dirName: '[爱情公寓] (2020)',
+      fileCount: 2, seasons: [], hasSeasonDirs: false,
+    })
+    // 推定类型只决定**先查哪个**：无季标记 → 先 movie；movie 空 → 回退 tv 命中
+    expect(calls).toEqual(['movie', 'tv'])
+    const row = db.prepare('SELECT work_id, last_error FROM files WHERE work_dir = ? LIMIT 1').get(workDir) as any
+    expect(row.last_error).toBeNull()
+    expect(row.work_id).toBe('tmdb:95897')
+    expect(report.tmdbId).toBe('95897')
+  })
+
+  it('🔴 两种类型都查不到 → 才落 tmdb-404（终态语义恢复），且同时盖当前版本戳', async () => {
+    const db = openDb(':memory:')
+    const workDir = '/media/TV/Nowhere'
+    seedFlatShow(db, workDir)
+    const deps: IdentifySchedulerDeps = {
+      db,
+      runIdentify: async () => ({ tmdbId: '1', title: 'Nowhere', reason: 'ok' }),
+      worker: { model: {} as any, tmdb: { search: async () => [], getDetails: async () => null } as any },
+    }
+    await runIdentifyWorkDir(deps, {
+      workDir, dirName: 'Nowhere', fileCount: 2, seasons: [], hasSeasonDirs: false,
+    })
+    const row = db.prepare('SELECT last_error, identify_gate_version FROM files WHERE work_dir = ? LIMIT 1').get(workDir) as any
+    expect(row.last_error).toBe('tmdb-404')
+    // 落 404 时必须同时盖戳，否则队列谓词会把它无限重新入队（付费热循环）
+    expect(row.identify_gate_version).toBe(IDENTIFY_GATE_VERSION)
+  })
+
+  it('🔴 目录名带季标记（全3季）→ 类型推断为剧集（旧判据恒判 movie）', async () => {
+    const db = openDb(':memory:')
+    const workDir = '/media/影视/某剧 全3季'
+    seedFlatShow(db, workDir)
+    const calls: string[] = []
+    const deps: IdentifySchedulerDeps = {
+      db,
+      runIdentify: async () => ({ tmdbId: '2', title: 'Some Show', reason: 'ok' }),
+      worker: {
+        model: {} as any,
+        tmdb: {
+          search: async () => [],
+          getDetails: async (mediaType: string) => {
+            calls.push(mediaType)
+            return { id: 2, title: 'Some Show', originalTitle: 'Some Show', year: 2020, genreIds: [] } as any
+          },
+        } as any,
+      },
+    }
+    await runIdentifyWorkDir(deps, { workDir, dirName: '某剧 全3季', fileCount: 2, seasons: [], hasSeasonDirs: false })
+    // hasSeasonDirs=false 且 seasons 为空，旧推断必先查 movie；带季标记后应先查 tv
+    expect(calls[0]).toBe('tv')
+  })
+})
+
+describe('D-4 · 404 终态可失效（identify_gate_version 版本戳）', () => {
+  function seed404(db: ReturnType<typeof openDb>, workDir: string, gateVersion: number | null) {
+    db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, last_error, identify_gate_version, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(`${workDir}/01.mp4`, workDir, '01.mp4', 100, 1000, workDir, 'tmdb-404', gateVersion, 1000)
+  }
+
+  it('🔴 从未盖戳（NULL）的 404 行 → 重新入队（存量假 404 的解冻出口）', () => {
+    const db = openDb(':memory:')
+    seed404(db, '/media/A', null)
+    expect(listIdentifyQueue(db, 9999).map(i => i.workDir)).toContain('/media/A')
+  })
+
+  it('🔴 盖了旧版本戳的 404 行 → 重新入队', () => {
+    const db = openDb(':memory:')
+    seed404(db, '/media/B', IDENTIFY_GATE_VERSION - 1)
+    expect(listIdentifyQueue(db, 9999).map(i => i.workDir)).toContain('/media/B')
+  })
+
+  it('🔴 盖了当前版本戳的 404 行 → 不再入队（收敛，不每轮重试）', () => {
+    const db = openDb(':memory:')
+    seed404(db, '/media/C', IDENTIFY_GATE_VERSION)
+    expect(listIdentifyQueue(db, 9999).map(i => i.workDir)).not.toContain('/media/C')
+  })
+
+  it('非 404 的错误照常入队（本变更不改变它们的语义）', () => {
+    const db = openDb(':memory:')
+    db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, last_error, identify_gate_version, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run('/media/D/01.mp4', '/media/D', '01.mp4', 100, 1000, '/media/D', 'evidence-fail: title mismatch', IDENTIFY_GATE_VERSION, 1000)
+    expect(listIdentifyQueue(db, 9999).map(i => i.workDir)).toContain('/media/D')
   })
 })

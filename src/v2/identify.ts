@@ -43,6 +43,21 @@ export function searchCandidates(dirName: string): string[] {
 /** 双证据核验（spec: two-evidence bar）：
  *  名字匹配 + 独立结构证据（年份/类型/集数）至少一条吻合。
  *  返回是否通过。纯函数，TMDB 查询结果由调用方传入。 */
+/** 识别写库门（two-evidence bar）的**判据版本**。D-4（2026-09-18），照 v45 `PARSER_VERSION`
+ *  的既有机制。
+ *
+ *  🔴 改本文件的**任何判据**（标题门、结构证据、媒体类型推断）都必须 +1。
+ *
+ *  为什么需要它：队列谓词里有 `last_error != 'tmdb-404'`，而 `tmdb-404` 是**终态**——
+ *  写入它的行从此再也不进识别队列。于是"改好了判据"对**已经落在库里的假 404 行零作用**：
+ *  它们被谓词永久排除，改了门也不重跑，生产库原封不动，而且连日志都不会响。
+ *  这与 v45 用 parser_version 消灭的静默失效是**同一个形状**。
+ *
+ *  写入侧：识别成功、写完 `work_id` 的那条绑定 UPDATE 恒写本值（记的是"我用哪套门判的"）。
+ *  读取侧：`listIdentifyQueue` 把 NULL 归一成 0，允许 `identify_gate_version < 本值` 的
+ *  404 行**重新入队**一次。重跑仍判 404 时盖上当前版本戳 → 此后收敛，不会每轮重试。 */
+export const IDENTIFY_GATE_VERSION = 1
+
 export interface TmdbEvidence {
   id: string
   title: string
@@ -70,6 +85,10 @@ export interface DirFacts {
    *  当标题，里面还混着分辨率/编码/发布组（`2160p`/`x265`/`DreamHD`），拿它当标题证据等于给
    *  幻觉开门。收紧到这里，"文件名证据"才是**比目录名更精确**而不是更松的东西。 */
   fileTitles?: string[]
+  /** D-4（2026-09-18）：目录名里带季/集标记（`全1-5季`、`Season 3`、`S01`…）——这是
+   *  「该作品是剧集」的**独立结构证据**，见 `hasSeasonToken` 的完整论证。
+   *  缺席 = 视为无该证据（旧调用点行为不变）。 */
+  dirHasSeasonToken?: boolean
 }
 
 export function verifyEvidence(
@@ -140,6 +159,10 @@ export function verifyEvidence(
   //  - 类型：candidate.mediaType 与 work_dir 的位置（TV/ 下 → tv）
   //  - 集数：candidate.episodeCount 与文件数（同数量级）
   if (dirFacts.hasSeasonDirs && candidate.mediaType === 'tv') return { ok: true }
+  // D-4 第四条腿：**目录名里的季/集标记**也是"这是剧集"的独立结构证据。
+  // 它修的是扁平文件目录（`01.mp4`、无季子目录）那一类——`hasSeasonDirs` 为假，
+  // 原来一律落进下面那条 movie 分支或最终拒绝。
+  if (dirFacts.dirHasSeasonToken === true && candidate.mediaType === 'tv') return { ok: true }
   if (!dirFacts.hasSeasonDirs && candidate.mediaType === 'movie' && dirFacts.fileCount <= 10) {
     return { ok: true }
   }
@@ -157,6 +180,35 @@ export function verifyEvidence(
  *  范围取窄是有意的：宁可让少数混排标题走旧判据（行为不变），也不要放宽到把符号当汉字。 */
 function hasCjk(s: string): boolean {
   return /[\u4E00-\u9FFF\u3400-\u4DBF]/.test(s)
+}
+
+/** 目录名里是否带"这是剧集"的季/集标记。D-4（2026-09-18）新增：既是**独立结构证据**的
+ *  第四条腿，也参与媒体类型推断。
+ *
+ *  修的是什么：扁平文件目录（文件名 `01.mp4`、季集全 NULL）**且没有**季子目录时，
+ *  `hasSeasonDirs || seasons.length > 0` 恒假 → 判 movie → 拿 TV id 去查 movie 端点 → null
+ *  → 落 `tmdb-404` **终态**，被队列谓词永久排除。生产实案
+ *  `[爱情公寓][全1-5季+电影+番外篇][国语中字][4K高码][203G]`：目录名里的 `全1-5季` 已经
+ *  明说了这是剧集，而原实现完全不看目录名里的季信息。
+ *
+ *  认这几类形态（都是发布命名里**稳定出现**的写法，不是模糊猜）：
+ *    · `全1-5季` / `全3季` / `第2季` / `第一季`  —— 中文季标记
+ *    · `Season 3` / `season03`                  —— 英文季标记
+ *    · `S01` / `s1` / `S01E01`                  —— 缩写季集标记
+ *    · `全23集` / `共12集`                       —— 中文集数标记（同为"这是剧集"的证据）
+ *
+ *  ⚠️ 刻意**不**把裸数字当季号——`2004`（年份）、`265`（编码）、`521G`（体积）都会误判。
+ *  宁可漏认（退回旧行为）也不要误认：误认会让 movie 被拿去查 tv 端点，正是要修的形状。 */
+export function hasSeasonToken(dirName: string): boolean {
+  return (
+    /全\s*\d+\s*[-–~至]\s*\d+\s*季/.test(dirName)              // 全1-5季
+    || /全\s*\d+\s*季/.test(dirName)                            // 全3季
+    || /第\s*[0-9一二三四五六七八九十]+\s*季/.test(dirName)      // 第2季 / 第一季
+    || /season\s*\d+/i.test(dirName)                            // Season 3 / season03
+    || /(^|[^A-Za-z])S\d{1,2}(E\d{1,3})?([^0-9]|$)/.test(dirName)  // S01 / S01E01
+    || /全\s*\d+\s*集/.test(dirName)                            // 全23集
+    || /共\s*\d+\s*集/.test(dirName)                            // 共12集
+  )
 }
 
 function normalize(s: string): string {

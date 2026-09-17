@@ -1554,6 +1554,46 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
     if (!cols.has('overview_zh')) db.exec('ALTER TABLE works ADD COLUMN overview_zh TEXT')
     if (!cols.has('overview_zh_checked_at')) db.exec('ALTER TABLE works ADD COLUMN overview_zh_checked_at INTEGER')
   },
+
+  // v46（D-4 识别写库门的版本戳可失效，2026-09-18）：files 表加 identify_gate_version。
+  // 纯条件式 ADD COLUMN，不碰既有表，故不触发 12 步建新表流程（同 v45 口径）。
+  //
+  // ── 为什么需要这一列（没有它，本次识别门的修复对存量库**静默失效**）──────────────
+  // 队列谓词（identifyScheduler.listIdentifyQueue）里有 `last_error != 'tmdb-404'`，
+  // 而 `tmdb-404` 是**终态**：写入它的行从此再也不进识别队列。本次 D-4 修掉的正是
+  // 产生假 404 的机制（推定类型单向、查不到就判 404），但**已经落在库里的那批 404 行
+  // 一行都不会重跑**——它们被谓词永久排除。
+  // 生产实案：`[爱情公寓][全1-5季+电影+番外篇][国语中字][4K高码][203G]`（15 文件），
+  // 扁平 `01.mp4` + 无季子目录 → 被推成 movie → 拿 TV id 查 movie 端点 → null → 404 终态。
+  // 修好门却不解冻这批行，等于"改了判据、加了代码，而生产库原封不动"——这正是 v45 用
+  // parser_version 消灭过的那类静默失效，穿着新衣服再来一次。
+  //
+  // ── 谁写 / 谁读 ────────────────────────────────────────────────────────────
+  //  · 谁写：identifyScheduler 的**绑定 UPDATE**（识别成功、写完 work_id 的那一条）恒写
+  //    IDENTIFY_GATE_VERSION。没有第二个写入者。
+  //  · 谁读：listIdentifyQueue 的谓词——`last_error != 'tmdb-404'` 那一支放宽为
+  //    「不是 404，**或者**这一行的 gate 版本落后于当前门」。于是每次改门判据并 +1 常量，
+  //    所有旧 404 行自动回到队列重跑一次；重跑仍判 404 时会盖上**当前**版本戳，此后收敛
+  //    （谓词恒假），不会每轮重试。
+  //
+  // ── 默认值必须是 NULL，不能是当前版本（v45 同一条要害）────────────────────────
+  // 若写成 `DEFAULT <当前版本>`，全部存量行会当场被标成"已用最新门判过"→ 一条都不重跑，
+  // 加了列、加了判据、加了代码而生产库原封不动。NULL = "旧门判的（或未知）"，是解冻的唯一凭据。
+  // 读取侧在 TS 里把 NULL 归一成 0 再比较（**不用 SQL 谓词判**：`identify_gate_version < 1`
+  // 在 NULL 上是三值逻辑的 unknown，永远选不中存量行——v45 头注释记的同一个坑）。
+  (db) => {
+    const exists = db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'")
+      .get()
+    if (!exists) return
+    const columns = new Set(
+      (db.prepare('PRAGMA table_info(files)').all() as Array<{ name: string }>)
+        .map((c) => c.name),
+    )
+    if (!columns.has('identify_gate_version')) {
+      db.exec('ALTER TABLE files ADD COLUMN identify_gate_version INTEGER')
+    }
+  },
 ]
 
 /** pre-fold（v9 折叠之前，Jellyfin 时代）老库的结构指纹：series.poster_tag 列存在。

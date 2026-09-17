@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { titleFromDir, searchCandidates, verifyEvidence, yearFromDir, yearFolderTypoOk, applyYearFolderTypoGate } from './identify.js'
+import { titleFromDir, searchCandidates, verifyEvidence, yearFromDir, yearFolderTypoOk, applyYearFolderTypoGate, hasSeasonToken } from './identify.js'
 import type { FindSubtitleBatchReport } from '../agent/findSubtitleWorker.schemas.js'
 
 describe('titleFromDir（目录名 → 标题）', () => {
@@ -228,6 +228,35 @@ describe('verifyEvidence 的文件名腿（D-3：高置信文件名升为一级�
     const base = { dirName: 'Pulp Fiction (1994)', fileCount: 1, seasons: [], hasSeasonDirs: false }
     expect(verifyEvidence(ev, base, 'Pulp Fiction')).toEqual({ ok: true })
     expect(verifyEvidence(ev, { ...base, fileTitles: [] }, 'Pulp Fiction')).toEqual({ ok: true })
+  })
+})
+
+// D-4（2026-09-18）：目录名里的季/集标记 = "这是剧集"的独立结构证据，也参与类型推断。
+// 误判方向很重要——把 movie 认成 tv 会让它被拿去查 tv 端点，正是要修的那个形状，
+// 故**宁可漏认**（退回旧行为）也不误认：裸数字（年份 2004、编码 265、体积 521G）一律不算。
+describe('hasSeasonToken（目录名 → 是否带季/集标记）', () => {
+  it('中文季标记：全1-5季 / 全3季 / 第2季 / 第一季', () => {
+    expect(hasSeasonToken('[爱情公寓][全1-5季+电影+番外篇][国语中字][4K高码][203G]')).toBe(true)
+    expect(hasSeasonToken('苍穹浩瀚 全6季 4K.HDR&杜比视界')).toBe(true)
+    expect(hasSeasonToken('某某剧 第2季')).toBe(true)
+    expect(hasSeasonToken('某某剧 第一季')).toBe(true)
+  })
+  it('中文集数标记：全23集 / 共12集', () => {
+    expect(hasSeasonToken('藏锋[杜比视界版本][全23集][国语配音+中文字幕]')).toBe(true)
+    expect(hasSeasonToken('某剧 共12集')).toBe(true)
+  })
+  it('英文/缩写季标记：Season 3 / S01 / S01E01', () => {
+    expect(hasSeasonToken('My Show Season 3 (2019)')).toBe(true)
+    expect(hasSeasonToken('Show.S01.1080p')).toBe(true)
+    expect(hasSeasonToken('Show.S01E01.1080p')).toBe(true)
+  })
+  it('🔴 误认防线：电影目录一律 false（裸数字不算季号）', () => {
+    expect(hasSeasonToken('The.Batman.2022.2160p.UHD.BluRay.x265.10bit.HDR.DTS-HD.MA.TrueHD.7.1.Atmos-SWTYBLZ')).toBe(false)
+    expect(hasSeasonToken('Troy.2004.DIRECTORS.CUT.Bluray.2160p.DTS-HDMA5.1.DoVi.HDR.x265.10bit-DreamHD')).toBe(false)
+    expect(hasSeasonToken('Ice.Age.Collision.Course.2016.2160p.BluRay.REMUX.HEVC.DTS-HD.MA.TrueHD.7.1.Atmos-FGT')).toBe(false)
+    expect(hasSeasonToken('The Mummy.2026.Remux.1080p.W')).toBe(false)
+    expect(hasSeasonToken('龙餐馆')).toBe(false)
+    expect(hasSeasonToken('狂赌之渊 (2017) {tmdb-72305}')).toBe(false)
   })
 })
 
