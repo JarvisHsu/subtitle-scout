@@ -505,6 +505,17 @@ async function cmdWatch() {
       // 注入面）——setup 模式下现取现得 null，端点照既有降级先例 503/跳过。
       jobs,
       tmdb: () => clients.current.tmdb,
+      // D-5 接线（2026-09-18）：`POST /api/v2/identify/bind` 的人工绑定通道。
+      //
+      // 与上面 `tmdb` 那个 getter **故意分开**：那条是 `TmdbClient` 的窄注入面
+      // （只保证 getSeasonTable/getSeasonEpisodes/search），而人工绑定要复用自动识别的**整条**
+      // 写库路径，需要 identifyDeps.worker.tmdb 那个**富适配器**（getDetails + chineseTitles +
+      // originLanguage + backdropPath）。把两者合并会让 dashboard 的只读端点被迫依赖富适配器。
+      //
+      // 取 `clients.current.identifyDeps` 而不是上面那个局部 `identifyDeps`：setup 模式或
+      // 重启同步后这一处必须现取现得，与 line 633 的 identifyProvider 同一个先例。为 null 时
+      // server.ts 的 bind 端点降级 503（unbind 不依赖 tmdb，仍可用）。
+      identifyTmdb: () => clients.current.identifyDeps?.worker.tmdb ?? null,
       cacheRoot,
       setupDeps: {
         env: process.env,

@@ -23,6 +23,7 @@ import {
 import { buildMediaLibrary, buildMediaLibraryDetail } from './mediaLibraryApi.js'
 import { buildActivity } from './activityApi.js'
 import { buildUnidentifiedHealth, type UnidentifiedHealthDTO } from './unidentifiedHealth.js'
+import { bindUnidentifiedDir, unbindUnidentifiedDir } from './identifyBindApi.js'
 import { buildStalledJobs, type StalledJobsDTO } from './stalledJobsHealth.js'
 // R-F3：通知页列表的读函数。**复用**，不在 dashboard 层重写查询——一周窗与倒序都长在
 // 那边（读窗常量还与 dbMaintenance 的 pruneFound 共用），另写一份必然静默漂移。
@@ -116,6 +117,18 @@ export interface DashboardOpts {
    *
    *  spec A §4.2：tmdb 改 getter 注入（holder 覆盖 dashboard 注入面）——消费处现取现判空。 */
   tmdb?: () => Pick<TmdbClient, 'getSeasonTable' | 'getSeasonEpisodes' | 'search'> | null
+  /** D-5（2026-09-18）：**识别轨**的 TMDB 注入面——`POST /api/v2/identify/bind` 要用它跑
+   *  `runIdentifyWorkDir`（因此需要 `getDetails` 的完整形状：含 `chineseTitles` /
+   *  `originLanguage` / `backdropPath` 那几个由 cli 适配器补上的字段）。
+   *
+   *  🔴 与上面那个 `tmdb` 窄口**刻意分开**，不是重复接线：窄口只服务季表三方法
+   *  （`getSeasonTable`/`getSeasonEpisodes`/`search`），形态是 `Pick<TmdbClient, …>`，
+   *  **连 `getDetails` 都没有**；把它放宽成识别的形状会逼所有只读调用点一起面对那几个
+   *  可选增益字段。这里注入的是 cli 已经建好的**同一个** identify 适配器
+   *  （cli/index.ts 的 `identifyDeps.worker.tmdb`）——不新开客户端、不新写适配。
+   *
+   *  未接线（setup 模式 / 老构造点）时返回 null → 端点答 503，同 reconcile-all 的既有降级先例。 */
+  identifyTmdb?: () => import('../agent/identifyWorker.js').IdentifyWorkerDeps['tmdb'] | null
   /** spec A：setupApi 的默认实现需要 cacheRoot（assrt 探测的缓存目录）；测试可注入临时目录。 */
   cacheRoot?: string
   /** spec A：setup 三端点的依赖注入（缺席→接真实实现，同 subtitleWriteDeps 的既有注入口惯例）。 */
@@ -1271,6 +1284,66 @@ export function startDashboard(opts: DashboardOpts): Promise<Server> {
           res.writeHead(502, { 'content-type': 'application/json; charset=utf-8' })
           res.end(JSON.stringify({ error: 'tmdb search failed' }))
         }
+        return
+      }
+
+      // D-5（2026-09-18）：人工绑定通道——把认不出来的目录**手动指定**到某个 TMDB 作品。
+      //
+      // 修的是什么（提案原话）：「用户当前唯一的『手动』手段是去文件管理器改目录名——而这恰好
+      // 对本节的故障目录无效」。《毒枭》那类目录，用户既不想破坏发布组原始命名，也**不知道
+      // 该改成什么**（他不知道 TMDB 上这部作品的英文名）。D-2/D-3/D-4 修好了机械判据，但判据
+      // 再宽也架不住 agent 一开始就搜错了作品——那时用户需要一个"就是它"的开关。
+      //
+      // 写库**复用自动识别的整条路径**：identifyBindApi 内部直接调 `runIdentifyWorkDir`，
+      // 只把 runIdentify 换成"立即返回用户选定 id"的 stub。于是 buildFacts / 双向类型核验 /
+      // verifyEvidence 的全部证据腿 / works 写入 / files 更新 / 版本戳一行都不重复，也就不可能
+      // 漂移（提案明写「不开旁路」）。用户选定的 id **不是免检通道**：verifyEvidence 照样要过
+      // ——选错作品比不写更糟（那是把字幕装到错的作品上）。
+      //
+      // 两个端点放这一族（而不是 router.ts 纯函数）的原因：要 await TMDB、要读 body，
+      // 同 tmdb/search / redispatch 的既有先例。鉴权由上方 `/api/*` 统一前置门负责。
+      if (rawPath === '/api/v2/identify/bind' || rawPath === '/api/v2/identify/unbind') {
+        if (req.method !== 'POST') {
+          res.writeHead(405, JSON_CT)
+          res.end(JSON.stringify({ error: 'method not allowed' }))
+          return
+        }
+        const body = await readJsonBodyOrFail(req, res)
+        if (body === BODY_FAILED) return
+        const b = (body ?? {}) as { handle?: unknown; tmdbId?: unknown }
+        const handle = typeof b.handle === 'string' ? b.handle : ''
+        const now = Date.now()
+
+        if (rawPath === '/api/v2/identify/unbind') {
+          const r = unbindUnidentifiedDir({ db, now: () => now }, { handle })
+          if (!r.ok) {
+            res.writeHead(r.status, JSON_CT)
+            res.end(JSON.stringify({ error: r.error }))
+            return
+          }
+          // 撤销成功 = 该目录回到"未识别"，下一轮识别队列会重新取它。
+          res.writeHead(200, JSON_CT)
+          res.end(JSON.stringify({ ok: true, cleared: r.cleared }))
+          return
+        }
+
+        const identifyTmdb = opts.identifyTmdb?.() ?? null
+        if (!identifyTmdb) {
+          res.writeHead(503, JSON_CT)
+          res.end(JSON.stringify({ error: 'identify deps not ready (setup mode or daemon not wired)' }))
+          return
+        }
+        const r = await bindUnidentifiedDir(
+          { db, tmdb: identifyTmdb, now: () => now },
+          { handle, tmdbId: typeof b.tmdbId === 'string' ? b.tmdbId : '' },
+        )
+        if (!r.ok) {
+          res.writeHead(r.status, JSON_CT)
+          res.end(JSON.stringify({ error: r.error }))
+          return
+        }
+        res.writeHead(200, JSON_CT)
+        res.end(JSON.stringify({ ok: true, tmdbId: r.tmdbId, written: r.written }))
         return
       }
 

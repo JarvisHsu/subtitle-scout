@@ -1594,6 +1594,37 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
       db.exec('ALTER TABLE files ADD COLUMN identify_gate_version INTEGER')
     }
   },
+
+  // v47（D-5 人工绑定通道，2026-09-18）：files 表加 work_id_source。
+  // 纯条件式 ADD COLUMN（同 v45/v46 口径），不触发 12 步建新表流程。
+  //
+  // ── 为什么需要这一列 ──────────────────────────────────────────────────────
+  // D-5 新增 `POST /api/v2/identify/bind`：用户把认不出来的 work_dir **人工指定**到某个 TMDB
+  // 作品。它与自动识别**走完全同一条写库路径**（复用 runIdentifyWorkDir + verifyEvidence +
+  // 同一事务，见 identifyBindApi.ts），本列记的是"这一行的 work_id 是谁定的"：
+  //   · 'auto'  = 识别 agent 判定的（daemon 派发）
+  //   · 'human' = 用户人工绑定的
+  //   · NULL    = v47 之前的存量行（未记录来源，**不是**"自动"的同义词）
+  //
+  // 它的唯一消费者是**撤销**：`work_id_source = 'human'` 是撤销的**前置条件**——只许撤销
+  // 人绑的，绝不许一键抹掉 agent 的判定（那会把一次正常的自动识别变成静默回退，用户看不出
+  // 发生了什么）。故这一列不是可观测性装饰，是撤销闸的判据本体。
+  //
+  // 默认 NULL 而不是 'auto'：存量行来源未知，写成 'auto' 是编造一个我们没记录过的事实；
+  // 而撤销闸要求**显式**是 'human'，NULL 天然落在"不许撤销"一侧，方向安全。
+  (db) => {
+    const exists = db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'")
+      .get()
+    if (!exists) return
+    const columns = new Set(
+      (db.prepare('PRAGMA table_info(files)').all() as Array<{ name: string }>)
+        .map((c) => c.name),
+    )
+    if (!columns.has('work_id_source')) {
+      db.exec('ALTER TABLE files ADD COLUMN work_id_source TEXT')
+    }
+  },
 ]
 
 /** pre-fold（v9 折叠之前，Jellyfin 时代）老库的结构指纹：series.poster_tag 列存在。

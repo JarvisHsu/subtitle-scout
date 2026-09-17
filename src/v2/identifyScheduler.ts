@@ -115,6 +115,17 @@ export function buildFacts(db: ScoutDb, item: IdentifyQueueItem): WorkDirFacts {
 export async function runIdentifyWorkDir(
   deps: IdentifySchedulerDeps,
   item: IdentifyQueueItem,
+  /** D-5（2026-09-18）：这一行的 work_id 是**谁**定的——写进 `files.work_id_source`。
+   *  `'auto'` = daemon 派发的识别 agent 判定（**默认**，既有的 74 个调用点一字不改）；
+   *  `'human'` = 用户经 `POST /api/v2/identify/bind` 人工指定。
+   *  唯一消费者是**撤销闸**：只许撤销 `'human'` 的行（论证见 identifyBindApi.ts）。
+   *
+   *  为什么走"同一个函数 + 一个 source 参数"而不是给绑定另写一套写库：
+   *  提案明写「写库复用自动识别同一套核验与事务，**不开旁路**」。让绑定直接调用本函数、
+   *  只把 worker 换成一个"立即返回用户选定 id"的 stub，复用的就是**整条**路径——
+   *  buildFacts、双向类型核验、verifyEvidence 的全部证据腿、works 行写入、files 更新、
+   *  版本戳——一行都不重复，也就不可能漂移。 */
+  source: 'auto' | 'human' = 'auto',
 ): Promise<IdentifyReport> {
   const now = deps.now?.() ?? Date.now()
   const runKey = deps.runKey?.(item.workDir) ?? `identify:${item.workDir}`
@@ -286,14 +297,14 @@ export async function runIdentifyWorkDir(
       // 按文件名匹配绑定（同一 work_dir 下的文件）
       const byFilename = new Map(facts.files.map(f => [f.filename, f]))
       const stmt = deps.db.prepare(`
-        UPDATE files SET work_id = ?, season = ?, episode = ?, attempt = 0, next_retry_at = NULL, last_error = NULL, identify_gate_version = ?, updated_at = ?
+        UPDATE files SET work_id = ?, season = ?, episode = ?, attempt = 0, next_retry_at = NULL, last_error = NULL, identify_gate_version = ?, work_id_source = ?, updated_at = ?
         WHERE work_dir = ? AND filename = ?
       `)
       let written = 0
       for (const f of input.files) {
         const target = byFilename.get(f.filename)
         if (!target) continue
-        stmt.run(`tmdb:${input.tmdbId}`, f.season, f.episode, IDENTIFY_GATE_VERSION, now, facts.workDir, f.filename)
+        stmt.run(`tmdb:${input.tmdbId}`, f.season, f.episode, IDENTIFY_GATE_VERSION, source, now, facts.workDir, f.filename)
         written++
       }
       return written
@@ -348,7 +359,10 @@ export async function runIdentifyWorkDir(
         UPDATE files SET attempt = ?, next_retry_at = ?, last_error = ?, identify_gate_version = ?, updated_at = ?
         WHERE work_dir = ?
       `).run(attempt + 1, now + retryDelayMs(attempt + 1), writeResult.error, IDENTIFY_GATE_VERSION, now, facts.workDir)
-      return { ...report, reason: `${report.reason} [bind failed: ${writeResult.error}]` }
+      // D-5（2026-09-18）：把写库失败**结构化**地放进 report（不只是塞进 reason 文案里）。
+      // 上面那个 `...report` 保留 tmdbId 是对的（认定结果没变），但调用方因此无法用
+      // `tmdbId === null` 判断"有没有写进去"——加这个字段就是为了让那个判断存在。
+      return { ...report, reason: `${report.reason} [bind failed: ${writeResult.error}]`, writeError: writeResult.error }
     }
     console.error(`[identify-scheduler] bound ${writeResult.written}/${facts.fileCount} files of ${facts.workDir} to tmdb:${report.tmdbId}`)
   }

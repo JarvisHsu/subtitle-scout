@@ -112,6 +112,23 @@ export interface IdentifyReport {
   tmdbId: string | null
   title: string | null
   reason: string
+  /** D-5（2026-09-18）：**写库**失败的原因；写库成功或未走到写库时为 undefined。
+   *
+   *  ⚠️ 为什么需要这个字段——`tmdbId` 与"写库成功"是**两件事**，此前没有任何字段能把它们分开：
+   *  `tmdbId` 的语义是"agent/用户**认定**这是哪部作品"，而写库还要再过一道机械核验
+   *  （`verifyEvidence` + 双向类型核验）。核验不过时 `identifyScheduler` 走的是
+   *  `return { ...report, reason: '… [bind failed: …]' }`——**tmdbId 仍是原值**，
+   *  因为"认定结果"确实没变，变的只是"没写进去"。
+   *
+   *  于是把 `tmdbId !== null` 读成"成功"是个静默陷阱：它会让一个**什么都没写进去**的
+   *  调用被当成成功回报（D-5 的人工绑定第一版就栽在这里——`POST /api/v2/identify/bind`
+   *  对一次 evidence-fail 回了 200，而库里一个字都没动）。
+   *
+   *  这里刻意**不**改用 `tmdbId = null` 表达写库失败：那会把"认定结果"也一起抹掉，
+   *  而 `identifyScheduler` 的既有分支（line 368 `report.tmdbId === null` → 'identify-failed'
+   *  退避）依赖它区分"agent 没认出来"与"认出来了但没写进去"，改语义会连带改掉退避行为。
+   *  加法比改语义安全。 */
+  writeError?: string
 }
 
 /** Identification system prompt. Default (`librarySandbox=false`) is byte-identical to the

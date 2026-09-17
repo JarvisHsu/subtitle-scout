@@ -47,14 +47,30 @@
 //       要改名的那个东西；前面的挂载点前缀对他毫无信息量，
 //       且把容器内路径贴给用户是纯排障噪音。
 import type { ScoutDb } from '../v2/db.js'
+import { encodeWorkDirHandle } from '../core/workDirHandle.js'
 
-/** 一个认不出来的作品目录。**刻意只有两个字段**——多一个就是往界面上搬排障读数。 */
+/** 一个认不出来的作品目录。
+ *
+ *  🔴 原注释是「**刻意只有两个字段**——多一个就是往界面上搬排障读数」。D-5（2026-09-18）
+ *  加了第三个 `handle`，这里说明**为什么它不算破例**：
+ *   · 破例要防的是把 `last_error` / `attempt` / `next_retry_at` / 绝对路径这类**排障读数**
+ *     搬上界面——它们对"我该做什么"零边际信息量，只是把系统的辛苦展示给用户看。
+ *   · `handle` 不是读数，是一个**动作的入参**：`POST /api/v2/identify/bind` 靠它回指这个目录。
+ *     没有它，界面上那条"你有 17 个目录认不出来"就仍然只是一条**用户无法执行的提示**——
+ *     而那正是本模块存在要修的那个病（见文件头注释：R-F2 与 R-F1 只有在"数量可见、卡片不可见"
+ *     且**用户有行动通道**时才同时成立）。
+ *   · 它是 base64url 编码的**不透明串**，不是绝对路径：前端不需要也不应该解释它，故没有把
+ *     容器内路径贴给用户（原注释那条纪律仍然成立）。
+ *   · 撤销闸只认 `work_id_source='human'`（见 db.ts v47），所以句柄本身不构成任何越权能力。 */
 export interface UnidentifiedDirDTO {
   /** 目录名（`work_dir` 的最后一段），**不是绝对路径**。用户要改名的就是这个东西。 */
   dirName: string
   /** 这个目录下有几个视频文件认不出来。用户判断"这值不值得我去改名"的唯一依据
    *  （1 个文件的目录与 24 集的目录，优先级对他完全不同）。 */
   fileCount: number
+  /** 不透明句柄（base64url(work_dir)），供 `POST /api/v2/identify/bind` / `unbind` 回指。
+   *  前端原样回传即可，不要解析、不要展示。 */
+  handle: string
 }
 
 /** `/api/v2/health` 的 `unidentified` 段。 */
@@ -116,6 +132,8 @@ export function buildUnidentifiedHealth(db: ScoutDb): UnidentifiedHealthDTO {
     dirs: rows.slice(0, MAX_LISTED_DIRS).map((r) => ({
       dirName: basenameOf(r.work_dir),
       fileCount: r.n,
+      // D-5：机器可用指针，供 POST /api/v2/identify/bind|unbind 回指。前端原样回传即可。
+      handle: encodeWorkDirHandle(r.work_dir),
     })),
   }
 }
