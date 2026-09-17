@@ -57,6 +57,19 @@ export interface DirFacts {
   fileCount: number
   seasons: number[]   // work_dir 下出现的季号
   hasSeasonDirs: boolean
+  /** D-3（2026-09-18）：该 work_dir 下**高置信**文件名解析出的标题，升为一级标题证据。
+   *
+   *  为什么需要它：目录名会被发布组/网盘污染（`G 爱G公寓5 (2020)`、
+   *  `【高清影视之家发布 www.BEBBB.com】特洛伊[…]`），而**文件名往往是干净的**
+   *  （`Ipartment.S05E01.mkv`、`Troy.2004.2160p…mkv`）。原实现只吃
+   *  `titleFromDir(work_dir)`，把这条最精确的一级证据整条浪费了——生产实案：
+   *  `苍穹浩瀚 全6季 4K.HDR&…` 目录名认不出，但同目录的文件名里 `The.Expanse.S01E01` 是干净的。
+   *
+   *  🔴 只收**高置信**（`parse_confidence === 'high'`，即有明确季集结构、title 取自
+   *  `parseFilename` 的 seriesname）的条目：无结构时 `parseFilename` 会把**整个文件名清洗后**
+   *  当标题，里面还混着分辨率/编码/发布组（`2160p`/`x265`/`DreamHD`），拿它当标题证据等于给
+   *  幻觉开门。收紧到这里，"文件名证据"才是**比目录名更精确**而不是更松的东西。 */
+  fileTitles?: string[]
 }
 
 export function verifyEvidence(
@@ -73,41 +86,48 @@ export function verifyEvidence(
   if (candidate.originalTitle != null) titleCandidates.push(normalize(candidate.originalTitle))
   for (const c of chineseTitles) titleCandidates.push(normalize(c))
   const normTarget = normalize(targetTitle)
-  const titleOk = titleCandidates.some((nc) => {
-    if (nc === '' || normTarget === '') return false
-    if (nc === normTarget) return true
-    // ── CJK 侧（D-2 修复，2026-09-18 复盘 openspec `improve-media-recognition`）─────────────
-    // 🔴 曾经的单一判据是"显著子串重叠 ≥ 5 字符"，它对**含 CJK 的标题**是错的门：
-    // 归一后的中文标题通常是 2~4 字（毒枭=2、西部世界=4、爱情公寓=4），**永远够不到 5 字下限**，
-    // 于是整条包含匹配从未在中文字幕上执行过——所有中文目录一律判 `title mismatch`。
-    // 生产实案（2026-09-16）：库里 17 个"认不出来"的目录里绝大多数是这个原因，
-    // `evidence-fail: title mismatch: candidate="Narcos" vs dir="[毒枭][全1-3季]…"`，
-    // 而 TMDB 上 Narcos 的 zh 译名正是 `毒枭`、是目录名的字面前缀。
-    //
-    // 为什么可以取消下限：原阈值的意图是**防幻觉**（拦住与目录名无关的候选），而那个意图只在
-    // 拉丁侧成立——汉字的信息密度远高于字母，2 个字已是**完整词**且几乎不共享：
-    // "毒枭"与"毒液"共享首字但谁也不包含谁，包含关系本身仍是强证据。故：
-    //   · 含 CJK 的候选 → 只要求归一后互为子串（含相等，相等上面已处理）
-    //   · 纯拉丁的候选 → 保持原有 ≥5 字符显著性重叠，行为一字不改
-    // 双证据条（本函数下半段的年份/类型/集数）不放松，仍然是"名字 + 独立结构证据"两道。
-    if (hasCjk(nc) || hasCjk(normTarget)) {
-      if (nc.includes(normTarget) || normTarget.includes(nc)) return true
-      // CJK 侧不做"短串滑窗找 5 字"那一套——那是为拉丁长标题设计的部分匹配补丁，
-      // 对 2~4 字的中文标题既不适用（滑窗步长本就是 5）也无必要。
-      return false
-    }
-    // 显著子串重叠（≥5 字符）——覆盖 PLUR1BUS vs Pluribus 这种部分匹配
-    if (nc.length >= 5 && normTarget.length >= 5) {
-      if (nc.includes(normTarget) || normTarget.includes(nc)) return true
-      // 最长公共子串（简化：取短串的前 5+ 字符在长串里找）
-      const short = nc.length <= normTarget.length ? nc : normTarget
-      const long = nc.length <= normTarget.length ? normTarget : nc
-      for (let i = 0; i <= short.length - 5; i++) {
-        if (long.includes(short.slice(i, i + 5))) return true
+
+  /** 一组标题候选与一个"被测串"的匹配判据——**唯一一份**，目录名腿与文件名腿共用。
+   *  分叉成两份是本仓反复栽过的坑（C30）。 */
+  const matches = (cands: string[], target: string): boolean =>
+    cands.some((nc) => {
+      if (nc === '' || target === '') return false
+      if (nc === target) return true
+      // ── CJK 侧（D-2 修复，2026-09-18 复盘 openspec `improve-media-recognition`）───────────
+      // 🔴 曾经的单一判据是"显著子串重叠 ≥ 5 字符"，它对**含 CJK 的标题**是错的门：
+      // 归一后的中文标题通常是 2~4 字（毒枭=2、西部世界=4、爱情公寓=4），**永远够不到 5 字下限**，
+      // 于是整条包含匹配从未在中文字幕上执行过——所有中文目录一律判 `title mismatch`。
+      // 生产实案（2026-09-16）：库里 17 个"认不出来"的目录里绝大多数是这个原因。
+      //
+      // 为什么可以取消下限：原阈值的意图是**防幻觉**，而那个意图只在拉丁侧成立——汉字的信息
+      // 密度远高于字母，2 个字已是**完整词**且几乎不共享："毒枭"与"毒液"共享首字但谁也不包含
+      // 谁，包含关系本身仍是强证据。
+      if (hasCjk(nc) || hasCjk(target)) {
+        return nc.includes(target) || target.includes(nc)
       }
-    }
-    return false
-  })
+      // 显著子串重叠（≥5 字符）——覆盖 PLUR1BUS vs Pluribus 这种部分匹配（纯拉丁侧，行为不变）
+      if (nc.length >= 5 && target.length >= 5) {
+        if (nc.includes(target) || target.includes(nc)) return true
+        const short = nc.length <= target.length ? nc : target
+        const long = nc.length <= target.length ? target : nc
+        for (let i = 0; i <= short.length - 5; i++) {
+          if (long.includes(short.slice(i, i + 5))) return true
+        }
+      }
+      return false
+    })
+
+  // 标题证据的两条**并列**腿（D-3）：
+  //   ① 目录名腿——候选与 `targetTitle`（已由 titleFromDir 清洗的目录名）互为包含
+  //   ② 文件名腿——候选与某个**高置信文件名标题**互为包含
+  // 为什么不合并成一组候选去比 targetTitle：那是最弱的形态，**救不了它要救的场景**。
+  // 生产实案 `G 爱G公寓5 (2020)`：目录名被注入了 `G`，`Ipartment`（文件名干净解析出的标题）
+  // **不可能**是 `g爱g公寓5` 的子串，而 TMDB 的 zh 译名是 `爱情公寓`（不是目录名里的片段）——
+  // 于是"并入候选再比目录名"照样 FAIL。文件名证据的价值恰恰在于它**能独立支撑**，不依赖目录名。
+  // 判据仍是同一份 `matches()`（防漂移），只是把"被测串"换成文件名标题。
+  const fileTitles = (dirFacts.fileTitles ?? []).map(normalize).filter((t) => t !== '')
+  const titleOk = matches(titleCandidates, normTarget)
+    || fileTitles.some((ft) => matches(titleCandidates, ft))
   if (!titleOk) {
     return { ok: false, reason: `title mismatch: candidate="${candidate.title}" vs dir="${targetTitle}"` }
   }

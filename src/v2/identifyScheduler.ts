@@ -5,7 +5,33 @@
 // 404 终态：getDetails 返回 null → last_error='tmdb-404'，永不重试（spec-gap B2）。
 import type { ScoutDb } from './db.js'
 import { verifyEvidence, titleFromDir, type TmdbEvidence } from './identify.js'
+import { parseFilename } from '../recognition/parseFilename.js'
 import type { IdentifyWorkerDeps, IdentifyReport, WorkDirFacts } from '../agent/identifyWorker.js'
+
+/** D-3：从本簇文件里取**高置信**解析出的标题，作为一级标题证据交给 verifyEvidence。
+ *
+ *  「高置信」= `parse_confidence === 'high'`（有明确季集结构），此时 `parseFilename` 的
+ *  `title` 取自规则库的 seriesname，**不含**分辨率/编码/发布组——生产实例：
+ *  `The.Expanse.S01E01.2015.2160p.AMZN.WEB-DL.DDP5.1.H265.HDR.DV.2Audio-年糕.mkv`
+ *  → title = `The Expanse`。
+ *
+ *  🔴 刻意**不要**低置信行：无季集结构时 `parseFilename` 会把整个文件名清洗后当标题，里面
+ *  混着 `2160p`/`x265`/`DreamHD` 这类片段，拿它当标题证据等于给幻觉开门（同 verifyEvidence
+ *  头注释"机械层只拦完全无关的标题"的边界）。收紧到高置信，"文件名证据"才是比目录名更精确。
+ *
+ *  去重：同一作品的每个文件都会解析出同一个 seriesname，几十个文件没必要重复进候选表。
+ *  纯函数、无 IO——`parseFilename` 是纯字符串解析，可以在核验路径上直接调。 */
+function highConfidenceFileTitles(
+  files: Array<{ filename: string; confidence: string }>,
+): string[] {
+  const out = new Set<string>()
+  for (const f of files) {
+    if (f.confidence !== 'high') continue
+    const t = parseFilename(f.filename).title
+    if (t != null && t !== '') out.add(t)
+  }
+  return [...out]
+}
 
 export interface IdentifySchedulerDeps {
   db: ScoutDb
@@ -106,6 +132,13 @@ export async function runIdentifyWorkDir(
       fileCount: facts.fileCount,
       seasons: facts.seasons,
       hasSeasonDirs: facts.hasSeasonDirs,
+      // D-3（2026-09-18）：把**高置信文件名**升为一级标题证据（第三个根因的修复）。
+      // 目录名会被发布组/网盘污染，而文件名常常是干净的；原实现只吃 titleFromDir(work_dir)，
+      // 把这条最精确的证据整条浪费。生产实案（苍穹浩瀚 / tmdb:63174）：
+      //   目录名  = 「苍穹浩瀚 全6季 4K.HDR&杜比视界 国英双音轨 内封精修简英双语特效字幕 顶级收藏版片源」
+      //   文件名  = 「The.Expanse.S01E01.2015.2160p.AMZN.WEB-DL.DDP5.1.H265.HDR.DV.2Audio-年糕.mkv」
+      // 目录名里**没有** "theexpanse"（D-2 的 CJK 门也救不了它），只有文件名能证明身份。
+      fileTitles: highConfidenceFileTitles(facts.files),
       // 🔴 2026-08-08 实测：必须用 titleFromDir 清洗后的标题（去掉年份/花括号），
       // 不能传原始 dirName——带年份的目录名会让 normalize 后的字符串多出年份数字导致
       // 永不匹配（Chainsaw Man Reze Arc 的 ': ' vs '- ' 差异 + 年份 2025 实测踩中）。

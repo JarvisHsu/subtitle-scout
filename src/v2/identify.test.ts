@@ -170,6 +170,67 @@ describe('verifyEvidence 的 CJK 标题门（D-2：取消对中文短标题的 5
   })
 })
 
+// D-3 修复（2026-09-18，openspec `improve-media-recognition`）：把**高置信文件名**升为
+// 一级标题证据。目录名会被发布组/网盘污染，而文件名往往干净——
+// 生产实案 `G 爱G公寓5 (2020)`：目录名被注入 `G`，TMDB 的 zh 译名是 `爱情公寓`（不是目录名的
+// 片段），于是"候选并入目录名比较"这种最弱形态照样 FAIL；而文件名 `Ipartment.S05E01…` 解析出
+// 干净标题 `Ipartment`，与 TMDB 主标题 `iPartment` 归一后相等。
+// 故标题证据做成**两条并列腿**：① 候选 vs 目录名  ② 候选 vs 高置信文件名标题。
+describe('verifyEvidence 的文件名腿（D-3：高置信文件名升为一级标题证据）', () => {
+  it('🔴 生产实案：目录名被注入 `G` 而文件名干净 → 目录名腿 FAIL、文件名腿 PASS', () => {
+    const dir = 'G 爱G公寓5 (2020)'
+    const facts = { dirName: dir, fileCount: 36, seasons: [5], hasSeasonDirs: true }
+    // ① 只有目录名腿 → 拒绝（生产里这 36 个文件全被拒的原因）
+    expect(verifyEvidence(
+      { id: 'tmdb:84947', title: 'iPartment', originalTitle: 'iPartment', year: 2020, mediaType: 'tv' },
+      facts,
+      dir,
+      ['爱情公寓'],
+    )).toEqual({ ok: false, reason: expect.stringContaining('title mismatch') })
+    // ② 补上文件名腿 → 通过
+    expect(verifyEvidence(
+      { id: 'tmdb:84947', title: 'iPartment', originalTitle: 'iPartment', year: 2020, mediaType: 'tv' },
+      { ...facts, fileTitles: ['Ipartment'] },
+      dir,
+      ['爱情公寓'],
+    )).toEqual({ ok: true })
+  })
+
+  it('另一实案：`Narcos.S01E01…` 的文件名标题与 TMDB 主标题相等', () => {
+    expect(verifyEvidence(
+      { id: 'tmdb:63351', title: 'Narcos', originalTitle: 'Narcos', year: 2015, mediaType: 'tv' },
+      { dirName: '[毒枭][全1-3季][内嵌多国字幕][4K HDR][145G]', fileCount: 30, seasons: [1, 2, 3], hasSeasonDirs: true, fileTitles: ['Narcos'] },
+      '[毒枭][全1-3季][内嵌多国字幕][4K HDR][145G]',
+      ['毒枭'],
+    )).toEqual({ ok: true })
+  })
+
+  it('🔴 误放防线：文件名腿**不**让无关候选通过（这正是它不依赖目录名的风险所在）', () => {
+    expect(verifyEvidence(
+      { id: 'tmdb:999', title: 'Completely Different Show', originalTitle: null, year: 2020, mediaType: 'tv' },
+      { dirName: 'G 爱G公寓5 (2020)', fileCount: 36, seasons: [5], hasSeasonDirs: true, fileTitles: ['Ipartment'] },
+      'G 爱G公寓5 (2020)',
+      ['爱情公寓'],
+    )).toEqual({ ok: false, reason: expect.stringContaining('title mismatch') })
+  })
+
+  it('双证据条不因文件名腿而放松：标题腿过了、但无任何结构证据 → 仍拒', () => {
+    expect(verifyEvidence(
+      { id: 'tmdb:84947', title: 'iPartment', originalTitle: null, year: null, mediaType: 'movie' },
+      { dirName: 'G 爱G公寓5 (2020)', fileCount: 50, seasons: [], hasSeasonDirs: false, fileTitles: ['Ipartment'] },
+      'G 爱G公寓5 (2020)',
+      [],
+    )).toEqual({ ok: false, reason: expect.stringContaining('no independent') })
+  })
+
+  it('fileTitles 缺席/空数组（旧调用点）→ 行为与 D-3 之前逐字一致', () => {
+    const ev = { id: 'tmdb:680', title: 'Pulp Fiction', originalTitle: 'Pulp Fiction', year: 1994, mediaType: 'movie' as const }
+    const base = { dirName: 'Pulp Fiction (1994)', fileCount: 1, seasons: [], hasSeasonDirs: false }
+    expect(verifyEvidence(ev, base, 'Pulp Fiction')).toEqual({ ok: true })
+    expect(verifyEvidence(ev, { ...base, fileTitles: [] }, 'Pulp Fiction')).toEqual({ ok: true })
+  })
+})
+
 describe('yearFromDir', () => {
   it('标准年份', () => {
     expect(yearFromDir('Pulp Fiction (1994)')).toBe(1994)
