@@ -18,6 +18,9 @@ dist/
 # 本地部署资料（不随公开仓；本地保留）
 deploy/
 worker/
+# 本地构建覆盖：把 image 换成 subtitle-scout:local 并补上 build 段，让领先上游的本地提交
+# 能进容器（主 compose 只跟 ghcr 上游镜像，无 build 段）。纯本机部署件，见文件头注释。
+docker-compose.override.yml
 # 内部设计、运维、战役和研究记录不随公开仓，本地仍保留。
 docs/*
 !docs/agent-first-identification-architecture.md
