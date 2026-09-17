@@ -5,7 +5,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { allocate, cleanup, install, gcOrphans, findStagingHusks, isStagingHusk } from './stagingSandbox.js'
+import { allocate, cleanup, install, gcOrphans, findStagingHusks, isStagingHusk, probeStagingPlacement, PLACEMENT_PROBE_PREFIX } from './stagingSandbox.js'
 
 // Finding 4: production code has no call sites for install() yet, so defaulting this to
 // a short ladder everywhere retries are exercised keeps this suite fast without touching
@@ -45,6 +45,8 @@ let closeSyncOverride: ((real: typeof import('node:fs').closeSync, fd: number) =
 // 2026-09-16 cleanup 父目录收尾 / 并发窗口的可测接缝（同上：ESM 命名空间对象不可重定义）。
 let rmSyncOverride: ((real: typeof import('node:fs').rmSync, path: string, opts: unknown) => void) | null = null
 let unlinkSyncOverride: ((real: typeof import('node:fs').unlinkSync, path: string) => void) | null = null
+// 2026-09-17 落点探针（probeStagingPlacement 的收尾用 rmdirSync）的可测接缝。
+let rmdirSyncOverride: ((real: typeof import('node:fs').rmdirSync, path: string) => void) | null = null
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>()
@@ -82,6 +84,10 @@ vi.mock('node:fs', async (importOriginal) => {
       if (unlinkSyncOverride) return unlinkSyncOverride(actual.unlinkSync, args[0] as string)
       return actual.unlinkSync(...args)
     },
+    rmdirSync: (...args: Parameters<typeof actual.rmdirSync>) => {
+      if (rmdirSyncOverride) return rmdirSyncOverride(actual.rmdirSync, args[0] as string)
+      return actual.rmdirSync(...args)
+    },
   }
 })
 
@@ -117,6 +123,84 @@ describe('allocate', () => {
     writeFileSync(ignorePath, 'custom content')
     allocate('job-2', root)
     expect(readFileSync(ignorePath, 'utf8')).toBe('custom content')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 沙盒目录名映射（2026-09-17）。生产形态：jobId = `subtitle:tmdb:<id>`，媒体根在夸克网盘上
+// （rclone mount → WebDAV → alist Quark 驱动），驱动拒绝**目录名**里的 `:`：
+//     POST /api/fs/mkdir → {"code":500,"message":" bad file name :[...] "}
+//     MKCOL（终态）→ 405 Method Not Allowed
+// 而同一个位置的**文件名**允许 `:`（`.ignore` 上传成功即证）。更坏的是 rclone 的
+// `--vfs-cache-mode writes` 把 mkdir 失败伪装成本地成功，于是 cleanup 的 rm 必然失败、被
+// `catch {}` 吞掉——预防者连续停摆数十次任务而无一条日志。修法：目录名过 stagingDirName。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('allocate/cleanup — jobId 含冒号（生产形态）', () => {
+  afterEach(() => {
+    rmSyncOverride = null
+    unlinkSyncOverride = null
+    vi.restoreAllMocks()
+  })
+
+  it('🔴 allocate 建出的目录名不含冒号，落点是映射后的名字', () => {
+    const root = mediaRoot()
+    const dir = allocate('subtitle:tmdb:999999', root)
+    expect(dir).toBe(join(root, '.subtitle-staging', 'subtitle-tmdb-999999'))
+    expect(dir).not.toContain(':')
+    expect(existsSync(join(root, '.subtitle-staging', 'subtitle-tmdb-999999'))).toBe(true)
+    // 逐字当目录名的那份名字**不该**存在（旧代码下的形态）
+    expect(existsSync(join(root, '.subtitle-staging', 'subtitle:tmdb:999999'))).toBe(false)
+  })
+
+  it('🔴 cleanup 对冒号 jobId 真的删得掉：视频目录下净残留为 0', () => {
+    const root = mediaRoot()
+    const dir = allocate('subtitle:tmdb:999999', root)
+    writeFileSync(join(dir, 'candidate.zh-Hans.srt'), 'junk')
+    // 忠实模拟生产的不对称：**建**（mkdir）在 rclone VFS 下会假成功，而**删**（rm）真的打到远端
+    // 并对含冒号的路径失败（实测日志 `Dir.Remove failed ... directory not found` / 回写 405）。
+    // 于是旧代码在这里必红：rmSync 抛错 → 被 catch 吞掉 → 沙盒目录原样留下。
+    rmSyncOverride = (real, p, opts) => {
+      if (typeof p === 'string' && p.includes(':')) {
+        throw Object.assign(new Error('405 Method Not Allowed'), { code: 'EPERM' })
+      }
+      return (real as unknown as (path: string, o?: unknown) => void)(p, opts)
+    }
+    cleanup('subtitle:tmdb:999999', root)
+    rmSyncOverride = null
+
+    expect(existsSync(dir)).toBe(false)
+    expect(existsSync(join(root, '.subtitle-staging'))).toBe(false)
+    expect(readdirSync(root).filter(n => n.startsWith('.'))).toEqual([])
+  })
+
+  it('失败必须留痕：删不掉时打出含原始 jobId 与映射后目录名的 ERROR，且不抛错', () => {
+    const root = mediaRoot()
+    const dir = allocate('subtitle:tmdb:999999', root)
+    writeFileSync(join(dir, 'candidate.srt'), 'junk')
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    rmSyncOverride = (real, p) => {
+      if (p === dir) throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' })
+      return real(p)
+    }
+
+    expect(() => cleanup('subtitle:tmdb:999999', root)).not.toThrow()
+    rmSyncOverride = null
+
+    // 映射关系必须从日志里就能看懂（否则排障要回头读代码）
+    const logged = spy.mock.calls.map(c => c.join(' ')).join('\n')
+    expect(logged).toContain(dir)
+    expect(logged).toContain('subtitle:tmdb:999999')
+    expect(logged).toContain('subtitle-tmdb-999999')
+  })
+
+  it('反向断言保留：同根还有另一个冒号 jobId 时，父目录与共用标记都原样保留', () => {
+    const root = mediaRoot()
+    allocate('subtitle:tmdb:1', root)
+    const dir2 = allocate('subtitle:tmdb:2', root)
+    cleanup('subtitle:tmdb:1', root)
+    expect(existsSync(join(root, '.subtitle-staging', 'subtitle-tmdb-1'))).toBe(false)
+    expect(existsSync(dir2)).toBe(true)
+    expect(existsSync(join(root, '.subtitle-staging', '.ignore'))).toBe(true)
   })
 })
 
@@ -665,6 +749,107 @@ describe('gcOrphans', () => {
     expect(existsSync(join(root, 'Show', 'Season 01', 'E01.mkv'))).toBe(true)
     expect(existsSync(join(root, 'Show', 'Season 01'))).toBe(true)
     expect(existsSync(join(root, 'Show'))).toBe(true)
+  })
+})
+
+describe('gcOrphans — 在飞登记的是原始 jobId（映射后仍认得出）', () => {
+  it('🔴 登记的原始 jobId（含冒号）其沙盒不被当孤儿删掉', () => {
+    // daemonV2 的 inFlightStagingJobIds 登记的是 subtitleJobId() 的原样返回（`subtitle:tmdb:<id>`），
+    // 而磁盘条目名已被 allocate 映射过。这一条锁住"两侧都传原始 jobId、映射只在 gcOrphans 内部做"。
+    const root = mediaRoot()
+    const dir = allocate('subtitle:tmdb:7', root)
+    const oldTime = new Date(Date.now() - 11 * 60 * 1000)
+    utimesSync(dir, oldTime, oldTime)
+
+    const cleaned = gcOrphans([root], new Set(['subtitle:tmdb:7']), 0)
+
+    expect(cleaned).toBe(0)
+    expect(existsSync(dir)).toBe(true)
+  })
+
+  it('登记已映射过的名字同样认得出（幂等性质撑住的第二种调用约定）', () => {
+    const root = mediaRoot()
+    const dir = allocate('subtitle:tmdb:7', root)
+    const oldTime = new Date(Date.now() - 11 * 60 * 1000)
+    utimesSync(dir, oldTime, oldTime)
+
+    const cleaned = gcOrphans([root], new Set(['subtitle-tmdb-7']), 0)
+
+    expect(cleaned).toBe(0)
+    expect(existsSync(dir)).toBe(true)
+  })
+
+  it('不在飞集合里的冒号任务照样被回收（保护不能变成豁免）', () => {
+    const root = mediaRoot()
+    const dir = allocate('subtitle:tmdb:8', root)
+    const oldTime = new Date(Date.now() - 11 * 60 * 1000)
+    utimesSync(dir, oldTime, oldTime)
+
+    const cleaned = gcOrphans([root], new Set(['subtitle:tmdb:7']), 0)
+
+    expect(cleaned).toBe(1)
+    expect(existsSync(dir)).toBe(false)
+  })
+})
+
+describe('probeStagingPlacement — doctor 的落点探针', () => {
+  afterEach(() => {
+    rmdirSyncOverride = null
+    vi.restoreAllMocks()
+  })
+
+  it('可建的根：建得出来、也删得掉，且不留任何痕迹', () => {
+    const root = mediaRoot()
+    expect(() => probeStagingPlacement(root)).not.toThrow()
+    // 父目录是探针顺手建的 → 必须一并收掉，否则 doctor 会在媒体根里留一个 0 条目的
+    // .subtitle-staging（它既不是空壳也不在任何回收面的判据里）
+    expect(existsSync(join(root, '.subtitle-staging'))).toBe(false)
+    expect(readdirSync(root)).toEqual([])
+  })
+
+  it('已有 .subtitle-staging（如在跑任务）时只删探针目录，父目录与标记原样保留', () => {
+    const root = mediaRoot()
+    const jobDir = allocate('job-1', root)
+    probeStagingPlacement(root)
+    expect(existsSync(jobDir)).toBe(true)
+    expect(existsSync(join(root, '.subtitle-staging', '.ignore'))).toBe(true)
+    const leftovers = readdirSync(join(root, '.subtitle-staging'))
+      .filter(n => n.startsWith(PLACEMENT_PROBE_PREFIX))
+    expect(leftovers).toEqual([])
+  })
+
+  it('probe 名字走隐藏前缀（不会被 Jellyfin / 媒体树遍历看到）', () => {
+    const root = mediaRoot()
+    const names: string[] = []
+    // 借 rmdirSync 接缝观察探针目录名（真实 rmdir 已由上一个用例覆盖）
+    rmdirSyncOverride = (real, p) => {
+      names.push(p)
+      return real(p)
+    }
+    probeStagingPlacement(root)
+    expect(names.some(p => p.includes(PLACEMENT_PROBE_PREFIX))).toBe(true)
+    expect(PLACEMENT_PROBE_PREFIX.startsWith('.')).toBe(true)
+  })
+
+  it('媒体根不可达时抛 ENOENT，且**不**顺手把挂载点当普通目录建出来', () => {
+    const root = mediaRoot()
+    const missing = join(root, 'not-mounted')
+    // 这一条同时钉住实现里的"两级都不 recursive"：若用了 recursive，探针会在宿主上凭空造出
+    // `<missing>/.subtitle-staging/`，把"盘没挂上"伪装成 ✓（2026-07-29 云盘误判的同型事故）。
+    expect(() => probeStagingPlacement(missing)).toThrow()
+    expect(existsSync(missing)).toBe(false)
+    expect(readdirSync(root)).toEqual([])
+  })
+
+  it('清理失败不改变结论：只记一条 ERROR，不抛错（残留交给 gcOrphans 兜底）', () => {
+    const root = mediaRoot()
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    rmdirSyncOverride = () => {
+      throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' })
+    }
+    expect(() => probeStagingPlacement(root)).not.toThrow()
+    rmdirSyncOverride = null
+    expect(spy.mock.calls.map(c => c.join(' ')).join('\n')).toContain(PLACEMENT_PROBE_PREFIX)
   })
 })
 

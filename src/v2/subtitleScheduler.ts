@@ -171,11 +171,17 @@ export function listSubtitleQueue(
   return [...byWork.values()]
 }
 
-/** 一个作品的字幕任务的 jobId，同时也是它 staging 沙盒的**目录名**
- *  （`<root>/.subtitle-staging/<jobId>/`，见 files/stagingSandbox.ts allocate）。
+/** 一个作品的字幕任务的 jobId——**身份串**，不是 staging 沙盒的目录名。
  *
- *  抽出来导出是 C34 的刚性需求：gcOrphans 靠这个目录名判"这个工作台是不是正在被使用"，
- *  daemon 侧必须能算出与 buildSubtitleTask **字节一致**的同一个字符串。两边各自手写一份
+ *  ⚠️ 2026-09-17：本函数此前也是沙盒的目录名（`<root>/.subtitle-staging/<jobId>/`），这个巧合
+ *  在生产上爆掉了——jobId 的形态是 `subtitle:tmdb:<id>`，而媒体根所在的夸克网盘/ alist 驱动
+ *  **拒绝目录名里的冒号**（详见 core/mediaContext.ts 的 stagingDirName）。现在目录名由
+ *  `files/stagingSandbox.ts` 经 `stagingDirName(jobId)` 派生，本函数的返回值不再直接落盘。
+ *  它仍然是 trace 的 runKey 组成（`job-${jobId}`，daemonV2）与任务对象上的 `jobId` 字段。
+ *
+ *  抽出来导出是 C34 的刚性需求：gcOrphans 靠目录名判"这个工作台是不是正在被使用"，
+ *  daemon 侧必须能算出与 buildSubtitleTask **字节一致**的同一个 jobId 字符串（映射只在
+ *  stagingSandbox 内部做一次，两侧都传原始 jobId）。两边各自手写一份
  *  `subtitle:${workId}` 的话，任何一侧改了格式，GC 的保护就静默失效——沙盒会在 agent 正在
  *  往里写的时候被 rm 掉，而测试里两边都自洽、全绿。本仓已因"留两份漂移实现"栽过多次。 */
 export function subtitleJobId(workId: string): string {
@@ -198,7 +204,8 @@ export function buildSubtitleTask(
   const dirs = item.files.map(f => f.dir)
   const mediaRoot = commonDir(dirs)
   // jobId 只算一次，与下面返回体里的 jobId 字段共用同一个值——必须与 daemon 侧
-  // (this as any).inFlightStagingJobIds 登记的目录名**字节一致**（见 subtitleJobId 注释）。
+  // (this as any).inFlightStagingJobIds 登记的那个串**字节一致**（见 subtitleJobId 注释：
+  // 两侧都登记原始 jobId，目录名的映射只在 stagingSandbox 内部发生一次）。
   const jobId = subtitleJobId(item.workId)
   // 🔴 试错沙盒根 ≠ INNER 沙盒根。mediaRoot（上一步的公共祖先，如 /media/Show）是**装机**
   // 收窄用的；沙盒必须挂在**配置媒体根**（如 /media）一级，否则 gcOrphans 的非递归扫描

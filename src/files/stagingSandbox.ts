@@ -7,7 +7,9 @@ import {
 } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { writeAll } from './fsUtil.js'
-import { isJunkDirName, STAGING_DIRNAME, TRANSLATE_STAGING_DIRNAME } from '../core/mediaContext.js'
+import {
+  isJunkDirName, STAGING_DIRNAME, TRANSLATE_STAGING_DIRNAME, stagingDirName,
+} from '../core/mediaContext.js'
 
 const INSTALL_RETRY_DELAYS_MS = [50, 150, 400, 1000]
 const RETRYABLE_CODES = new Set(['EEXIST', 'EPERM', 'EBUSY'])
@@ -147,10 +149,16 @@ function copyThenRenameSameDir(stagedPath: string, finalPath: string): void {
  *  allocate 与 cleanup 之间发生时会成为永久泄漏。install() 仍把最终文件 rename 进视频自己的
  *  目录(同一挂载/文件系统,原子 rename 单跳不破),所以沙盒挂在根一级不影响装机。调用方
  *  (如 v2/realignExecutor.ts)用 containingRoot(videoDir, mediaRoots) 求这个根;没有根匹配时
- *  安全退回视频目录本身(无媒体根概念的退化路径不受 gcOrphans 保护是预期行为)。 */
+ *  安全退回视频目录本身(无媒体根概念的退化路径不受 gcOrphans 保护是预期行为)。
+ *
+ *  目录名 = `stagingDirName(jobId)`，**不是** jobId 本身——jobId 是身份串（`subtitle:tmdb:<id>`），
+ *  底层的网盘驱动可能拒绝其中的字符。下一个读者不要以为 `join(root, jobId)` 是安全的。 */
 export function allocate(jobId: string, mediaRootForVideo: string): string {
   const root = join(mediaRootForVideo, STAGING_DIRNAME)
-  const dir = join(root, jobId)
+  // 目录名 MUST 经 stagingDirName 映射，MUST NOT 用 jobId 逐字当目录名：jobId 是 `subtitle:tmdb:<id>`
+  // 这样的身份串，而媒体根所在的文件系统/网盘驱动可能拒绝其中的字符（夸克拒绝冒号，且 rclone 的
+  // VFS 写缓存会把 mkdir 失败伪装成本地成功）。详见 core/mediaContext.ts 的 stagingDirName。
+  const dir = join(root, stagingDirName(jobId))
   mkdirSync(dir, { recursive: true })
   ensureStagingMarker(root)
   return dir
@@ -175,14 +183,37 @@ export function allocate(jobId: string, mediaRootForVideo: string): string {
  *  上消除那个窗口。残余窗口转移到"标记已删、`<jobId>` 刚建"这个更窄的组合上，且这一组合
  *  由下面的 `ensureStagingMarker(root)` 兜住——rmdir 失败即把标记补回，不留屏蔽空窗。
  *
- *  cleanup 是上面两处的**唯一**生产调用点（agent/findSubtitleWorker.ts:504 的 finally）。 */
+ *  cleanup 是上面两处的**唯一**生产调用点（agent/findSubtitleWorker.ts:504 的 finally）。
+ *
+ *  ── 有意不做的选择：不加删除重试/回退策略 ────────────────────────────────
+ *  ①′ 只留痕、不重试、不换姿势再删（不改 `rm -rf` 的语义、不改为先删内容再删目录）。冒号这条
+ *  根因由 stagingDirName 从构造上消除后，剩余的删除失败原因只剩"挂载抖动/远端最终一致"，那是
+ *  **启动时的 gcOrphans 本来就该兜**的场景；在这里加一层重试只会把一次等待挪到任务尾（拖慢
+ *  finally），并制造第二份"什么时候算删干净"的判据。 */
 export function cleanup(jobId: string, mediaRootForVideo: string): void {
   const root = join(mediaRootForVideo, STAGING_DIRNAME)
-  // ① 删本 job 的沙盒：既有行为，逐字不变。
+  // 目录名与 allocate 同法映射（两处 MUST 同一个函数，见 core/mediaContext.ts 的 stagingDirName）。
+  const dirName = stagingDirName(jobId)
+  // ① 删本 job 的沙盒：既有行为，逐字不变（除目录名映射）。
   try {
-    rmSync(join(root, jobId), { recursive: true, force: true })
+    rmSync(join(root, dirName), { recursive: true, force: true })
   } catch {
     // best-effort:清理失败不影响本次运行已产生的结论
+  }
+  // ①' 复核删除结果并留痕（2026-09-17 修订）。此前这里只有上面的空 catch：当沙盒目录**根本建不
+  // 出来**时（实测：jobId 的冒号被夸克/alist 拒绝，rclone 的 VFS 写缓存把 mkdir 失败伪装成本地
+  // 成功），删除会稳定失败并被无声吞掉——预防者在生产上连续停摆数十次任务而日志里一条痕迹都没有，
+  // 残留只能等启动时的孤儿回收被动兜住。"尽力而为"指的是**不阻塞**，不是**不留痕**。
+  try {
+    if (existsSync(join(root, dirName))) {
+      console.error(
+        `staging sandbox not removed: ${join(root, dirName)} still exists after cleanup ` +
+        `(jobId ${jobId} → dir name ${dirName}). Best-effort: the run's conclusion is unaffected; ` +
+        `boot-time orphan GC will retry.`,
+      )
+    }
+  } catch {
+    // 复核本身失败（目录读不出来等）不该反噬主流程；上面的日志已经覆盖了"删不掉"这一主要情形
   }
   // ② 收尾父目录：只在"此刻只剩我们自己写的那一个标记文件"时才动手。
   try {
@@ -369,6 +400,8 @@ function walkForHusks(dir: string, found: Set<string>, visited: Set<string>): vo
  *  （见 v2/daemonV2.ts 的 inFlightStagingJobIds），而不用为了满足类型多拷一份——拷一份的写法
  *  在这里正好是危险的：GC 的判据是"这个工作台此刻是否在被使用"，任何一层拷贝都可能在 await
  *  边界上变成陈旧快照，把跑了两小时的翻译工作台当孤儿 rm 掉。既有调用方传 `Set` 不受影响。
+ *  （2026-09-17：下面确实把成员映射成目录名形态放进了一个新 Set，但那不是上述意义的"快照"——
+ *  本函数全程同步、无 await，映射是入参的纯函数，不存在新旧两份判据并存的窗口。）
  *
  *  ── 两段式（2026-09-16 修订，design D4/D7）──────────────────────────────
  *  ① **任意深度的空壳**：只剩一个标记文件的沙盒根（findStagingHusks 的产物）。
@@ -397,6 +430,15 @@ export function gcOrphans(mediaRoots: string[], activeJobIds: ReadonlySet<string
   // 自述场景（3 小时前创建的 CLI 工作台）照样被删。递归取最新 mtime + 10 分钟活性窗口。
   const bootTime = bootTimeMs ?? Date.now()
   const ACTIVE_WINDOW_MS = 10 * 60 * 1000 // 10 分钟
+
+  /** 在飞集合的**目录名形态**（2026-09-17）：调用方登记的是原始 jobId（`subtitle:tmdb:<id>`，
+   *  见 daemonV2 的 inFlightStagingJobIds），而下面 ② 段拿到的是磁盘条目名——已被 allocate 经
+   *  stagingDirName 映射过（`subtitle-tmdb-<id>`）。拿原始串直接 `.has(磁盘名)` 恒为 false，
+   *  后果不是"少删一个目录"而是**把正在被使用的沙盒当孤儿删掉**（本函数唯一的破坏性错误方向）。
+   *  两个约定都要能用：stagingDirName 幂等，故这里对成员统一映射一次即可同时容纳
+   *  "传原始 jobId"与"传已映射名字"两种调用方（见 core/mediaContext.ts 的注释）。 */
+  const activeDirNames = new Set<string>()
+  for (const id of activeJobIds) activeDirNames.add(stagingDirName(id))
 
   /** 两条保留条件（R6-9 / R7-1 / R8-1），根一级条目与任意深度空壳**共用同一份实现**——
    *  在两处各写一遍就是"留两份漂移实现"的又一次翻版（见 subtitleJobId 的注释：GC 的保护
@@ -437,7 +479,8 @@ export function gcOrphans(mediaRoots: string[], activeJobIds: ReadonlySet<string
         continue // best-effort:目录列不出来(权限/挂载抖动)跳过这一根,下次启动再试
       }
       for (const name of entries) {
-        if (name === '.ignore' || activeJobIds.has(name)) continue
+        // name 是磁盘形态（已映射）；activeDirNames 是同一映射下的在飞集合（见上方注释）。
+        if (name === '.ignore' || activeDirNames.has(name)) continue
         const full = join(stagingRoot, name)
         try {
           if (shouldKeep(full)) continue
@@ -450,4 +493,54 @@ export function gcOrphans(mediaRoots: string[], activeJobIds: ReadonlySet<string
     }
   }
   return cleaned
+}
+
+/** 落点探针的目录名前缀。命名沿用 isDirWritable 的"隐藏名 + 本进程 pid + 自增序号"约定，但
+ *  **刻意不复用** `.subtitle-scout-writetest-`：那个前缀属于"根一级 0 字节**文件**探针"，由
+ *  sweepWriteProbes 逐个 unlink；本探针是 `.subtitle-staging/` 内部的**目录**，清扫者是
+ *  gcOrphans ②（那一层正是它的扫描面）——混用前缀会让 sweepWriteProbes 去 unlink 一个目录。 */
+export const PLACEMENT_PROBE_PREFIX = '.subtitle-scout-placement-'
+
+let placementProbeCounter = 0
+
+/** doctor 的"沙盒落点可建"探针（design D5）：在 root 上真实建一个
+ *  `<root>/.subtitle-staging/.subtitle-scout-placement-<pid>-<n>/` 再删掉；**建不出来就抛**
+ *  （由 doctor.ts 的 checkStagingPlacement 翻译成报告行——它不该关心 fs，本模块不该关心文案）。
+ *
+ *  ── 这次探查能发现什么、**不能**发现什么（2026-09-17 实测修正，别高估它）────────
+ *  能发现：挂载已死/只读（EROFS）、权限不足（EACCES/EPERM）、驱动**同步**拒绝该名字（如 alist 的
+ *  `{"code":500,"message":" bad file name :[...] "}`）、父路径缺失（ENOENT）。
+ *  **不能发现**：rclone `--vfs-cache-mode writes` 那一类"本地写缓存吞掉失败、只在回写时才爆 405"
+ *  ——本函数跑在 FUSE 视图里，`mkdirSync` 会返回成功。这正是本次缺陷（含冒号的沙盒目录）的形态，
+ *  故本探针**不是**那类缺陷的回归护栏；那类缺陷由单元测试（stagingSandbox.test.ts 的红线）与
+ *  `cleanup` 的留痕日志负责。把这条写在这里，是为了防止下一个读者看到"doctor ✓"就以为
+ *  "盘上一定建得出冒号目录"。
+ *
+ *  ── 清理口径 ────────────────────────────────────────────────────────
+ *  best-effort（同 isDirWritable 的 2026-07-29 事故口径：判据只看"建得出"，删除失败不改结论）。
+ *  探针目录建不出来时 mkdirSync 会先抛，此时不留任何东西。清理失败留下的空目录由 gcOrphans ②
+ *  兜底收（在 `.subtitle-staging/` 一层、名字不匹配在飞集合、也不会被 gcOrphans ① 当空壳——它
+ *  不是沙盒根）。**父目录是本探针顺手建的时候（此前不存在）才回删它**：否则 doctor 会留下一个
+ *  0 条目的 `.subtitle-staging/`，而它既不是空壳（isStagingHusk 要求恰好一个 `.ignore`）也不在
+ *  任何回收面的判据里，会永久留着。 */
+export function probeStagingPlacement(root: string): void {
+  const stagingRoot = join(root, STAGING_DIRNAME)
+  // existsSync 在 FUSE/网盘上也只有本地视图可信——但这里问的是"父目录本来在不在"，
+  // 判错的后果只是"该不该回删父目录"，不影响探针结论。
+  const stagingRootExisted = existsSync(stagingRoot)
+  // 🔴 两级都**不使用** recursive：媒体根不存在（未挂载/挂错）时必须抛 ENOENT，而不是顺着
+  // 递归把挂载点当普通目录建出来——那会在宿主上凭空造出一个同名的本地空目录，把"盘没挂上"
+  // 这件最该被发现的事伪装成 ✓（本仓已有 2026-07-29 云盘误判的先例，代价是 175 个残留）。
+  if (!stagingRootExisted) mkdirSync(stagingRoot)
+  const probe = join(stagingRoot, `${PLACEMENT_PROBE_PREFIX}${process.pid}-${placementProbeCounter++}`)
+  mkdirSync(probe)
+  try {
+    rmdirSync(probe)
+    if (!stagingRootExisted) rmdirSync(stagingRoot) // 非空即失败（别人刚建了沙盒）→ 忽略，正确
+  } catch {
+    console.error(
+      `placement probe left behind: ${probe}（删除失败）。best-effort：结论不受影响，` +
+      `该空目录由下次启动的 gcOrphans 回收。`,
+    )
+  }
 }

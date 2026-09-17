@@ -21,7 +21,7 @@ import { cmdTranslateItem, tryAutoTranslateCfg, makeDaemonTranslateRunItem } fro
 import { makeRealFetchSourceSub } from './fetchSourceSub.js'
 import {
   checkAssrt, checkOpenSubtitles, checkZimuku, checkLlm, checkTmdb, checkMediaRoots, checkStagingHusks,
-  checkDatabase, checkStuckJobs, checkMountCapabilities, checkJimaku, checkR3sub, checkSubdl, checkSubhd,
+  checkStagingPlacement, checkDatabase, checkStuckJobs, checkMountCapabilities, checkJimaku, checkR3sub, checkSubdl, checkSubhd,
   formatDoctorReport, overallOk, withTimeout, relevantSourceForDoctor, type DoctorResult,
 } from './doctor.js'
 import { detectChallenge } from '../adapters/providers/yunsuo.js'
@@ -959,6 +959,10 @@ async function cmdDoctor() {
   // 与上一行同源（DB media_roots 表优先、env 种子兜底）：报告里的"沙盒残留"查的必须是
   // 当前真正生效的那份清单，否则用户会在一个没在用的根上看到 0 条残留而误以为健康。
   results.push(checkStagingHusks(mediaRootsForDoctor))
+  // 落点检查与上一行同源（同一份 roots）。放在这里而不是并进 media-roots：那一项探的是根一级
+  // 的**文件**写入，本项探的是 `.subtitle-staging/` 下的**目录**创建——本次缺陷（驱动拒绝目录名
+  // 里的字符）恰好落在后者上。能查什么、查不出什么见 doctor.ts 的 checkStagingPlacement。
+  results.push(checkStagingPlacement(mediaRootsForDoctor))
 
   {
     // R2D-11 同源修正:挂载能力也探"真正生效的" DB 根(mediaRootsForDoctor),而不是 env 种子 roots

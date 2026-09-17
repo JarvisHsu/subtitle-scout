@@ -3,7 +3,7 @@ import * as fs from 'node:fs'
 import { mkdtempSync, chmodSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { parsePathMappings, mapPath, isUnderRoots, containingRoot, isDirWritable, sweepWriteProbes } from './mediaContext.js'
+import { parsePathMappings, mapPath, isUnderRoots, containingRoot, isDirWritable, sweepWriteProbes, stagingDirName } from './mediaContext.js'
 
 describe('parsePathMappings', () => {
   it('parses comma-separated pairs', () => {
@@ -132,5 +132,54 @@ describe('sweepWriteProbes', () => {
     })
     expect(removed).toBe(1) // 只删掉了能删的那个
     expect(readdirSync(dir)).toEqual(['.subtitle-scout-writetest-9-1'])
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// stagingDirName · 沙盒目录名映射（2026-09-17 生产实测：夸克网盘经 alist 拒绝目录名里的 `:`，
+// 而同一个位置的**文件名**允许 `:`；rclone 的 VFS 写缓存又把 mkdir 失败伪装成本地成功，
+// 于是含冒号的沙盒目录建不起来、也删不掉，任务每次结束都在用户媒体目录里留一个空壳）。
+// 这一族用例钉住映射本身；三处消费点由 stagingSandbox.test.ts 钉。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('stagingDirName', () => {
+  it('🔴 生产形态的 jobId 映射后不含冒号', () => {
+    // 这一条就是本次缺陷的红线：旧代码把 `subtitle:tmdb:60948` 逐字当目录名。
+    expect(stagingDirName('subtitle:tmdb:60948')).toBe('subtitle-tmdb-60948')
+    expect(stagingDirName('subtitle:tmdb:60948')).not.toContain(':')
+  })
+
+  it('幂等：对已映射过的名字再映射一次结果不变', () => {
+    // 承重性质——"调用方传原始 jobId"与"传已映射名字"必须同结果，否则又变成了两份纪律。
+    const once = stagingDirName('subtitle:tmdb:60948')
+    expect(stagingDirName(once)).toBe(once)
+  })
+
+  it('无非法字符的 jobId（jobs 表自增整数）逐字不变', () => {
+    expect(stagingDirName('17')).toBe('17')
+    expect(stagingDirName('job-1')).toBe('job-1')
+  })
+
+  it('非法字符逐个替换为 `-`（路径分隔符 + 文件系统保留集）', () => {
+    expect(stagingDirName('a:b')).toBe('a-b')
+    expect(stagingDirName('a?b')).toBe('a-b')
+    expect(stagingDirName('a*b')).toBe('a-b')
+    expect(stagingDirName('a|b')).toBe('a-b')
+    expect(stagingDirName('a"b')).toBe('a-b')
+    expect(stagingDirName('a<b')).toBe('a-b')
+    expect(stagingDirName('a>b')).toBe('a-b')
+    expect(stagingDirName('a/b')).toBe('a-b')
+    expect(stagingDirName('a\\b')).toBe('a-b')
+    expect(stagingDirName('a:b?c*d|e"f<g>h/i\\j')).toBe('a-b-c-d-e-f-g-h-i-j')
+  })
+
+  it('🔴 合法字符必须逐字保留（误伤它们等于把沙盒换到别处建不起来）', () => {
+    // 生产的目录名里就有全角冒号、括号、方括号、空格与中文——全角冒号不是保留字符。
+    const mixed = 'subtitle：tmdb（2024）[测试] v2 已修复'
+    expect(stagingDirName(mixed)).toBe(mixed)
+  })
+
+  it('只返回单层目录名（不含路径分隔符残留）', () => {
+    expect(stagingDirName('a/b/c')).not.toMatch(/[/\\]/)
+    expect(stagingDirName('a/b/c')).toBe('a-b-c')
   })
 })

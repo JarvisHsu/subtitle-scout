@@ -1,7 +1,7 @@
 import { MIGRATIONS } from '../v2/db.js'
 import { sourcesForLanguages, type SourceId } from '../core/sourceRegistry.js'
 import type { MountCapabilities } from '../files/mountCapabilities.js'
-import { findStagingHusks } from '../files/stagingSandbox.js'
+import { findStagingHusks, probeStagingPlacement } from '../files/stagingSandbox.js'
 
 export interface DoctorResult {
   name: string
@@ -277,6 +277,65 @@ export function checkStagingHusks(
       `${sample.join('、')}${more}`,
     hint: '重启 watch：启动回收（gcOrphans）会清掉它们。若正在跑翻译/字幕任务，先等它跑完再重启，' +
       '以免中断在飞行中的工作台。',
+  }
+}
+
+/** 报告里最多列几个失败的根（同 MAX_LISTED_HUSKS 的理由：根可能配置了很多个）。 */
+const MAX_LISTED_PLACEMENT_FAILURES = 3
+
+/** 只读倾向的检查：每个配置根上真实建一次沙盒形态的目录再删掉，回答"这个根能不能承载沙盒"。
+ *
+ *  ── 为什么单独来一项（而不是并进 media-roots）────────────────────────
+ *  `可写` ≠ `能建出沙盒`：media-roots 用的是根一级的 0 字节**文件**探针，而沙盒是
+ *  `.subtitle-staging/` 下的**目录**——某些驱动/挂载对"建文件"与"建目录"的接受度不同，
+ *  目录名还多一层字符集约束（本次缺陷就是后者）。
+ *
+ *  ── 能力边界（2026-09-17 实测修正：别把它当万能护栏）────────────────
+ *  本项能发现挂载已死/只读、权限不足、驱动**同步**拒绝该名字（errno/code 是区分的唯一信号）。
+ *  **不能**发现 rclone `--vfs-cache-mode writes` 那一类"本地缓存吞掉 mkdir 失败"的形态——
+ *  那正是本次冒号目录缺陷的形态，探针在 FUSE 视图里会看到 mkdir 成功。详见
+ *  files/stagingSandbox.ts 的 probeStagingPlacement（缺陷本身由单元测试与 cleanup 留痕负责）。
+ *
+ *  探针由调用方注入（doctor.ts 的既有惯例，同 checkMediaRoots 的 isWritable）：本文件的其余
+ *  检查都只做"纯翻译"，fs 副作用留在 files/ 层。
+ *
+ *  @param probe 省略 = files/stagingSandbox.ts 的 probeStagingPlacement。 */
+export function checkStagingPlacement(
+  roots: string[], probe: (root: string) => void = probeStagingPlacement,
+): DoctorResult {
+  if (roots.length === 0) {
+    return {
+      name: 'staging-placement', ok: true, skip: true,
+      detail: 'MEDIA_ROOTS 未配置，跳过（无媒体根则无沙盒）',
+    }
+  }
+  const failures: string[] = []
+  for (const root of roots) {
+    try {
+      probe(root)
+    } catch (e) {
+      // errno/code 必有（EACCES / EROFS / ENOENT）或是驱动自己的文本（如 alist 的
+      // "bad file name"）——这是"名字非法"与"挂载不可用"唯一的区分信号，必须原样带出去。
+      const code = (e as NodeJS.ErrnoException).code
+      const text = e instanceof Error ? e.message : String(e)
+      failures.push(`${root}（${code ? `${code}: ` : ''}${text}）`)
+    }
+  }
+  if (failures.length === 0) {
+    return {
+      name: 'staging-placement', ok: true,
+      detail: `${roots.length} 个媒体根都能建出沙盒目录（.subtitle-staging/ 下可建可删）`,
+    }
+  }
+  const sample = failures.slice(0, MAX_LISTED_PLACEMENT_FAILURES)
+  const more = failures.length > sample.length
+    ? `（另有 ${failures.length - sample.length} 个未列出）` : ''
+  return {
+    name: 'staging-placement', ok: false,
+    detail: `以下媒体根无法在 .subtitle-staging/ 下建出目录：${sample.join('、')}${more}`,
+    hint: '按错误文本分辨：EROFS = 挂载只读；EACCES/EPERM = 容器用户无写权限；ENOENT = 挂载点不可达；' +
+      '驱动自己的文本（如 "bad file name"）= 该名字被网盘驱动拒绝（本项检查存在的理由）。' +
+      '注意：网络盘的写缓存可能让这里报通过而实际回写失败——本项查不出那一类。',
   }
 }
 

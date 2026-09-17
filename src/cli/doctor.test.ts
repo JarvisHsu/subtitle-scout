@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { checkAssrt, checkOpenSubtitles, checkZimuku, checkJimaku, checkR3sub, checkSubdl, checkSubhd, checkLlm, checkTmdb, checkMediaRoots, checkStagingHusks, formatDoctorReport, overallOk, withTimeout, checkDatabase, checkStuckJobs, checkMountCapabilities, relevantSourceForDoctor } from './doctor.js'
+import { checkAssrt, checkOpenSubtitles, checkZimuku, checkJimaku, checkR3sub, checkSubdl, checkSubhd, checkLlm, checkTmdb, checkMediaRoots, checkStagingHusks, checkStagingPlacement, formatDoctorReport, overallOk, withTimeout, checkDatabase, checkStuckJobs, checkMountCapabilities, relevantSourceForDoctor } from './doctor.js'
 import { MIGRATIONS } from '../v2/db.js'
 
 describe('doctor 远端三项', () => {
@@ -189,6 +189,73 @@ describe('checkStagingHusks', () => {
     writeFileSync(join(root, '.subtitle-staging', '.ignore'),
       'subtitle-scout staging area — media servers should not scan this directory\n')
     expect(checkStagingHusks([root])).toMatchObject({ ok: false })
+  })
+})
+
+describe('checkStagingPlacement（doctor 的落点探针，2026-09-17）', () => {
+  it('roots 为空 → skip（不算失败，同 checkMediaRoots / checkMountCapabilities 口径）', () => {
+    const r = checkStagingPlacement([], () => { throw new Error('should never be called') })
+    expect(r).toMatchObject({ name: 'staging-placement', ok: true, skip: true })
+  })
+
+  it('全部可建 → ✓ 并报根数（skip 必须是 undefined，否则 formatDoctorReport 会画成 ⊘）', () => {
+    const seen: string[] = []
+    const r = checkStagingPlacement(['/a', '/b'], root => { seen.push(root) })
+    expect(r).toMatchObject({ name: 'staging-placement', ok: true })
+    expect(r.detail).toContain('2 个媒体根')
+    expect(r.skip).toBeUndefined()
+    expect(seen).toEqual(['/a', '/b']) // 每个根都真探过，不是抽样
+  })
+
+  it('不可建 → ✗，详情带根路径 + errno code + 错误原文（errno 是分辨故障类型的唯一信号）', () => {
+    const err = Object.assign(new Error('EACCES: permission denied, mkdir'), { code: 'EACCES' })
+    const r = checkStagingPlacement(['/ok', '/ro'], root => {
+      if (root === '/ro') throw err
+    })
+    expect(r).toMatchObject({ name: 'staging-placement', ok: false })
+    expect(r.detail).toContain('/ro')
+    expect(r.detail).toContain('EACCES')
+    expect(r.detail).toContain('permission denied')
+    expect(r.detail).not.toContain('/ok') // 能建的根不该进失败列表
+    expect(r.hint).toContain('EROFS')
+  })
+
+  it('驱动自己的文本（无 errno，如 alist 的 "bad file name"）也原样带出去', () => {
+    // 网盘驱动拒绝目录名时给的是自己的 message、不一定是 errno —— 这条正是本检查存在的理由
+    const r = checkStagingPlacement(['/quark'], () => { throw new Error(' bad file name :[...] ') })
+    expect(r).toMatchObject({ name: 'staging-placement', ok: false })
+    expect(r.detail).toContain('bad file name')
+    expect(r.hint).toContain('网盘驱动拒绝')
+  })
+
+  it('失败根超过 3 个时只列前 3 条并注明剩余数量', () => {
+    const r = checkStagingPlacement(['/a', '/b', '/c', '/d', '/e'], root => {
+      throw Object.assign(new Error(`no ${root}`), { code: 'ENOENT' })
+    })
+    expect(r.detail).toContain('/c')
+    expect(r.detail).not.toContain('/d')
+    expect(r.detail).toContain('另有 2 个未列出')
+  })
+
+  it('探针抛非 Error 值也不崩（String(e) 兜底）', () => {
+    const r = checkStagingPlacement(['/a'], () => { throw 'plain string' })
+    expect(r).toMatchObject({ name: 'staging-placement', ok: false })
+    expect(r.detail).toContain('plain string')
+  })
+
+  it('真接缝：默认参数就是 probeStagingPlacement（真临时根可建可删 → ✓ 且不留痕）', () => {
+    const root = mkdtempSync(join(tmpdir(), 'doctor-placement-'))
+    expect(checkStagingPlacement([root])).toMatchObject({ ok: true })
+    // 探针是只读倾向的：跑完不许在媒体根里留下 .subtitle-staging（否则 doctor 自己制造残留）
+    expect(existsSync(join(root, '.subtitle-staging'))).toBe(false)
+  })
+
+  it('真接缝：挂载点不可达 → ✗ 而不是把盘没挂上当 ✓（探针不许 recursive 建出父目录）', () => {
+    const root = join(tmpdir(), `doctor-placement-missing-${process.pid}`)
+    const r = checkStagingPlacement([root])
+    expect(r).toMatchObject({ ok: false })
+    expect(r.detail).toContain('ENOENT')
+    expect(existsSync(root)).toBe(false) // 不能顺手在宿主上凭空造出挂载点
   })
 })
 

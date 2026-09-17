@@ -142,3 +142,45 @@ export const STAGING_DIRNAME = '.subtitle-staging'
  *  此前这一串字面量在两处各写一份——任何一侧改了格式，另一侧的回收会**静默**停止工作
  *  （工作台无界堆积，且不会有任何测试变红）。 */
 export const TRANSLATE_STAGING_DIRNAME = '.subtitle-translate'
+
+/** 目录名里会被底层文件系统/网盘驱动拒绝的字符（Windows 保留集 + 路径分隔符）。
+ *  实测来源见 stagingDirName 的注释。 */
+const ILLEGAL_DIRNAME_CHARS = /[/\\:*?"<>|]/g
+
+/** jobId → **目录名**的唯一映射：把底层文件系统不接受的字符换成 `-`，其余字符（含空格、中文、
+ *  全角标点、括号）逐字保留。
+ *
+ *  ── 为什么必须存在（2026-09-17 生产实测）────────────────────────────
+ *  字幕流的 jobId 是 `subtitle:<workId>`（`v2/subtitleScheduler.ts` 的 subtitleJobId），生产形态
+ *  即 `subtitle:tmdb:60948`，而它被**逐字当作目录名**用。生产的媒体根是夸克网盘（rclone mount →
+ *  WebDAV → alist 的 Quark 驱动），该驱动拒绝目录名里的 `:`：
+ *      POST /api/fs/mkdir → {"code":500,"message":" bad file name :[...] "}
+ *      MKCOL（终态）→ 405 Method Not Allowed；日志里的 409 Conflict 只是"父目录解析不到"的通用码
+ *  更坏的是 rclone 的 `--vfs-cache-mode writes` 把这次失败伪装成本地成功：`mkdirSync` 返回 0、写入
+ *  进 VFS 缓存，失败只在回写时以 `Failed to copy ... 405` 爆出来。于是 cleanup 的 `rmSync` 必然
+ *  失败、被 best-effort 的 catch 吞掉，沙盒目录与它的 `.subtitle-staging` 父目录一起永久留在用户
+ *  媒体目录里（两个配置根下实测 689 条含冒号路径日志中，成功上传 **0** 次）。
+ *  **文件名的冒号是合法的**——同一目录里的 `.ignore`（名字无冒号）上传成功，这就是"只映射目录名"
+ *  的依据。
+ *
+ *  ── 为什么放在"文件系统边界"而不是改 jobId 本身 ──────────────────────
+ *  jobId 同时是**身份**：`job-${jobId}` 是 trace 的 runKey（daemonV2）、也是库里 jobs 行的标识。
+ *  改它等于改掉全仓的 runKey 字面量与运维排障时的肉眼对应关系，而功能上零收益。目录名与身份
+ *  解耦之后，`allocate` / `cleanup` / `gcOrphans` 三处**共用同一个函数**，"两侧必须字节一致"这条
+ *  脆弱的跨模块纪律随之由构造保证（本仓已因"留两份漂移实现"栽过多次，见 isJunkDirName 的注释）。
+ *
+ *  ── 幂等是承重性质（不是顺手写的性质）────────────────────────────────
+ *  映射后的名字里不再有非法字符，而 `-` 不在替换集内，故 `stagingDirName(stagingDirName(x)) ===
+ *  stagingDirName(x)`。因此"调用方传原始 jobId"与"调用方传已映射的名字"两种约定行为一致——
+ *  daemon 侧继续登记原始 jobId（gcOrphans 比较前先映射）不会出错，将来若有人改成登记映射后的
+ *  名字也不会出错，不制造第二份纪律。
+ *
+ *  ── 已知代价：映射不是单射 ────────────────────────────────────────────
+ *  `subtitle:tmdb:1` 与 `subtitle-tmdb-1` 会撞同一个目录名。实际可达性：字幕 jobId 只有两种来源
+ *  ——`subtitle:<workId>`（映射后恒以 `subtitle-` 开头）与 jobs 表的自增整数（纯数字），两者不相交，
+ *  故今天不可达；代价也只是"两个作品的试错沙盒互相覆盖"（试错内容，安装走各自的视频目录）。
+ *  单射方案（追加原串短 hash）能消掉这条，代价是目录名多一段无意义后缀、排障可读性下降——本仓
+ *  既有先例（`v2/ownIds.ts` 的 translateJobId）选了简单形态，此处跟随；真要改只需改这一个函数。 */
+export function stagingDirName(jobId: string): string {
+  return jobId.replace(ILLEGAL_DIRNAME_CHARS, '-')
+}

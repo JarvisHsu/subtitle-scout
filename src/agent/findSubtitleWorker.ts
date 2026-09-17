@@ -181,6 +181,9 @@ export function makeFindSubtitleWorker(deps: FindSubtitleWorkerDeps) {
     // 用同一个根，否则 cleanup 会去清一个从未被 allocate 用过的目录，真正的 staging 目录永久泄漏。
     const stagingBase = task.stagingRoot ?? task.mediaRoot
     const stagingDir = allocate(task.jobId, stagingBase)
+    // 注：这里的 task.jobId 逐字进路径是**安全的**，刻意不走 stagingDirName——落点是本机磁盘上
+    // 的 cacheRoot（`~/.subtitle-scout/cache`，见 dashboard/server.ts 的默认值），不是媒体根上的
+    // 网盘挂载。目录名非法字符那套约束只对媒体根那一侧成立（core/mediaContext.ts 的 stagingDirName）。
     const store = makeFileResultSetStore(join(deps.cacheRoot, 'result-sets', task.jobId))
     const stagedFiles = new Map<string, string>()
     // W1（装机记账修复批·跨集内容近似去重闸）：per-run 对白指纹表，与 stagedFiles 同法每 run

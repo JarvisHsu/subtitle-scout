@@ -429,8 +429,9 @@ export class ScoutDaemonV2 {
   /** trace 修剪的天级时间门（照旧 daemon 的 meta 手法，但这一支只服务本进程，存内存足够；
    *  重启后多修剪一次是幂等的、无害的）。 */
   private lastTracePruneAt = 0
-  /** C34：本进程当前在飞行的 staging 沙盒 jobId（= 目录名，见 subtitleJobId 的论证）。
-   *  gcOrphans 靠它区分"孤儿垃圾"与"正在被 agent 写入的工作台"。 */
+  /** C34：本进程当前在飞行的 staging 沙盒 **jobId**（原始身份串，不是目录名——目录名由
+   *  stagingSandbox 经 stagingDirName 派生，见 core/mediaContext.ts，2026-09-17）。
+   *  gcOrphans 靠它区分"孤儿垃圾"与"正在被 agent 写入的工作台"（比较前由 gcOrphans 自己映射）。 */
   private inFlightStagingJobIds = new Set<string>()
 
   /** 带外扫描请求标志（`requestScan()` 置位，run() 主循环取件后清位）。
