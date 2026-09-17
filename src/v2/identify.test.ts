@@ -96,6 +96,80 @@ describe('verifyEvidence（双证据核验）', () => {
   })
 })
 
+// D-2 修复（2026-09-18，openspec `improve-media-recognition`）：标题门的"≥5 字符显著性"对含
+// CJK 的标题是**错的门**——归一后的中文标题通常 2~4 字，永远够不到 5 字下限，于是包含匹配
+// 从未在中文字幕上执行过，所有中文目录一律判 title mismatch。
+// 生产实案（2026-09-16）：17 个"认不出来"的目录绝大多数是这个原因，约 160 条；
+// `evidence-fail: title mismatch: candidate="Narcos" vs dir="[毒枭][全1-3季]…"`，
+// 而 TMDB TV 63351 `Narcos` 的 zh 译名正是 `毒枭`——**目录名的字面前缀**。
+// 修法：含 CJK 的候选只要求归一后互为子串（取消 5 字下限）；纯拉丁侧行为一字不改。
+describe('verifyEvidence 的 CJK 标题门（D-2：取消对中文短标题的 5 字符下限）', () => {
+  const narcos = {
+    id: 'tmdb:63351', title: 'Narcos', originalTitle: 'Narcos',
+    year: 2015, mediaType: 'tv' as const, episodeCount: 30,
+  }
+
+  it('🔴 生产实案：2 字中文译名 `毒枭` 是污染目录名的字面前缀 → 通过（旧门必拒）', () => {
+    // 目录无年份、但带季目录 → 独立证据来自"类型"这一条；断言聚焦在
+    // "短中文标题不再被 5 字门拦掉"，故用带季目录的形态让第二道有据可依。
+    expect(verifyEvidence(
+      narcos,
+      { dirName: '[毒枭][全1-3季][1080p]', fileCount: 30, seasons: [1, 2, 3], hasSeasonDirs: true },
+      '[毒枭][全1-3季][1080p]',
+      ['毒枭'],
+    )).toEqual({ ok: true })
+  })
+
+  it('4 字中文译名 `西部世界` 作为字面前缀 → 通过', () => {
+    expect(verifyEvidence(
+      { id: 'tmdb:63247', title: 'Westworld', originalTitle: 'Westworld', year: 2016, mediaType: 'tv', episodeCount: 36 },
+      { dirName: '西部世界 第一季', fileCount: 10, seasons: [1], hasSeasonDirs: true },
+      '西部世界 第一季',
+      ['西部世界'],
+    )).toEqual({ ok: true })
+  })
+
+  it('方向可逆：目录名是候选的子串也通过（`毒枭` ⊂ `毒枭 第一季`）', () => {
+    expect(verifyEvidence(
+      narcos,
+      { dirName: '毒枭 第一季', fileCount: 10, seasons: [1], hasSeasonDirs: true },
+      '毒枭 第一季',
+      ['毒枭'],
+    )).toEqual({ ok: true })
+  })
+
+  it('误放防线：2 字中文但**互不包含** → 仍然拒绝（`毒枭` vs `毒液`）', () => {
+    expect(verifyEvidence(
+      { id: 'tmdb:999', title: 'Venom', originalTitle: 'Venom', year: 2018, mediaType: 'movie' },
+      { dirName: '毒枭 (2015)', fileCount: 10, seasons: [1], hasSeasonDirs: true },
+      '毒枭',
+      ['毒液'],
+    )).toEqual({ ok: false, reason: expect.stringContaining('title mismatch') })
+  })
+
+  it('回归锁：纯拉丁短标题**保持**原行为（<5 字符仍不匹配）', () => {
+    expect(verifyEvidence(
+      { id: 'tmdb:1', title: 'Up', originalTitle: null, year: null, mediaType: 'tv', episodeCount: 1 },
+      { dirName: 'Up (2009)', fileCount: 1, seasons: [1], hasSeasonDirs: true },
+      'Up',
+    )).toEqual({ ok: true }) // 相等分支命中，与本变更无关——保留作对照
+    expect(verifyEvidence(
+      { id: 'tmdb:2', title: 'It', originalTitle: null, year: null, mediaType: 'tv', episodeCount: 1 },
+      { dirName: 'Its Always Sunny (2005)', fileCount: 1, seasons: [1], hasSeasonDirs: true },
+      'Its Always Sunny',
+    )).toEqual({ ok: false, reason: expect.stringContaining('title mismatch') })
+  })
+
+  it('CJK 侧放宽的是**标题门**，双证据条不放松：短中文标题 + 无任何结构证据 → 仍拒', () => {
+    expect(verifyEvidence(
+      { id: 'tmdb:63351', title: 'Narcos', originalTitle: 'Narcos', year: null, mediaType: 'movie', episodeCount: undefined },
+      { dirName: '毒枭', fileCount: 50, seasons: [], hasSeasonDirs: false },
+      '毒枭',
+      ['毒枭'],
+    )).toEqual({ ok: false, reason: expect.stringContaining('no independent') })
+  })
+})
+
 describe('yearFromDir', () => {
   it('标准年份', () => {
     expect(yearFromDir('Pulp Fiction (1994)')).toBe(1994)

@@ -76,6 +76,26 @@ export function verifyEvidence(
   const titleOk = titleCandidates.some((nc) => {
     if (nc === '' || normTarget === '') return false
     if (nc === normTarget) return true
+    // ── CJK 侧（D-2 修复，2026-09-18 复盘 openspec `improve-media-recognition`）─────────────
+    // 🔴 曾经的单一判据是"显著子串重叠 ≥ 5 字符"，它对**含 CJK 的标题**是错的门：
+    // 归一后的中文标题通常是 2~4 字（毒枭=2、西部世界=4、爱情公寓=4），**永远够不到 5 字下限**，
+    // 于是整条包含匹配从未在中文字幕上执行过——所有中文目录一律判 `title mismatch`。
+    // 生产实案（2026-09-16）：库里 17 个"认不出来"的目录里绝大多数是这个原因，
+    // `evidence-fail: title mismatch: candidate="Narcos" vs dir="[毒枭][全1-3季]…"`，
+    // 而 TMDB 上 Narcos 的 zh 译名正是 `毒枭`、是目录名的字面前缀。
+    //
+    // 为什么可以取消下限：原阈值的意图是**防幻觉**（拦住与目录名无关的候选），而那个意图只在
+    // 拉丁侧成立——汉字的信息密度远高于字母，2 个字已是**完整词**且几乎不共享：
+    // "毒枭"与"毒液"共享首字但谁也不包含谁，包含关系本身仍是强证据。故：
+    //   · 含 CJK 的候选 → 只要求归一后互为子串（含相等，相等上面已处理）
+    //   · 纯拉丁的候选 → 保持原有 ≥5 字符显著性重叠，行为一字不改
+    // 双证据条（本函数下半段的年份/类型/集数）不放松，仍然是"名字 + 独立结构证据"两道。
+    if (hasCjk(nc) || hasCjk(normTarget)) {
+      if (nc.includes(normTarget) || normTarget.includes(nc)) return true
+      // CJK 侧不做"短串滑窗找 5 字"那一套——那是为拉丁长标题设计的部分匹配补丁，
+      // 对 2~4 字的中文标题既不适用（滑窗步长本就是 5）也无必要。
+      return false
+    }
     // 显著子串重叠（≥5 字符）——覆盖 PLUR1BUS vs Pluribus 这种部分匹配
     if (nc.length >= 5 && normTarget.length >= 5) {
       if (nc.includes(normTarget) || normTarget.includes(nc)) return true
@@ -104,6 +124,19 @@ export function verifyEvidence(
     return { ok: true }
   }
   return { ok: false, reason: 'no independent structural evidence (year/type/episodes)' }
+}
+
+/** 字符串里是否含 CJK 汉字。用于标题门的**分侧判据**（见 verifyEvidence 里的完整论证）：
+ *  中文字的信息密度远高于拉丁字母，2 个汉字已是完整词，故 CJK 侧不适用"≥5 字符显著性"这个
+ *  为拉丁长标题设计的门槛。
+ *
+ *  只认**汉字**（Unified Ideograph，U+4E00–U+9FFF 主区 + 扩展 A U+3400–U+4DBF）：
+ *  · 不含日文假名（U+3040–U+30FF）——`normalize` 会把假名当字母保留，但假名标题（如
+ *    `進撃の巨人`）走原有的拉丁式长度判据更安全（假名是音节文字，信息密度接近字母）。
+ *  · 不含全角标点/数字——那些在 normalize 里已被剥掉，且它们单独出现不构成标题。
+ *  范围取窄是有意的：宁可让少数混排标题走旧判据（行为不变），也不要放宽到把符号当汉字。 */
+function hasCjk(s: string): boolean {
+  return /[\u4E00-\u9FFF\u3400-\u4DBF]/.test(s)
 }
 
 function normalize(s: string): string {
