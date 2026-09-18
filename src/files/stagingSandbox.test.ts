@@ -1256,4 +1256,38 @@ describe('retryUntilDirectory · 「重试到看见为止」的预算与错误�
     )).toThrow()
     expect(attempts).toBe(1)
   })
+
+  it('留痕：每次"还没放弃、准备再来一次"都回调一次（序号从 1 起 + 那条原始错误）', () => {
+    // 容错悄悄生效 = 没人知道 #14 又发生过一次、也没人敢动这个重试预算。
+    const noted: Array<{ n: number; code?: string }> = []
+    let verdicts = 0
+    retryUntilDirectory(
+      () => { throw eio() },
+      () => ++verdicts >= 3,      // 第 3 次问才对 → 前两次失败都要留痕
+      () => {},
+      3,
+      [120, 400],
+      (n, e) => noted.push({ n, code: (e as { code?: string }).code }),
+    )
+    expect(noted).toEqual([{ n: 1, code: 'EIO' }, { n: 2, code: 'EIO' }])
+  })
+
+  it('留痕**不**覆盖最后那次失败（预算耗尽即抛，没有"下一次"可言）', () => {
+    const noted: number[] = []
+    expect(() => retryUntilDirectory(
+      () => { throw eio() },
+      () => false,
+      () => {},
+      3,
+      [120, 400],
+      n => noted.push(n),
+    )).toThrow()
+    expect(noted).toEqual([1, 2])   // 第 3 次失败直接抛，不回调——日志不该说"等待后重试"
+  })
+
+  it('出错时视图已经是新的 → 一次都不算重试，不回调（EEXIST 那一类不该刷日志）', () => {
+    const noted: number[] = []
+    retryUntilDirectory(() => { throw eio() }, () => true, () => {}, 3, [120, 400], n => noted.push(n))
+    expect(noted).toEqual([])
+  })
 })

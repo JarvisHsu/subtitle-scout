@@ -53,6 +53,14 @@ function mkdirToleratingExisting(p: string): void {
     sleepSync,
     MKDIR_TOLERATE_ATTEMPTS,
     MKDIR_TOLERATE_RETRY_DELAYS_MS,
+    // 留痕：容错悄悄生效 = 没人知道 #14 又发生过一次，也就没人能判断这个重试预算够不够。
+    (n, e) => {
+      console.error(
+        `staging mkdir 需重试（第 ${n} 次失败，共 ${MKDIR_TOLERATE_ATTEMPTS} 次预算）：${p} —— ` +
+        `${describeFsError(e)}；此刻本地视图还看不见它（#14：后端对已存在的目录回 409、` +
+        `rclone 把它上抛成 EIO，而本地 FUSE 视图滞后毫秒~秒级）。等待后重试。`,
+      )
+    },
   )
 }
 
@@ -71,6 +79,10 @@ export function retryUntilDirectory(
   sleep: (ms: number) => void,
   attempts: number,
   delaysMs: readonly number[],
+  /** 每次"失败但还没放弃、准备再来一次"时回调（失败序号从 1 起、以及那条原始错误）。
+   *  存在的理由是**留痕**：容错若悄悄生效，生产上就没人知道 #14 又发生过一次——
+   *  本仓对"尽力而为"的既定口径是"不阻塞，但必须留痕"（见 cleanup ①′ 的同款论证）。 */
+  onRetry?: (failedAttemptNo: number, error: unknown) => void,
 ): void {
   // attempts <= 0 不是"静默成功"，而是调用方写错了：至少要试一次，宁可多试。
   const tries = Math.max(1, attempts)
@@ -83,12 +95,23 @@ export function retryUntilDirectory(
     } catch (e) {
       lastError = e
       if (isDir()) return
-      if (i < tries - 1) sleep(delaysMs[i] ?? 0)
+      if (i < tries - 1) {
+        onRetry?.(i + 1, e)
+        sleep(delaysMs[i] ?? 0)
+      }
     }
   }
   // 上抛**最后一个**原始错误，不包装：日志与调用方看到的仍是那条 EIO/EROFS/EACCES，
   // 根因不该被藏进一层自造类型里。
   throw lastError
+}
+
+/** 把一条 fs 错误压成"`code: message`"——日志里要能一眼认出 EIO/EROFS/EACCES。
+ *  `code` 不是 Error 的既有属性，故显式取；缺失时只留 message，不写 `undefined:`。 */
+function describeFsError(e: unknown): string {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code
+  const msg = e instanceof Error ? e.message : String(e)
+  return code ? `${code}: ${msg}` : msg
 }
 
 /** 同步睡眠。`allocate()` 是**同步**函数（回调链上不能 await），故不能用 Promise 版 `sleep`。
