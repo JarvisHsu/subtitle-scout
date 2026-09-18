@@ -873,9 +873,28 @@ export async function runSubtitleWorkDir(
     const p = resolvePath(item, rl.itemId)
     if (p) retryPaths.add(p)
   }
+  // 🔴 #17 的诊断留痕（2026-09-18 第 30 轮）。`no-outcome` 的定义是"agent 的终局报告里**完全
+  // 没提**这个文件"，但旧留痕（`bump(f,'no-outcome')` 只写 files 列）**不说它提了什么**——
+  // 第 29 轮就是卡在这里：明知 15 个缺口全在两个作品的 S2，却读不出 agent 到底报了哪些 itemId。
+  // 这里把两侧都写出来：**我们要的那个 itemId**（取自 task.targets，不是再拼一份——拼法只有
+  // buildSubtitleTask 那一处）与**它实际报的**（三个桶的 itemId 原样列出）。
+  // 留痕用 console.error：本函数没有注入 logger（签名里只有 db/worker/item/…），
+  // 而同目录的其它 best-effort 留痕走的也是 console.error，进容器日志。
+  const reportedIds = [
+    ...report.installed.map((x) => `installed:${x.itemId ?? '∅'}`),
+    ...report.no_safe_match.map((x) => `no_safe_match:${x.itemId ?? '∅'}`),
+    ...report.retry_later.map((x) => `retry_later:${x.itemId ?? '∅'}`),
+  ]
+  const wantIdByPath = new Map(task.targets.map((t) => [t.videoPath, t.itemId]))
   for (const f of item.files) {
     const inAnyBucket = coveredPaths.has(f.path) || noSafePaths.has(f.path) || retryPaths.has(f.path)
-    if (!inAnyBucket) bump(f, 'no-outcome')
+    if (!inAnyBucket) {
+      console.error(
+        `subtitle no-outcome: ${item.workId} 期望 itemId=${wantIdByPath.get(f.path) ?? '(?)'}` +
+        `（${f.filename}，在 ${f.dir}）；agent 实际报了 [${reportedIds.join(', ')}]`,
+      )
+      bump(f, 'no-outcome')
+    }
   }
 
   const coveredCount = coveredPaths.size
