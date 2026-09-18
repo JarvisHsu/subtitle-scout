@@ -5,7 +5,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { allocate, cleanup, install, gcOrphans, findStagingHusks, isStagingHusk, probeStagingPlacement, PLACEMENT_PROBE_PREFIX, cleanupNumberedDuplicates } from './stagingSandbox.js'
+import { allocate, cleanup, install, gcOrphans, findStagingHusks, isStagingHusk, probeStagingPlacement, PLACEMENT_PROBE_PREFIX, cleanupNumberedDuplicates, retryUntilDirectory } from './stagingSandbox.js'
 
 // Finding 4: production code has no call sites for install() yet, so defaulting this to
 // a short ladder everywhere retries are exercised keeps this suite fast without touching
@@ -1161,5 +1161,99 @@ describe('allocate / probeStagingPlacement · 「后端说已存在」容错（#
     const root = mediaRoot()
     mkdirSync(join(root, '.subtitle-staging'), { recursive: true })   // 父目录已存在
     expect(() => probeStagingPlacement(root)).not.toThrow()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// retryUntilDirectory —— #14 的**策略**层（2026-09-18 生产事故的时间线）
+//
+// 上面那组测试钉的是"已存在时不抛"，但它**钉不住本次事故**：本修复的第一版正是通过了
+// 那类测试、却在生产上继续报红。事故的关键不是"已存在"，而是"**报错的那一刻本地视图
+// 还是旧的**"——而这一点在本地文件系统上造不出来（本地 mkdir 不会给出"失败了却成功了"
+// 的答案，statSync 也永远是最新的）。故把重试策略与真实 fs 解耦，用注入的时间线把生产上
+// 真实发生过的顺序（报错 → 判据说没有 → 稍等 → 判据才说有了）重放一遍。
+// 下面这几条**全部不碰真实 fs、不真睡**（睡眠也是注入的）。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('retryUntilDirectory · 「重试到看见为止」的预算与错误语义（#14）', () => {
+  const eio = () => Object.assign(new Error('EIO: input/output error'), { code: 'EIO' })
+
+  it('🔴 生产时间线：前两次报错且判据说"不是目录"，第三次判据才刷新 → 不抛、共试 3 次', () => {
+    const events: string[] = []
+    let verdicts = 0            // 判据被问了几次 = 本地视图刷新了几步
+    let attempts = 0
+    retryUntilDirectory(
+      () => { attempts++; events.push('attempt'); throw eio() },
+      () => ++verdicts >= 3,    // 第 3 次问才对：模拟"毫秒~秒级才刷新"
+      ms => events.push(`sleep:${ms}`),
+      3,
+      [120, 400],
+    )
+    expect(attempts).toBe(3)
+    expect(events).toEqual(['attempt', 'sleep:120', 'attempt', 'sleep:400', 'attempt'])
+  })
+
+  it('判据在第一次报错后**立刻**为真 → 只试一次、不睡（不浪费预算）', () => {
+    const events: string[] = []
+    let attempts = 0
+    retryUntilDirectory(
+      () => { attempts++; events.push('attempt'); throw eio() },
+      () => true,               // 出错那一刻视图已经是新的（EEXIST 那一类）
+      ms => events.push(`sleep:${ms}`),
+      3,
+      [120, 400],
+    )
+    expect(attempts).toBe(1)
+    expect(events).toEqual(['attempt'])
+  })
+
+  it('🔴 判据**永远**为假 → 抛，且抛的是**最后一次**那条原始错误（不包装、不吞）', () => {
+    const thrown: unknown[] = []
+    let attempts = 0
+    let caught: unknown
+    try {
+      retryUntilDirectory(
+        () => { attempts++; const e = eio(); thrown.push(e); throw e },
+        () => false,            // 真失败：路径上确实什么都没有
+        () => {},
+        3,
+        [120, 400],
+      )
+    } catch (e) { caught = e }
+
+    expect(attempts).toBe(3)                         // 预算用尽才放弃
+    expect(caught).toBe(thrown[2])                   // 身份相同 = 原样上抛，没被换成新 Error
+    expect((caught as { code?: string }).code).toBe('EIO')  // 根因字段还得在，日志才认得出
+  })
+
+  it('睡眠严格按 delaysMs 逐次发生，且**最后一次失败后不再睡**（预算耗尽即抛）', () => {
+    const slept: number[] = []
+    let attempts = 0
+    expect(() => retryUntilDirectory(
+      () => { attempts++; throw eio() },
+      () => false,
+      ms => slept.push(ms),
+      4,
+      [10, 20, 30],
+    )).toThrow()
+    expect(attempts).toBe(4)
+    expect(slept).toEqual([10, 20, 30])              // 4 次尝试 = 3 次间隔
+  })
+
+  it('动作成功即返回——成功路径**不**看判据（判据只用于"报错了才知道看"）', () => {
+    let asked = 0
+    retryUntilDirectory(() => {}, () => { asked++; return false }, () => {}, 3, [120, 400])
+    expect(asked).toBe(0)
+  })
+
+  it('attempts <= 0 不是"静默成功"，而是至少试一次（宁可多试也不能假装建成）', () => {
+    let attempts = 0
+    expect(() => retryUntilDirectory(
+      () => { attempts++; throw eio() },
+      () => false,
+      () => {},
+      0,
+      [],
+    )).toThrow()
+    expect(attempts).toBe(1)
   })
 })

@@ -13,6 +13,10 @@ import {
 
 const INSTALL_RETRY_DELAYS_MS = [50, 150, 400, 1000]
 const RETRYABLE_CODES = new Set(['EEXIST', 'EPERM', 'EBUSY'])
+/** `mkdirToleratingExisting` 的重试预算（#14）。三次足以覆盖实测的视图刷新窗口
+ *  （毫秒~秒级）；再多只会拖慢装盘前置。 */
+const MKDIR_TOLERATE_ATTEMPTS = 3
+const MKDIR_TOLERATE_RETRY_DELAYS_MS = [120, 400]
 
 /** `mkdir` 的「**已存在**」容错（#14，2026-09-18）。
  *
@@ -36,11 +40,66 @@ const RETRYABLE_CODES = new Set(['EEXIST', 'EPERM', 'EBUSY'])
  *  "盘没挂上"这件最该被发现的事伪装成成功（`probeStagingPlacement` 为此已论证过，
  *  本仓 2026-07-29 云盘误判留过 175 个残留）。**调用方负责逐级调用本函数。** */
 function mkdirToleratingExisting(p: string): void {
+  // 🔴 **必须重试，不能只看一眼**（2026-09-18 生产实测：本修复的第一次尝试就栽在这里）。
+  // 后端 409 上抛成 EIO 的同时，**本地 FUSE 视图还没刷新**——同一路径上实测：
+  //   `mkdir` → EIO，紧接着 `mkdir` → **EEXIST**（File exists），
+  // 也就是"后端说已存在"与"本地视图看得见它"之间有一个毫秒~秒级的窗口。
+  // 只在出错后**立刻** stat 一次是不够的：那一刻视图仍是旧的 → 判"不是目录" → 原样抛出，
+  // 修复形同没做（实测：`Mediary Scout` 那个根就这样继续报红）。
+  // 故：短暂等待后重试，**每次**都重新 stat 复核；三次仍不成才抛。
+  retryUntilDirectory(
+    () => mkdirSync(p),
+    () => isDirectoryNow(p),
+    sleepSync,
+    MKDIR_TOLERATE_ATTEMPTS,
+    MKDIR_TOLERATE_RETRY_DELAYS_MS,
+  )
+}
+
+/** #14 策略层：**反复尝试同一动作，直到判据说"它已经在了"**。四个依赖点全部注入
+ *  （动作 / 判据 / 睡眠 / 预算），故本函数是纯策略、可被直接驱动。
+ *
+ *  ── 为什么要单独拆出这层（不是为测试而测试）────────────────────────────
+ *  本次事故的形态是"`mkdir` 报错、但**其实**已经建成了"——这种"失败了却成功了"的答案在
+ *  本地文件系统上**造不出来**（本地 `mkdir` 不会给出它，`statSync` 也永远是最新的）。
+ *  把重试策略与真实 fs 解耦后，测试可以喂进"前 N 次失败、第 N+1 次才看得见"的时间线，
+ *  这是唯一能把本事故**真的**钉住的写法；只测"已存在时不抛"是钉不住的（第一次修复就是
+ *  通过那类测试、却在生产上失效）。 */
+export function retryUntilDirectory(
+  attempt: () => void,
+  isDir: () => boolean,
+  sleep: (ms: number) => void,
+  attempts: number,
+  delaysMs: readonly number[],
+): void {
+  // attempts <= 0 不是"静默成功"，而是调用方写错了：至少要试一次，宁可多试。
+  const tries = Math.max(1, attempts)
+  // 初值只为满足"确定赋值"分析（tries >= 1 保证循环必跑一次，正常路径上它一定被覆盖）。
+  let lastError: unknown = new Error('retryUntilDirectory: no attempt was made')
+  for (let i = 0; i < tries; i++) {
+    try {
+      attempt()
+      return
+    } catch (e) {
+      lastError = e
+      if (isDir()) return
+      if (i < tries - 1) sleep(delaysMs[i] ?? 0)
+    }
+  }
+  // 上抛**最后一个**原始错误，不包装：日志与调用方看到的仍是那条 EIO/EROFS/EACCES，
+  // 根因不该被藏进一层自造类型里。
+  throw lastError
+}
+
+/** 同步睡眠。`allocate()` 是**同步**函数（回调链上不能 await），故不能用 Promise 版 `sleep`。
+ *  `Atomics.wait` 不忙等、不占 CPU；环境不支持时**退化为不睡**——重试本身仍会发生，
+ *  只是间隔为 0，不会把一次可恢复的抖动变成失败。 */
+function sleepSync(ms: number): void {
+  if (ms <= 0) return
   try {
-    mkdirSync(p)
-  } catch (e) {
-    if (isDirectoryNow(p)) return
-    throw e
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  } catch {
+    /* 退化：不睡直接重试（宁可间隔为 0，也不忙转 CPU） */
   }
 }
 
@@ -686,7 +745,7 @@ let placementProbeCounter = 0
  *
  *  ── 清理口径 ────────────────────────────────────────────────────────
  *  best-effort（同 isDirWritable 的 2026-07-29 事故口径：判据只看"建得出"，删除失败不改结论）。
- *  探针目录建不出来时 mkdirSync 会先抛，此时不留任何东西。清理失败留下的空目录由 gcOrphans ②
+ *  探针目录建不出来时 mkdirToleratingExisting 会（重试后仍不成而）先抛，此时不留任何东西。清理失败留下的空目录由 gcOrphans ②
  *  兜底收（在 `.subtitle-staging/` 一层、名字不匹配在飞集合、也不会被 gcOrphans ① 当空壳——它
  *  不是沙盒根）。**父目录是本探针顺手建的时候（此前不存在）才回删它**：否则 doctor 会留下一个
  *  0 条目的 `.subtitle-staging/`，而它既不是空壳（isStagingHusk 要求恰好一个 `.ignore`）也不在
