@@ -8,8 +8,8 @@
 // 的同型（源码级断言不锁行为）。
 // 取值走 vitest.config.ts:21 的 `define`（`?raw` 在 vitest 里恒空串，`node:fs` 撞
 // tsconfig types 白名单）——手法与 SeriesGrid.test.tsx 一致。
-import { describe, it, expect, afterEach } from 'vitest'
-import { render, screen, cleanup, within } from '@testing-library/react'
+import { describe, it, expect, afterEach, vi } from 'vitest'
+import { render, screen, cleanup, within, fireEvent } from '@testing-library/react'
 import { I18nProvider } from '../i18n/useT.js'
 import { MediaDetailPage, seasonTally, isNotFoundError, readyTally, formatDuration, formatSize } from './MediaDetailPage.js'
 import { extraUnsubtitledCount } from './EpisodeCell.js'
@@ -745,5 +745,96 @@ describe('Hero D：CSS 几何（圆角上缘 + 底缘渐入 + 拒绝投影）', 
   it('R-F11：hero 段无投影（MEDIA_CSS 已整段守 box-shadow，这里再钉 hero 专属块）', () => {
     const heroBlock = /\.media-detail-hero[\s\S]*?\{[^}]*box-shadow/
     expect(heroBlock.test(MEDIA_CSS)).toBe(false)
+  })
+})
+
+// ═══ 按需取字幕（openspec 第 12 组 12.9 + 12.6）═══════════════════════════════
+// 交互被刻意拆成两步：**点格子 = 选中（免费）**，**点动作条上的按钮 = 真花钱抓一次**。
+// 之所以不把按钮放进格子里：EpisodeCell 的铁律是"直接子元素只有集号 span + 可选 svg"，
+// 且 role="listitem" 是本文件 cellOf() 定位格子的唯一手段（上面 R-F5/R-F12 各条都靠它）。
+describe('按需取字幕：点格子选中 → 动作条上点按钮才真抓一次', () => {
+  const seasons = [{
+    season: 1,
+    episodes: [
+      ep({ episode: 1, onDisk: true, episodeState: 'covered' }),
+      ep({ episode: 2, onDisk: true, episodeState: 'pending' }),
+    ],
+  }]
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('🔴 没选中时**不出现**动作条；选中某一集后出现，并写着「这一次 = 一次独立抓取」', () => {
+    renderDetail(asyncOf(detail({ seasons })))
+    expect(screen.queryByTestId('media-fetch-bar')).toBeNull()
+    fireEvent.click(cellOf(2))
+    expect(screen.getByTestId('media-fetch-bar')).toBeTruthy()
+    // 12.6：成本必须常驻可见——按集线性放大是这条文案存在的全部理由
+    expect(screen.getByText(en.media_fetch_cost)).toBeTruthy()
+  })
+
+  it('🔴 12.6「不许批量入口」：页面上动作条恒只有一个、里面只有一个按钮', () => {
+    renderDetail(asyncOf(detail({ seasons })))
+    fireEvent.click(cellOf(2))
+    expect(screen.getAllByTestId('media-fetch-bar')).toHaveLength(1)
+    expect(within(screen.getByTestId('media-fetch-bar')).getAllByRole('button')).toHaveLength(1)
+  })
+
+  it('🔴 点按钮 → POST /api/v2/subtitle/fetch，body 精确到 {workId, season, episode}', async () => {
+    const calls: Array<{ url: string; body: unknown }> = []
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown, init?: { body?: unknown }) => {
+      calls.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : null })
+      return new Response(JSON.stringify({
+        ok: true, outcome: 'accepted', targets: 1, skipped: 0, queuedBehindRound: false,
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }))
+    renderDetail(asyncOf(detail({ seasons })))
+    fireEvent.click(cellOf(2))
+    fireEvent.click(screen.getByTestId('media-fetch-subtitle'))
+    expect(await screen.findByText(en.media_fetch_accepted)).toBeTruthy()
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.url).toContain('/api/v2/subtitle/fetch')
+    expect(calls[0]!.body).toEqual({ workId: 'tmdb:1396', season: 1, episode: 2 })
+  })
+
+  it('🔴 受理后若要等正在跑的那轮巡检（queuedBehindRound）→ 回执里如实说出来', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      ok: true, outcome: 'accepted', targets: 1, skipped: 0, queuedBehindRound: true,
+    }), { status: 200, headers: { 'content-type': 'application/json' } })))
+    renderDetail(asyncOf(detail({ seasons })))
+    fireEvent.click(cellOf(2))
+    fireEvent.click(screen.getByTestId('media-fetch-subtitle'))
+    // 「已受理」与「已经在找」是两件事（提案 10.9 的红线），这条钉住后者不被说成前者
+    expect(await screen.findByText(new RegExp(en.media_fetch_queued_behind_round))).toBeTruthy()
+  })
+
+  it('🔴 被关卡拒绝（409 already-covered）→ 显示**人话**而不是 reason 枚举原文', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ error: 'already-covered', reason: 'already-covered' }),
+      { status: 409, headers: { 'content-type': 'application/json' } },
+    )))
+    renderDetail(asyncOf(detail({ seasons })))
+    fireEvent.click(cellOf(1))
+    fireEvent.click(screen.getByTestId('media-fetch-subtitle'))
+    expect(await screen.findByText(en.media_fetch_reject_already_covered)).toBeTruthy()
+  })
+
+  it('电影：动作条**常显**（没有"选中"这一步），且不带 season/episode 发出', async () => {
+    const calls: Array<{ body: unknown }> = []
+    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
+      calls.push({ body: init?.body ? JSON.parse(String(init.body)) : null })
+      return new Response(JSON.stringify({
+        ok: true, outcome: 'accepted', targets: 1, skipped: 0, queuedBehindRound: false,
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }))
+    renderDetail(asyncOf(detail({
+      seasons: [],
+      movie: movieCell({ fileCount: 1, subtitledFileCount: 0, episodeState: 'pending' }),
+    })))
+    expect(screen.getByTestId('media-fetch-bar')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('media-fetch-subtitle'))
+    expect(await screen.findByText(en.media_fetch_accepted)).toBeTruthy()
+    expect(calls[0]!.body).toEqual({ workId: 'tmdb:1396' })
   })
 })

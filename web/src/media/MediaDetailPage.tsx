@@ -29,10 +29,10 @@ import type {
   MediaSubtitleDot,
   EpisodeState,
 } from '../api/types.js'
-import { backdropUrl, heroPosterUrl } from '../api/client.js'
+import { backdropUrl, heroPosterUrl, api } from '../api/client.js'
 import { useT } from '../i18n/useT.js'
 import { localizeError } from '../lib/errorText.js'
-import { EpisodeCell } from './EpisodeCell.js'
+import { EpisodeCell, formatEpisodeNumber } from './EpisodeCell.js'
 import { EpisodeMark } from './EpisodeMark.js'
 import { EPISODE_STATE_LABEL, LEGEND_STATES } from './episodeStateMeta.js'
 import { displayTitle } from '../workbench/displayTitle.js'
@@ -260,7 +260,84 @@ function Legend() {
   )
 }
 
-function SeasonBlock({ season }: { season: MediaLibrarySeasonDTO }) {
+/** 拒绝原因 → 文案键。**显式表**而不是拼字符串（`t('...' + reason)`）：拼出来的键一旦
+ *  对不上，`t()` 会回落到键名或者空串，用户看到的就是一句英文枚举或一片空白——
+ *  那种"看起来有反馈"的假反馈正是本仓反复修的那类。表里没有的（后端将来加了新原因）
+ *  一律原样显示枚举，宁可难看也要可查。 */
+const REJECT_TEXT: Record<string, string> = {
+  'already-covered': 'media_fetch_reject_already_covered',
+  'no-subtitle-needed': 'media_fetch_reject_no_subtitle_needed',
+  'translate-workbench': 'media_fetch_reject_translate_workbench',
+  'already-running': 'media_fetch_reject_already_running',
+  'not-judged': 'media_fetch_reject_not_judged',
+  'no-video-files': 'media_fetch_reject_no_video_files',
+  'work-not-found': 'media_fetch_reject_work_not_found',
+}
+
+/** 按需取字幕的动作条（openspec 第 12 组 12.9 + 12.6）。
+ *
+ *  ── 为什么按钮在这条**网格下方**的条上，而不是每一格里 ──────────────────────
+ *  EpisodeCell 有一条铁律：格子的直接子元素只有「集号 span + 可选 svg」，且
+ *  `role="listitem"` 是既有用例定位格子的手段。往格里塞按钮会把两条同时打破。
+ *  所以交互拆成两步：**点格子 = 选中（免费）**，**点这里的按钮 = 真花钱抓一次**。
+ *  这也顺带把 12.6 的成本可见性自然落在一处：这条上永远写着"这一次 = 一次独立抓取"。
+ *
+ *  ── 为什么必须逐项显示回执 ────────────────────────────────────────────────
+ *  提案第 10 组的实测教训：只回 `{ok:true}` 时用户点了看不出下文。这里把服务端
+ *  200 回执里的三件事分别说出来——已受理 / 是否要等正在跑的那轮巡检 / 有几个文件
+ *  被关卡挡下；被拒绝时把 `reason` 翻成一句人话，而不是把枚举丢给用户。 */
+function SubtitleFetchBar({ workId, season, episode, label }: {
+  workId: string
+  season?: number
+  episode?: number
+  label?: string
+}) {
+  const { t } = useT()
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState<string | null>(null)
+
+  const run = async () => {
+    setBusy(true)
+    setMsg(null)
+    try {
+      const r = await api.subtitleFetch(workId, season ?? null, episode ?? null)
+      const parts = [t('media_fetch_accepted')]
+      if (r.queuedBehindRound) parts.push(t('media_fetch_queued_behind_round'))
+      if (r.phase) parts.push(`${t('media_fetch_phase')} ${r.phase}`)
+      if (r.skipped > 0) parts.push(`${t('media_fetch_skipped')} ${r.skipped}`)
+      setMsg(parts.join(' · '))
+    } catch (e) {
+      const raw = e instanceof Error ? e.message : String(e)
+      const key = REJECT_TEXT[raw]
+      setMsg(key ? t(key) : raw)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="media-fetch-bar" data-testid="media-fetch-bar">
+      <span className="text-[13px] text-muted-foreground">
+        {label ? `${label} · ` : ''}
+        {t('media_fetch_cost')}
+      </span>
+      <Button variant="secondary" size="sm" disabled={busy} onClick={() => void run()} data-testid="media-fetch-subtitle">
+        {t('media_fetch_button')}
+      </Button>
+      {msg !== null ? (
+        <span role="status" className="text-[13px] text-muted-foreground" data-testid="media-fetch-msg">{msg}</span>
+      ) : null}
+    </div>
+  )
+}
+
+function SeasonBlock({ season, workId, picked, onPick }: {
+  season: MediaLibrarySeasonDTO
+  workId: string
+  /** 当前选中的集号（**本季**的；跨季同名集号不该互相点亮，故由调用方按季过滤）。 */
+  picked: number | null
+  onPick: (episode: number) => void
+}) {
   const { t } = useT()
   const tally = seasonTally(season)
   return (
@@ -275,9 +352,23 @@ function SeasonBlock({ season }: { season: MediaLibrarySeasonDTO }) {
       </h2>
       <div className="media-ep-grid" role="list">
         {season.episodes.map((ep) => (
-          <EpisodeCell key={ep.episode} ep={ep} />
+          <EpisodeCell
+            key={ep.episode}
+            ep={ep}
+            picked={picked === ep.episode}
+            onPick={() => onPick(ep.episode)}
+          />
         ))}
       </div>
+      {/* 选中了本季某一集 → 露出动作条。一次只服务一集（12.6：不提供批量入口）。 */}
+      {picked !== null ? (
+        <SubtitleFetchBar
+          workId={workId}
+          season={season.season}
+          episode={picked}
+          label={`${t('media_season_prefix')} ${season.season}${formatEpisodeNumber(picked)}`}
+        />
+      ) : null}
     </div>
   )
 }
@@ -286,7 +377,7 @@ function SeasonBlock({ season }: { season: MediaLibrarySeasonDTO }) {
  *  ⚠️ 后端注释点名：电影格**可能零文件**（空壳 works 直达详情端点），此时 episodeState
  *  是 'absent' —— 走虚线、不染色，与剧集的虚线格完全一致。
  *  有文件时露出磁盘文件名，不再复用拉满整行的集号格（那是给 E01 这种短标签用的）。 */
-function MovieBlock({ movie }: { movie: MediaLibraryMovieDTO }) {
+function MovieBlock({ movie, workId }: { movie: MediaLibraryMovieDTO; workId: string }) {
   const { t } = useT()
   const label = t(EPISODE_STATE_LABEL[movie.episodeState])
   return (
@@ -308,6 +399,9 @@ function MovieBlock({ movie }: { movie: MediaLibraryMovieDTO }) {
           <EpisodeMark state={movie.episodeState} />
         </div>
       </div>
+      {/* 电影不需要"选中"这一步：它只有一部片，动作条直接常显。
+          不传 season/episode = 整个作品（服务端就是这么定义"单片"的）。 */}
+      <SubtitleFetchBar workId={workId} />
     </div>
   )
 }
@@ -329,6 +423,10 @@ function DetailSkeleton() {
 
 export function MediaDetailPage({ detail }: { detail: Async<MediaLibraryDetailDTO> }) {
   const { t, lang } = useT()
+  // 按需取字幕（openspec 第 12 组 12.9）：选中的那一集。**钩子必须在本函数的一切 early return
+  // 之前**（下面有 loading/error/空数据三条 return），所以放在这里而不是"拿到 data 之后"。
+  // 存 {season, episode} 而不是裸集号：两个季都有 E01 时，裸集号会让两季的动作条同时亮。
+  const [picked, setPicked] = useState<{ season: number; episode: number } | null>(null)
 
   if (detail.loading && !detail.data) {
     return (
@@ -395,10 +493,16 @@ export function MediaDetailPage({ detail }: { detail: Async<MediaLibraryDetailDT
 
         {/* 剧集：逐季网格。**电影恒空数组**（后端保证），所以这个 map 对电影天然不渲染。 */}
         {seasons.map((s) => (
-          <SeasonBlock key={s.season} season={s} />
+          <SeasonBlock
+            key={s.season}
+            season={s}
+            workId={work.workId}
+            picked={picked !== null && picked.season === s.season ? picked.episode : null}
+            onPick={(episode) => setPicked({ season: s.season, episode })}
+          />
         ))}
 
-        {movie !== null ? <MovieBlock movie={movie} /> : null}
+        {movie !== null ? <MovieBlock movie={movie} workId={work.workId} /> : null}
 
         {/* 有文件但进不了网格（季集解析不出）——如实报，不报用户会以为文件被弄丢了。 */}
         {unplacedFileCount > 0 ? (

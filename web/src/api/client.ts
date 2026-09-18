@@ -351,6 +351,20 @@ export const api = {
   triggerInspect: () =>
     post<{ ok: true; outcome: 'queued' | 'accepted_starting'; phase?: string | null }>('/api/v2/library/inspect'),
 
+  /** 按需取字幕（openspec 第 12 组）：**指定一部影片 / 某一集，立刻给它找字幕**。
+   *
+   *  `season`/`episode` **要么都给、要么都不给**：都不给 = 整个作品（电影就是单片）。
+   *  只给一个会被服务端 400（那形状等于"把整季点成批量抓取"，而 12.6 明令不许批量入口）；
+   *  这里干脆不构造那种 body，让"只能整集或整片"成为客户端的形状而不是一条约定。
+   *
+   *  拒绝（409）走 mutate 的既有错误路径抛出，message 就是 `reason` 枚举——
+   *  调用方按它选文案，别把枚举原文直接给用户看。 */
+  subtitleFetch: (workId: string, season?: number | null, episode?: number | null) =>
+    post<import('./types.js').SubtitleFetchReceiptDTO>('/api/v2/subtitle/fetch', {
+      workId,
+      ...(season != null && episode != null ? { season, episode } : {}),
+    }),
+
   // Task ⑦：健康快照。SSE（events/）给的是**变化**，这个给的是**当前态**——断线期间丢了
   // 事件之后靠它纠正，这正是后端设立该端点的理由（server.ts 的 F-6 论证）。
   // ⚠️ 不跑 watch 时它**照常 200**（只是 current 为 null），与隔壁 /api/v2/events 的 503

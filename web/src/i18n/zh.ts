@@ -469,6 +469,22 @@ export const zh = {
   // "但另一份还是裸的"。不说"缺"——那个词在本页属于虚线格（磁盘上没有）。
   media_extra_unsubtitled: '另有份数还没配上：',
   media_extra_unsubtitled_legend: '右上角数字 = 这一集还没配上字幕的份数',
+  // ── 按需取字幕（openspec 第 12 组 12.6 / 12.9）────────────────────────────
+  // 12.6 的硬要求：入口必须让用户看见"这一次 = 一次独立抓取"。按集线性放大的成本
+  // （一季 24 集 = 24 次付费调用）是这条文案存在的全部理由，故它常驻、不折叠。
+  media_fetch_cost: '这一次 = 一次独立抓取',
+  media_fetch_button: '就找这一集的字幕',
+  media_fetch_accepted: '已受理，正在去找',
+  media_fetch_queued_behind_round: '等正在跑的那轮巡检跑完就开始',
+  media_fetch_phase: '引擎还在启动：',
+  media_fetch_skipped: '另有几个文件被跳过：',
+  media_fetch_reject_already_covered: '磁盘上已经有这一集的目标语言字幕了，不用再找',
+  media_fetch_reject_no_subtitle_needed: '这一集按判定不需要外挂字幕（母语即目标语言 / 已有内嵌目标字幕 / 特典）',
+  media_fetch_reject_translate_workbench: '这一集归翻译工作台，请到那边处理',
+  media_fetch_reject_already_running: '这个作品的字幕任务正在进行，等它跑完再点',
+  media_fetch_reject_not_judged: '这一集还没判定（先跑一次扫描 / 巡检再来）',
+  media_fetch_reject_no_video_files: '这一集在库里没有对应的视频文件',
+  media_fetch_reject_work_not_found: '找不到这个作品（未识别的目录要先绑定作品）',
   media_detail_not_found_title: '没有这部作品',
   media_detail_not_found_desc: '库里没有这个作品，可能已随守备目录一起移除。',
   media_detail_no_seasons_title: '还没有任何一集',

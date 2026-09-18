@@ -61,7 +61,19 @@ export function extraUnsubtitledCount(ep: {
   return Math.max(0, ep.fileCount - ep.subtitledFileCount)
 }
 
-export function EpisodeCell({ ep }: { ep: MediaLibraryEpisodeDTO }) {
+export function EpisodeCell({ ep, onPick, picked = false }: {
+  ep: MediaLibraryEpisodeDTO
+  /** 用户点这一格 = **选中这一集**（openspec 第 12 组 12.9 的按需取字幕入口）。
+   *
+   *  ── 为什么按钮**不在这一格里** ────────────────────────────────────────────
+   *  本文件头注释那条铁律：格子的直接子元素只有「集号 span + 可选 svg」两个，
+   *  且外层的 `role="listitem"` 是既有用例定位格子的唯一手段。往格里塞一个按钮
+   *  会把这两条同时打破。所以这里只提供"可以选择"，真正的动作按钮渲染在网格**下方**
+   *  的动作条上（一次点击 = 一次独立抓取的提示也在那里，12.6）。
+   *  选中态只是给动作条提供主语，本身不发任何请求、不花钱。 */
+  onPick?: () => void
+  picked?: boolean
+}) {
   const { t } = useT()
   const extraUnsubtitled = extraUnsubtitledCount(ep)
   // 无障碍整句：屏幕阅读器读到的是"E01 已配字幕"，而不是把符号与集号读成两个碎片
@@ -74,6 +86,18 @@ export function EpisodeCell({ ep }: { ep: MediaLibraryEpisodeDTO }) {
   return (
     <div
       className="media-ep-cell"
+      // 可选中时给一条可聚焦的键盘通道（Enter/Space）——只有 onClick 的 div 对键盘用户
+      // 等于不存在。role 仍留 listitem（格子是列表项这件事没变），故不宣称它是 button：
+      // 真正的 button 在下面的动作条里，键盘用户 Tab 到它就能完成整个动作。
+      tabIndex={onPick ? 0 : undefined}
+      onClick={onPick}
+      onKeyDown={onPick
+        ? (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onPick() }
+          }
+        : undefined}
+      data-picked={picked ? 'true' : 'false'}
+
       // 边框实虚由 CSS 按 data-ondisk 选（组件层不写死任何几何/色值，同 activity/ 的
       // data-tone 既有手法）。
       //

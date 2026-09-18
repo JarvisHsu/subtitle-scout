@@ -535,6 +535,22 @@ export const en = {
   // "但另一份还是裸的"。刻意不说 "missing"——那个词在本页已经属于虚线格（磁盘上没有）。
   media_extra_unsubtitled: 'another copy still needs subtitles:',
   media_extra_unsubtitled_legend: 'superscript = copies of this episode still without subtitles',
+  // ── On-demand subtitle fetch (openspec group 12, 12.6 / 12.9) ─────────────
+  // 12.6 requires the entry point to show "this = one independent fetch". The cost scales
+  // linearly per episode (a 24-episode season = 24 paid fetches), so this line stays visible.
+  media_fetch_cost: 'this = one independent fetch',
+  media_fetch_button: 'Find subtitles for this one',
+  media_fetch_accepted: 'Accepted, searching now',
+  media_fetch_queued_behind_round: 'starts right after the running inspection finishes',
+  media_fetch_phase: 'engine still starting:',
+  media_fetch_skipped: 'files skipped:',
+  media_fetch_reject_already_covered: 'Subtitles for this episode are already on disk — nothing to look for',
+  media_fetch_reject_no_subtitle_needed: 'This episode is judged not to need external subtitles (native language / embedded target track / extra)',
+  media_fetch_reject_translate_workbench: 'This episode belongs to the translate workbench — handle it there',
+  media_fetch_reject_already_running: 'A subtitle job for this title is already running — try again when it finishes',
+  media_fetch_reject_not_judged: 'This episode has not been judged yet (run a scan / inspection first)',
+  media_fetch_reject_no_video_files: 'No video file in the library for this episode',
+  media_fetch_reject_work_not_found: 'No such title (an unidentified directory must be bound to a title first)',
   media_detail_not_found_title: 'No such title',
   media_detail_not_found_desc: 'This work is not in the library. It may have been removed with its media root.',
   media_detail_no_seasons_title: 'No episodes yet',

@@ -596,7 +596,35 @@ export interface MediaLibraryItemDTO {
   unplacedFileCount: number
 }
 
-/** 详情页一格（一集）。 */
+/** 按需取字幕被**关卡拒绝**的原因（手抄自服务端 `SubtitleFetchRejection`）。
+ *  这些不是"服务不可用"，而是"你点名的这个东西现在不该抓"——界面要按它给不同的解释，
+ *  而不是把它们混成一句"失败了"（那正是本仓反复修的那类"诚实的垃圾回执"）。 */
+export type SubtitleFetchRejectReason =
+  | 'work-not-found'
+  | 'no-video-files'
+  | 'not-judged'
+  | 'no-subtitle-needed'
+  | 'already-covered'
+  | 'translate-workbench'
+  | 'already-running'
+
+/** 按需取字幕的**受理回执**（`POST /api/v2/subtitle/fetch` 的 200 形状）。
+ *
+ *  ⚠️ 只回 `{ok:true}` 是不够的（提案 10.2 那条红线在按需取件上同样适用）：用户必须能看出
+ *  「已受理，要点名 N 个文件」与「已受理，但要等正在跑的那轮巡检跑完」是两件事，
+ *  否则又是一次"点了没反应"。 */
+export interface SubtitleFetchReceiptDTO {
+  ok: true
+  outcome: 'accepted' | 'accepted_starting'
+  /** 本次要点名抓取的文件数。 */
+  targets: number
+  /** 同一次点名里被关卡挡下的文件数（点整部作品时会出现）。 */
+  skipped: number
+  /** 本次要等正在跑的那一轮巡检结束才执行（主循环是串行的）。 */
+  queuedBehindRound: boolean
+  /** 只在 daemon 仍处启动阶段时有值（第 10 组落下的受理态机制）。 */
+  phase?: string
+}
 export interface MediaLibraryEpisodeDTO {
   episode: number
   title: string | null
