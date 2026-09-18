@@ -522,3 +522,90 @@ describe('D-4 · 404 终态可失效（identify_gate_version 版本戳）', () =
     expect(listIdentifyQueue(db, 9999).map(i => i.workDir)).toContain('/media/D')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 提案 §6（2026-09-18）：队列取件顺序改为按目录内**最新 mtime** 倒序。
+//
+// 这一组锁的是"排序键必须是外部事实、不能是轨道自己的记账"这条纪律。
+// 它极容易被下一个人当成"随手优化"改回 `updated_at`（那个列看起来更"新"），
+// 而那个改动会让一个永远认不出来的目录**每轮都把自己推到队首**——把新作品饿死。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('listIdentifyQueue · 取件顺序按最新 mtime（提案 §6）', () => {
+  /** 播一个 work_dir；`mtime` 是磁盘写入时间，`updatedAt` 模拟识别轨自己的回写。 */
+  function seedDir(
+    db: ReturnType<typeof openDb>,
+    workDir: string,
+    opts: { mtime: number; updatedAt: number; attempt?: number; lastError?: string | null; gate?: number | null },
+  ) {
+    db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, attempt, last_error, identify_gate_version, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(`${workDir}/01.mp4`, workDir, '01.mp4', 100, opts.mtime, workDir,
+        opts.attempt ?? 0, opts.lastError ?? null, opts.gate ?? null, opts.updatedAt)
+  }
+
+  it('新 mtime 的目录排前面（用户刚放进去的先处理）', () => {
+    const db = openDb(':memory:')
+    seedDir(db, '/media/老片', { mtime: 1_000, updatedAt: 1_000 })
+    seedDir(db, '/media/新片', { mtime: 9_000_000, updatedAt: 9_000_000 })
+
+    expect(listIdentifyQueue(db, 999_999_999).map((i) => i.workDir)).toEqual(['/media/新片', '/media/老片'])
+    db.close()
+  })
+
+  it('🔴 updated_at 不是排序键：失败目录的回写不许把自己顶上队首', () => {
+    const db = openDb(':memory:')
+    // 老目录：mtime 很旧，但识别轨刚刚回写过（退避/盖戳），updated_at 是最新的。
+    // 任何"按 updated_at 排"的写法都会把它排到第一 —— 这就是要拦的形态。
+    seedDir(db, '/media/永远认不出的老片', { mtime: 1_000, updatedAt: 9_000_000, attempt: 9, lastError: 'evidence-fail: x' })
+    // 新目录：mtime 最新，但识别轨从没碰过它（updated_at 很旧）。
+    seedDir(db, '/media/刚加的新片', { mtime: 8_000_000, updatedAt: 5_000 })
+
+    expect(listIdentifyQueue(db, 999_999_999).map((i) => i.workDir)).toEqual(['/media/刚加的新片', '/media/永远认不出的老片'])
+    db.close()
+  })
+
+  it('🔴 attempt 不是排序键：失败得越多越不该靠前（原实现的 MIN(attempt) 会这样做）', () => {
+    const db = openDb(':memory:')
+    seedDir(db, '/media/老片attempt0', { mtime: 1_000, updatedAt: 1_000, attempt: 0 })
+    seedDir(db, '/media/新片attempt9', { mtime: 8_000_000, updatedAt: 1_000, attempt: 9 })
+
+    expect(listIdentifyQueue(db, 999_999_999)[0]!.workDir).toBe('/media/新片attempt9')
+    db.close()
+  })
+
+  it('同 mtime → 按 work_dir 确定性排序（顺序不随查询计划抖动）', () => {
+    const db = openDb(':memory:')
+    seedDir(db, '/media/B', { mtime: 5_000, updatedAt: 1 })
+    seedDir(db, '/media/A', { mtime: 5_000, updatedAt: 2 })
+    seedDir(db, '/media/C', { mtime: 5_000, updatedAt: 3 })
+
+    expect(listIdentifyQueue(db, 999_999_999).map((i) => i.workDir)).toEqual(['/media/A', '/media/B', '/media/C'])
+    db.close()
+  })
+
+  it('§6.3：版本戳解冻的 404 老目录**不额外提权**——按自身 mtime 老实排队', () => {
+    const db = openDb(':memory:')
+    // 一条被 D-4 解冻的老 404（gate 为 NULL → 重新入队），mtime 很旧。
+    seedDir(db, '/media/解冻的老404', { mtime: 1_000, updatedAt: 1_000, lastError: 'tmdb-404', gate: null })
+    // 用户今天刚加的新片。
+    seedDir(db, '/media/今天刚加', { mtime: 9_000_000, updatedAt: 9_000_000 })
+
+    // 两条都在队列里（解冻生效），但**新片排前面**——解冻不等于插队。
+    expect(listIdentifyQueue(db, 999_999_999).map((i) => i.workDir)).toEqual(['/media/今天刚加', '/media/解冻的老404'])
+    db.close()
+  })
+
+  it('目录内取 MAX(mtime)：新加一集的旧目录，按那一集的新 mtime 参与排序', () => {
+    const db = openDb(':memory:')
+    seedDir(db, '/media/老剧', { mtime: 1_000, updatedAt: 1_000 })
+    db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, updated_at)
+                VALUES (?,?,?,?,?,?,?)`)
+      .run('/media/老剧/S04E01.mkv', '/media/老剧', 'S04E01.mkv', 100, 9_500_000, '/media/老剧', 1_000)
+    seedDir(db, '/media/另一部老片', { mtime: 5_000, updatedAt: 5_000 })
+
+    // 老剧的最新 mtime(9_500_000) > 另一部老片(5_000) → 老剧在前。
+    // 若写成 MIN(mtime) 或 MIN(id)，老剧会被另一部老片压住。
+    expect(listIdentifyQueue(db, 999_999_999).map((i) => i.workDir)).toEqual(['/media/老剧', '/media/另一部老片'])
+    db.close()
+  })
+})

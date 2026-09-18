@@ -74,7 +74,26 @@ export function listIdentifyQueue(db: ScoutDb, now: number): IdentifyQueueItem[]
         OR identify_gate_version < ?
       )
     GROUP BY work_dir
-    ORDER BY MIN(attempt), MIN(id)
+    -- 取件顺序（提案第 6 组，2026-09-18）：按**目录内最新 mtime** 倒序，
+    -- 替换原来的 ORDER BY MIN(attempt), MIN(id)。
+    -- 理由是"用户刚放进去的东西先被处理"——这是界面上唯一能让用户感知到
+    -- "我看得见它在动"的排序性质。
+    --
+    -- 为什么**不按 updated_at**（本仓最容易顺手写错的一条）：updated_at 是**识别轨
+    -- 自己会回写的列**——每次失败退避、每次盖版本戳都会刷新它。拿它排序等于
+    -- "越失败越靠前"：一个永远认不出来的目录每轮都把自己推到队首，
+    -- 把真正新加的作品饿在后面。**排序键必须是外部事实，不能是轨道自己的记账**。
+    -- mtime 满足这条：它是文件在磁盘上的写入时间，识别轨从不碰它。
+    --
+    -- 为什么**不按 id**（D-4 之前的 MIN(id)）：id 是"这个文件第一次被扫描到"的
+    -- 插入序号——一个三年前的老目录里**今天新加的一集**，id 依然是老的（行已存在，
+    -- scan 只更新 mtime），于是它会被埋在几百行之后。而 mtime 会跟着更新，
+    -- 这正是"同一目录里新加的文件也该优先"所要求的。MIN(id) 还顺带让
+    -- "重新扫描导致的 id 变化"影响队首，行为不可预期。
+    --
+    -- 末位 work_dir 只是**确定性 tiebreaker**（同 mtime 时顺序不随 SQLite 的任意选择变），
+    -- 不表达任何优先级——否则同 mtime 的目录顺序会随查询计划抖动，测试也跟着飘。
+    ORDER BY MAX(mtime) DESC, work_dir ASC
   `).all(now, IDENTIFY_GATE_VERSION) as Array<{ work_dir: string; file_count: number; with_season: number }>
 
   return rows.map(r => {
