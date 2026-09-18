@@ -1044,6 +1044,11 @@ export class ScoutDaemonV2 {
    *  循环"），但**必须逐个包**而不是整体包一层——整体包的话第一个器官抛错就短路掉后面三个，
    *  一次磁盘满会同时静默掉 checkpoint、备份、探针清扫和 trace 修剪。 */
   private async runMaintenance(): Promise<void> {
+    // 🔴 #19（第 40 轮）：维护拍原来**没有任何日志**（`db backup` 只是它的其中一步）。
+    // 实测："进主循环"之后 **2 分 20 秒**仍无 `巡检开始`/`扫描开始`，而 boot 段已只需 31 毫秒
+    // ⇒ 剩下的静默就在这一拍里。首尾各一行，把主循环第一拍也变成有主的时间。
+    const maintStartedAt = Date.now()
+    this.deps.log('维护拍: 开始')
     const now = this.deps.now?.() ?? Date.now()
 
     // preTick 最先跑：secrets_version 变了在这里完成热重建，本拍后续的 workPermitted 与
