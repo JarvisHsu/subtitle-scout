@@ -772,6 +772,8 @@ export class ScoutDaemonV2 {
     // 事实只能靠 in-flight 集合 + mtime 活性窗口保护，任何一处判据失灵就是把跑了两小时的
     // 翻译工作台整个 rm 掉（gcOrphans 的 R6-9/R7-1 两次修复都在还这笔债）。
     try {
+      // 🔴 #19（第 36 轮）：boot 的第一步也可能是黑洞——它原来只在**真清到东西**时才打日志。
+      this.deps.log('boot: staging-gc 开始（扫沙盒残留）')
       this.enterStartupStep('staging-gc'); const cleaned = this.deps.gcStaging?.(this.inFlightStagingJobIds) ?? 0
       if (cleaned > 0) this.deps.log(`boot: 清理了 ${cleaned} 个上个进程遗留的孤儿工作台`)
     } catch (e) {
@@ -800,6 +802,10 @@ export class ScoutDaemonV2 {
     // 独立 try/catch 而不是与上面共用一个：共用时 embedded_langs 那支的 pass 级爆炸会
     // **跳过**本支，于是"ffprobe 二进制缺失"这种与 TMDB 毫不相干的故障会连带让 imdb 永远补不上。
     try {
+      // 🔴 #19（第 36 轮）：这一支**要按作品打 TMDB**（33 个剧 / 77 个作品，带限流），
+      // 而它原来**没有开始日志**——实测 `db backup` 之后 ≥19 分钟一行都没有、`扫描开始` 从未出现。
+      // 加一行开始日志，就把那段全黑的时间**劈开**：卡在哪一支立刻可见。
+      this.deps.log('回填: provider-ids 开始（按作品打 TMDB，可能要几分钟）')
       this.enterStartupStep('backfill-provider-ids'); await this.backfillProviderIds()
     } catch (e) {
       this.deps.log(`warn: boot provider_ids 回填失败（隔离，不阻塞巡检，下次启动重试）: ${String(e)}`)
@@ -814,6 +820,8 @@ export class ScoutDaemonV2 {
     // 独立 try/catch 而不是与上面共用：共用时 provider_ids 那支的 pass 级爆炸会**跳过**本支，
     // 于是一个与背景图毫不相干的 external_ids 故障会连带让活动页永远退化成模糊海报。
     try {
+      // 🔴 #19（第 36 轮）：同上一支——它也要按作品打 TMDB（背景图），原来没有开始日志。
+      this.deps.log('回填: backdrop-paths 开始（按作品打 TMDB，可能要几分钟）')
       this.enterStartupStep('backfill-backdrop-paths'); await this.backfillBackdropPaths()
     } catch (e) {
       this.deps.log(`warn: boot backdrop_path 回填失败（隔离，不阻塞巡检，下次启动重试）: ${String(e)}`)
@@ -828,6 +836,8 @@ export class ScoutDaemonV2 {
     // 于是一个与季集表毫不相干的 external_ids 故障会连带让媒体库页的虚线卡片永远画不出来。
     // 这条 catch 是"TMDB 抓不到季集表只是媒体库页少个虚线、绝不阻塞主巡检"的唯一保证者。
     try {
+      // 🔴 #19（第 36 轮）：同上一支——季集表回填同样按作品打 TMDB，原来没有开始日志。
+      this.deps.log('回填: season-catalog 开始（按作品打 TMDB，可能要几分钟）')
       this.enterStartupStep('backfill-season-catalog'); await this.backfillSeasonCatalog()
     } catch (e) {
       this.deps.log(`warn: boot 应有集回填失败（隔离，不阻塞巡检，下次启动重试）: ${String(e)}`)
