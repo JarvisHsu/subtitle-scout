@@ -1902,6 +1902,13 @@ export class ScoutDaemonV2 {
   }
 
   private async scanOnceInner(signal?: AbortSignal): Promise<void> {
+    // 🔴 #19（2026-09-18 第 33 轮）：**扫描开始也要留痕**。
+    // 实测：boot 段的 `db backup` 之后可以有 **≥14 分钟一行日志都没有**的窗口，而用户会问的正是
+    // "我加了片子，它到底动了没有"。扫描是这一段里最长的活（FUSE 上按分钟计），却原来只在
+    // **结束时**打一条 `scan: scanned=… upserted=…`——于是"正在扫"与"卡死了"在日志上完全同形。
+    // 这一行 + 收尾那条带 `用时` 的日志，把那段黑箱变成有首有尾的一段。
+    const scanStartedAt = Date.now()
+    this.deps.log(`扫描开始（${this.currentRoots().length} 个守备目录；FUSE 上可能要几分钟）`)
     const db = this.deps.db
     const now = this.deps.now?.() ?? Date.now()
 
@@ -2283,6 +2290,13 @@ export class ScoutDaemonV2 {
         } catch { /* 无表/写失败：不阻断扫描，见上 */ }
       }
     }
+    // 🔴 #19：扫描收尾**无条件**打一行。（原来只有下面那条，而它挂在 `upserted > 0` 下面——
+    // 没有任何新增/变化时**扫描全程一行日志都没有**，"扫完了没事"与"卡住了"在日志上完全同形。
+    // 这就是那个 ≥14 分钟黑箱的另一半。）
+    this.deps.log(
+      `扫描结束：用时 ${Math.round((Date.now() - scanStartedAt) / 1000)}s，` +
+      `扫到 ${scanned} 个文件，入库/更新 ${upserted} 行，跳过的根 ${skipped} 个`,
+    )
     if (upserted > 0) {
       this.deps.log(`scan: scanned=${scanned} upserted=${upserted} skipped=${skipped}`)
     }
