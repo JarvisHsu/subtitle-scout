@@ -848,6 +848,10 @@ export class ScoutDaemonV2 {
     // 翻译）。classifyFileState 已有纠正逻辑让终态盖过陈旧流水线态，但前端卡片聚合仍读脏值
     // 算「找不到」→ 卡片说「自带 30」、详情页却全红叉自相矛盾（2026-08-31 实案）。
     try {
+      // 🔴 #19（第 37 轮）：这三支原来**都没有开始日志**，而它们各自都可能吃掉几分钟——
+      // `backfillZhOverviews` 甚至是**逐作品调 LLM** 生成中文简介（写入点②），
+      // 在一轮 boot 里对 77 个作品里的若干批逐个调用，日志上却是全黑。
+      this.deps.log('回填: 清理陈旧 sub_status 开始')
       await this.backfillClearStaleSub()
     } catch (e) {
       this.deps.log(`warn: boot 清理陈旧 sub_status 失败（隔离，不阻塞巡检，下次启动重试）: ${String(e)}`)
@@ -855,6 +859,7 @@ export class ScoutDaemonV2 {
 
     // 双语 overview 存量回填（写入点②）：探针缺席休眠；批量 LIMIT 多轮 boot 收敛。
     try {
+      this.deps.log('回填: zh 简介开始（逐作品调 LLM，可能几分钟）')
       await this.backfillZhOverviews()
     } catch (e) {
       this.deps.log(`warn: boot zh 简介回填失败（隔离，不阻塞巡检，下次启动重试）: ${String(e)}`)
@@ -864,6 +869,7 @@ export class ScoutDaemonV2 {
     // 巡检把 judgeOnce 放在 scan+identify 之后；软路由上扫盘要数小时，详情会一直显示「还没判定」。
     // 纯函数、不碰磁盘。独立 try/catch：挂了只是晚一轮，不许掀翻主循环。
     try {
+      this.deps.log('boot: judge 开始')
       await this.judgeOnce()
     } catch (e) {
       this.deps.log(`warn: boot judge 失败（隔离，不阻塞巡检，下次启动或巡检阶段 2.5 重试）: ${String(e)}`)
@@ -884,6 +890,10 @@ export class ScoutDaemonV2 {
   private async mainLoop(signal: AbortSignal): Promise<void> {
     // 进主循环 = 启动阶段结束（提案 10.1）。从这里起 requestInspect() 才敢说 queued 就是「马上取件」。
     this.startupStep = null
+    // 🔴 #19（第 37 轮）：**boot 段结束**这一行是那条时间线的右界——
+    // 实测 `db backup` 之后还有 ≥6 分钟沉默，而它后面的第一行里程碑（`巡检开始`/`扫描开始`）
+    // 要等主循环跑起来才可能出现。有了这行，"boot 到底多久"与"主循环第一拍多久"就分开了。
+    this.deps.log('boot 段结束，进主循环')
     while (!this.stopping) {
       // 维护循环跑在时间闸**之外**（旧 daemon 的既有分界：产工作循环受闸、维护循环不受）。
       // 巡检一天一次，WAL checkpoint 若跟着变成一天一次，等于把一整天的写入押在"今天不掉电"上。
