@@ -1046,15 +1046,12 @@ describe('cleanup — 父目录收尾（净残留必须为 0）', () => {
     const root = mediaRoot()
     allocate('job-1', root)
     const ignorePath = join(root, '.subtitle-staging', '.ignore')
-    // 旧口径下这里有一条真实竞争窗口（"删标记"与"删空目录"之间被并发 allocate 插入）。
-    // 第 27 轮起 cleanup **根本不删标记、也不删父目录**，那条窗口从构造上消失了：
-    // 并发 allocate 插进来也好、不插也好，标记与父目录都必须原样在。
-    unlinkSyncOverride = (real, p) => {
-      if (p === ignorePath) mkdirSync(join(root, '.subtitle-staging', 'job-2'), { recursive: true })
-      return real(p)
-    }
+    // 旧口径下这里有一条真实竞争窗口（"删标记"与"删空目录"之间被并发 allocate 插入），
+    // 夹具靠 unlinkSyncOverride 在那个瞬间插进一个 job-2。
+    // 第 27 轮起 cleanup **根本不删标记、也不删父目录**，那条窗口从构造上消失了——
+    // 于是夹具改成直接模拟"另一个任务同时在跑"，断言的是同一件事：标记必须一直在。
+    mkdirSync(join(root, '.subtitle-staging', 'job-2'), { recursive: true })
     cleanup('job-1', root)
-    unlinkSyncOverride = null
     expect(existsSync(ignorePath)).toBe(true)
     expect(readFileSync(ignorePath, 'utf8')).toContain('subtitle-scout staging')
     expect(existsSync(join(root, '.subtitle-staging', 'job-2'))).toBe(true)
