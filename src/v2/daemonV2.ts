@@ -921,6 +921,22 @@ export class ScoutDaemonV2 {
       const everyMs = this.deps.inspectEveryMs?.() ?? INSPECT_INTERVAL_MS
       const permitted = this.deps.workPermitted?.() ?? true
 
+      // 🔴 #19 的收尾（2026-09-18 第 44 轮）：**闸判定必须留痕**。
+      // 实测：`db backup` 之后可以静默十几分钟到几小时，而这期间"维护拍 0 秒完成、provider 全绿、
+      // `runs` 为空"——主循环只是判了"这一拍不巡检"就去睡了，**却一行都不说**。
+      // 于是"它到底在不在干活 / 我加了片子要等多久"从日志里答不出来（#19 为此折腾了七轮）。
+      // 这一行把答案写出来：距上次多少分钟 / 闸多少分钟 / 到期没有。
+      if (!this.stopping) {
+        const waitedMin = lastInspectAt === 0 ? null : Math.round((now - lastInspectAt) / 60000)
+        const sameGateMin = Math.round(everyMs / 60000)
+        const due = lastInspectAt === 0 || now - lastInspectAt >= everyMs
+        this.deps.log(
+          `巡检闸: 距上次 ${waitedMin === null ? '(冷启动)' : `${waitedMin}min`} / 闸 ${sameGateMin}min` +
+          ` → ${due ? '已到期' : '未到期，本拍不巡检'}` +
+          `${permitted ? '' : '（且 workPermitted=false：本轮不会干识别/字幕的活）'}`,
+        )
+      }
+
       // 手动点火取件：必须在 24h 闸之前。闸关死 / 失败短退避都挡不住这次。
       // scanRequested 只在巡检真的开跑时清——workPermitted=false 只丢 inspect
       // 标志，带外扫描（加根 / wizard）仍要留给下一圈。
