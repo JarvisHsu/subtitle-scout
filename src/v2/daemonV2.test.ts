@@ -6771,6 +6771,47 @@ describe('ScoutDaemonV2.requestScan · 带外扫描（"加根后立刻扫"的真
     db.close()
   })
 
+  it('🔴 扫描发现**新增**文件 → 立刻抢跑一轮巡检，且那一轮不再扫盘（新片不必等下一次自然巡检）', async () => {
+    const db = openDb(':memory:')
+    const walks: string[] = []
+    const logs: string[] = []
+    const daemon = new ScoutDaemonV2(mkDeps(db, {
+      roots: ['/media'],
+      listVideoFiles: (root: string) => { walks.push(root); return ['/media/Show/E01.mkv'] },
+      fileExists: () => true,
+      statFile: () => ({ mtimeMs: 1000, size: BIG }),
+      inspectEveryMs: () => Number.MAX_SAFE_INTEGER,
+      maintenanceTickMs: 1,
+      sleep: undefined,
+      log: (m: string) => { logs.push(m) },
+    }))
+    db.prepare(`INSERT INTO meta (key, value) VALUES ('last_inspect_at', ?)`).run(String(1_000_000_000_000))
+
+    const ctrl = new AbortController()
+    const p = daemon.run(ctrl.signal)
+    await new Promise(r => setTimeout(r, 20))
+    const before = walks.length
+
+    // 一次带外扫描：库里此前没有 E01 → 它是"新加进来的"
+    daemon.requestScan()
+    await new Promise(r => setTimeout(r, 120))
+    const triggers = () => logs.filter(m => m.includes('抢跑一轮巡检')).length
+
+    expect(triggers()).toBe(1)                                   // 抢跑真的发生了
+    expect(logs.some(m => m.includes('阶段 1 跳过'))).toBe(true)    // 那一轮没再扫盘
+    // 🔴 关键不变量：抢跑那轮不扫盘 → "连点 N 次只换来一轮扫描"依然成立
+    expect(walks.length).toBe(before + 1)
+
+    // 再扫一次：E01 已经在库里了（`existing` 不再是 undefined）→ **不许**再抢跑。
+    // 这条钉的是"触发链只有一跳"，也就是这条特性不会变成付费热循环。
+    daemon.requestScan()
+    await new Promise(r => setTimeout(r, 120))
+    ctrl.abort()
+    await p
+    expect(triggers()).toBe(1)
+    expect(walks.length).toBe(before + 2)   // 这次那次扫描照常走盘（它本来就是"踢一脚扫描"）
+  })
+
   it('🔴 幂等：连点 N 次只换来一轮扫描（加根 UI 的"猴子动作"不许放大成 N 轮走盘）', async () => {
     const db = openDb(':memory:')
     const walks: string[] = []

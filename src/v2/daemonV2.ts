@@ -470,6 +470,13 @@ export class ScoutDaemonV2 {
    *  与 scanRequested 同型：HTTP 线程只置位，主循环串行取件，避免两个 runInspection 并发。 */
   private inspectRequested = false
 
+  /** 下一轮巡检**跳过它自己的扫描**（阶段 1）。只由"扫描发现新增文件→抢跑"这一条路置位：
+   *  那一轮之所以存在，就是因为扫描刚刚完整跑完（含 detect/probe/judge）。不跳的话
+   *  ① 在 FUSE 上白走一遍全库（分钟级）；② "连点 N 次只换来一轮扫描"这条既有不变量
+   *  会变成两轮——那条不变量是加根 UI 的猴子动作防线，不许被这个新特性悄悄改掉。
+   *  `runInspectionInner` 读一次即清；`already_running` 时不置位（见置位处的论证）。 */
+  private skipScanForNextInspect = false
+
   /** 本进程此刻是否在 `runInspection` 里（含 inspectOnce / 自然巡检 / 手动点火）。
    *  requestInspect 靠它返回 already_running，而不是再排队第二轮。 */
   private inspecting = false
@@ -1059,7 +1066,16 @@ export class ScoutDaemonV2 {
     // 阶段 1：机械扫描
     // signal 传下去是 C46 的刚性需求：R8 重试的退避（1s+3s）落在 scanOnce 里面，
     // 不接的话 `docker stop` 会在每个抖动的根上白等 4 秒。
-    await this.scanOnce(signal)
+    //
+    // ⚠️ 唯一的例外：这一轮巡检如果是**扫描发现新增文件**当场抢跑出来的
+    // （见 `scanOnceInner` 末尾），那么它到来之前扫描刚刚完整跑完（含 detect/probe/judge），
+    // 阶段 1 的状态已经是新鲜的。再扫一遍既是纯浪费（FUSE 上几分钟），
+    // 又会把"连点 N 次只换来一轮扫描"这条既有不变量悄悄改成两轮。
+    // 读一次即清：这个标志只对紧随其后的那一轮生效（主循环是串行的，不会被别人抢走）。
+    const skipScan = this.skipScanForNextInspect
+    this.skipScanForNextInspect = false
+    if (!skipScan) await this.scanOnce(signal)
+    else this.deps.log('巡检：本轮由"扫描发现新增文件"抢跑触发，阶段 1 跳过（扫描刚跑完，状态是新鲜的）')
 
     // 阶段 2：识别工作流（上游）——消费**冻结快照**（R4 / C23）
     //
@@ -2312,7 +2328,10 @@ export class ScoutDaemonV2 {
       this.deps.log(`scan: 新增 ${newlyAdded.length} 个文件 → 立刻抢跑一轮巡检（新片不必等下一次自然巡检）`)
       // 走既有那一根线（requestInspect → 主循环取件）：它自己会处理"巡检正在跑"的情形
       // （此时新片本来就会被这一轮的字幕阶段处理），并在启动阶段如实返回 accepted_starting。
-      this.requestInspect()
+      const outcome = this.requestInspect()
+      // 只有"真的会再起一轮"时才置跳过扫描：already_running 说明我们**就在**某一轮巡检里
+      // （这一轮的扫描刚跑完、它的字幕阶段自然会看到新片），此时置位会误伤下一轮无关的巡检。
+      if (outcome !== 'already_running') this.skipScanForNextInspect = true
     }
   }
 
