@@ -120,7 +120,9 @@ async function start(
     // reconcileAllGetter 已删（第 5.5 步）
     // 完整巡检点火（POST /api/v2/library/inspect）。走 extra 而不是第 7 个位置参数，
     // 免得把现有 `start(..., extra)` 调用的 extra 错位成 subtitleCompareDeps。
-    requestInspect?: () => 'queued' | 'already_running' | 'not_ready'
+    requestInspect?: () => 'queued' | 'already_running' | 'accepted_starting' | 'not_ready'
+    /** 提案 10.1/10.3：daemon 启动阶段的当前步骤；已进主循环为 null。 */
+    startupPhase?: () => string | null
   },
 ): Promise<{ base: string }> {
   server = await startDashboard({
@@ -131,6 +133,7 @@ async function start(
     tmdb: extra?.tmdbGetter ?? (tmdb ? () => tmdb : undefined),
     requestScan,
     requestInspect: extra?.requestInspect,
+    startupPhase: extra?.startupPhase,
     subtitleWriteDeps,
     subtitleCompareDeps,
     cacheRoot: extra?.cacheRoot,
@@ -848,7 +851,42 @@ describe('startDashboard (v2)', () => {
         })
         const res = await fetch(`${base}/api/v2/library/inspect?token=tok`, { method: 'POST' })
         expect(res.status).toBe(200)
-        expect(await res.json()).toEqual({ ok: true })
+        // 🔴 提案 10.2：**不许只回 {ok:true}**。受理语义必须随回执一起出去。
+        expect(await res.json()).toEqual({ ok: true, outcome: 'queued' })
+      })
+
+      // 🔴 提案第 10 组（2026-09-18）：**已受理、但 daemon 还在启动阶段**。
+      // 实测背景：daemon 卡在 boot 段的第一个回填里一个多小时，用户点「立即巡检」
+      // 拿到的是 200 {ok:true} —— 回执没撒谎，却让人分不出该等 1 秒还是 1 小时。
+      it('🔴 accepted_starting → 200 且带上阶段标识（不许只说 ok:true）', async () => {
+        const { base } = await start(distWith('<!doctype html>'), 'tok', undefined, undefined, undefined, undefined, undefined, undefined, {
+          requestInspect: () => 'accepted_starting',
+          startupPhase: () => 'backfill-embedded-langs',
+        })
+        const res = await fetch(`${base}/api/v2/library/inspect?token=tok`, { method: 'POST' })
+        expect(res.status).toBe(200)
+        expect(await res.json()).toEqual({
+          ok: true, outcome: 'accepted_starting', phase: 'backfill-embedded-langs',
+        })
+      })
+
+      it('已进主循环（startupPhase 为 null）→ 回执不带 phase，不编一个假的阶段名', async () => {
+        const { base } = await start(distWith('<!doctype html>'), 'tok', undefined, undefined, undefined, undefined, undefined, undefined, {
+          requestInspect: () => 'queued',
+          startupPhase: () => null,
+        })
+        const res = await fetch(`${base}/api/v2/library/inspect?token=tok`, { method: 'POST' })
+        expect(res.status).toBe(200)
+        expect(await res.json()).toEqual({ ok: true, outcome: 'queued' })
+      })
+
+      it('startupPhase 依赖缺席（老调用方）→ 仍 200，只是不带 phase', async () => {
+        const { base } = await start(distWith('<!doctype html>'), 'tok', undefined, undefined, undefined, undefined, undefined, undefined, {
+          requestInspect: () => 'accepted_starting',
+        })
+        const res = await fetch(`${base}/api/v2/library/inspect?token=tok`, { method: 'POST' })
+        expect(res.status).toBe(200)
+        expect(await res.json()).toEqual({ ok: true, outcome: 'accepted_starting' })
       })
 
       it('already_running → 409', async () => {

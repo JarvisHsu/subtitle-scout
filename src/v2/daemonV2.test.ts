@@ -7035,7 +7035,9 @@ describe('ScoutDaemonV2.requestInspect · 手动点火', () => {
                 VALUES (?,?,?,?,?,?,?,?,?)`)
       .run(VIDEO, '/media/C', 'E01.mkv', BIG, 1000, '/media/C', 'tmdb:ahs-wait', 1, now)
 
-    let fromInside: 'queued' | 'already_running' | undefined
+    // 类型随 `requestInspect()` 的返回值联合一起长（提案第 10 组加了 'accepted_starting'）。
+    // 写宽不带 'not_ready'：那是 **cli 包装层**加的第四态（holder 为 null），daemon 本身不返回它。
+    let fromInside: 'queued' | 'already_running' | 'accepted_starting' | undefined
     let release!: () => void
     const hanging = new Promise<void>((r) => { release = r })
     let daemon!: ScoutDaemonV2
@@ -7241,6 +7243,61 @@ describe('inspectEveryMs getter 化（改设置下一轮巡检即生效，不重
     expect(new Set(calls).size).toBe(2)
     expect(calls).toContain(6 * 3600_000)
     expect(calls).toContain(12 * 3600_000)
+    db.close()
+  })
+})
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 提案第 10 组（2026-09-18）：启动阶段可查 + 受理回执如实。
+//
+// 实测背景（提案自己记的）：daemon 从 17:12:19 起卡在 boot 段的第一个回填里
+// （embedded_langs IS NULL 到 19:41 仍有 144 行，约 1 行/分钟），而用户点「立即巡检」
+// 拿到的是 **200 {ok:true}**。三处叠加成「点了没反应」，本组修其中纯服务端、可证伪的那处。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('启动阶段可查（提案 10.1）', () => {
+  it('未跑 run() 的 daemon 没有"阶段"——照旧 queued（既有语义与既有用例都不动）', () => {
+    // 🔴 初始值是 null 而不是 'boot'，这是刻意的：阶段只在 run() 执行期间才有意义。
+    // 一个构造出来但从未启动的 daemon 去回答"正在哪一步"是编造。
+    const db = openDb(':memory:')
+    const daemon = new ScoutDaemonV2(mkDeps(db))
+    expect(daemon.getStartupStep()).toBeNull()
+    expect(daemon.requestInspect()).toBe('queued')
+    db.close()
+  })
+
+  it('🔴 run() 进行中且还在启动阶段 → accepted_starting，而不是含糊的 queued', () => {
+    // 白盒摆状态而不是驱动整个 boot：驱动 boot 要真跑完 5 个回填 + 巡检，代价与收益不成比例，
+    // 而且那种用例会因为无关的桩而飘。这里要验的只是**那一行判断**。
+    // （生产判据是部署后打一次端点看回执带不带 phase，那比这强。）
+    const db = openDb(':memory:')
+    const daemon = new ScoutDaemonV2(mkDeps(db))
+    ;(daemon as unknown as { startupStep: string | null }).startupStep = 'backfill-embedded-langs'
+
+    expect(daemon.getStartupStep()).toBe('backfill-embedded-langs')
+    expect(daemon.requestInspect()).toBe('accepted_starting')
+    db.close()
+  })
+
+  it('🔴 启动阶段受理 ≠ 不干活：标志照旧置位，boot 结束会被取件', () => {
+    // 本变更唯一的风险点：若把 accepted_starting 实现成"直接拒绝"，用户的点击就真的白点了。
+    // 判据是第二次调用**不是** already_running（那说明它没把第一次当成"一轮正在跑"）。
+    const db = openDb(':memory:')
+    const daemon = new ScoutDaemonV2(mkDeps(db))
+    ;(daemon as unknown as { startupStep: string | null }).startupStep = 'boot'
+    expect(daemon.requestInspect()).toBe('accepted_starting')
+    expect(daemon.requestInspect()).toBe('accepted_starting')
+    db.close()
+  })
+
+  it('回到主循环后（startupStep 清空）→ 恢复 queued', () => {
+    const db = openDb(':memory:')
+    const daemon = new ScoutDaemonV2(mkDeps(db))
+    const d = daemon as unknown as { startupStep: string | null }
+    d.startupStep = 'boot'
+    expect(daemon.requestInspect()).toBe('accepted_starting')
+    d.startupStep = null          // mainLoop 开头那一行做的事
+    expect(daemon.requestInspect()).toBe('queued')
     db.close()
   })
 })

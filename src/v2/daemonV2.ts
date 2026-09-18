@@ -474,6 +474,40 @@ export class ScoutDaemonV2 {
    *  requestInspect 靠它返回 already_running，而不是再排队第二轮。 */
   private inspecting = false
 
+  /** 启动阶段的当前步骤标识；`null` = **已进主循环**（提案第 10 组，2026-09-18）。
+   *
+   *  ── 它回答的是哪个问题 ────────────────────────────────────────────────────
+   *  提案的实测背景：daemon 从 17:12:19 起卡在 boot 段的第一个回填里
+   *  （`embedded_langs IS NULL` 到 19:41 仍有 144 行，约 1 行/分钟），
+   *  而用户点「立即巡检」拿到的是 **200 `{ok:true}`**。三处叠加成「点了没反应」：
+   *  ① 受理回执不区分「已受理」与「已在运行」；② boot 段按既有 emit 纪律**不发任何事件**；
+   *  ③ 前端按钮的等待态与巡检终态是同一个状态位。
+   *
+   *  本字段负责的是其中**唯一一个纯服务端、且可证伪**的部分：
+   *  「`queued` 到底意味着马上会取件，还是意味着还得等半小时」。
+   *  在它之前，`requestInspect()` 只有 `'queued' | 'already_running'` 两个值，
+   *  而 boot 段置位后**确实**是 queued —— 只是主循环还没开始转。**回执因此是真的但无用**：
+   *  它没撒谎，却让用户无法判断该等 1 秒还是 1 小时。
+   *
+   *  ⚠️ 刻意**不**把这种状态塞进 `'not_ready'`（提案 10.1 点名禁止）：那个值的含义是
+   *  "**真的不可服务**"（daemon 还没构造完 / 没跑 watch），用来表达"还在启动"会让
+   *  调用方再也分不出"重试一次就好"与"这个部署根本没有 watch"。 */
+  private startupStep: string | null = null
+
+  /** 启动阶段的分步标记。每步开始前调一次；进主循环时置 null。 */
+  private enterStartupStep(step: string): void {
+    this.startupStep = step
+  }
+
+  /** 启动阶段的当前步骤；**已进主循环则返回 null**（提案 10.1/10.3）。
+   *
+   *  读的是状态不是事件：boot 段本来就按既有纪律不发事件（daemonV2.ts:374-378 的反面清单），
+   *  改成发事件会动到事件通道的形状（10.6 明令不加新事件类型），而这些步骤的状态
+   *  本来就是"现在处于哪一步"这种**可轮询**的事实。 */
+  getStartupStep(): string | null {
+    return this.startupStep
+  }
+
   /** 本轮手动点火才为 true：阶段 3/4 取件带 includeBackoff。自然 24h 巡检与 inspectOnce
    *  都保持默认（滤 recheck_after > now，C26）。finally 清掉，不许漏到下一轮。 */
   private skipBackoffThisInspect = false
@@ -534,11 +568,11 @@ export class ScoutDaemonV2 {
    *  与 requestScan 同型：HTTP 线程只置位 + 叫醒 idle，主循环取件。正在 runInspection
    *  里就返回 already_running、不排队第二轮（连点只是把同一个标志重复置位）。
    *  24h 闸与 inspectRetryAfter 都挡不住这次；workPermitted=false 则丢弃标志不跑。 */
-  requestInspect(): 'queued' | 'already_running' {
+  requestInspect(): 'queued' | 'already_running' | 'accepted_starting' {
     if (this.inspecting) return 'already_running'
     this.inspectRequested = true
     this.wakeIdle?.()
-    return 'queued'
+    return this.startupStep === null ? 'queued' : 'accepted_starting'
   }
 
   /** One full inspection (scan → identify → judge → subtitles), ignoring the 24h watch gate.
@@ -629,6 +663,12 @@ export class ScoutDaemonV2 {
     this.stopping = signal.aborted
     signal.addEventListener('abort', () => { this.stopping = true }, { once: true })
 
+    // 启动阶段从这里开始算（提案 10.1）。**初始值是 null 而不是 'boot'**：
+    // 阶段这个概念只在 run() 执行期间才有意义——一个构造出来但从未启动的 daemon
+    // 没有"正在哪一步"，它的 requestInspect() 照旧返回 queued（既有行为与既有用例都编码了
+    // 这一点）。生产里那个真问题是"run() 已经在跑、却卡在 boot 段的回填里"，正是这一行之后。
+    this.startupStep = 'boot'
+
 
     // 启动时的一次性沙盒孤儿回收（照旧 daemon boot 的 gcStaging 语义：单实例前提下，
     // 本进程启动时旧进程必已死，它遗留的工作台全部是孤儿垃圾）。
@@ -636,7 +676,7 @@ export class ScoutDaemonV2 {
     // 事实只能靠 in-flight 集合 + mtime 活性窗口保护，任何一处判据失灵就是把跑了两小时的
     // 翻译工作台整个 rm 掉（gcOrphans 的 R6-9/R7-1 两次修复都在还这笔债）。
     try {
-      const cleaned = this.deps.gcStaging?.(this.inFlightStagingJobIds) ?? 0
+      this.enterStartupStep('staging-gc'); const cleaned = this.deps.gcStaging?.(this.inFlightStagingJobIds) ?? 0
       if (cleaned > 0) this.deps.log(`boot: 清理了 ${cleaned} 个上个进程遗留的孤儿工作台`)
     } catch (e) {
       this.deps.log(`warn: boot 孤儿工作台回收失败（隔离，不阻塞启动）: ${String(e)}`)
@@ -651,7 +691,7 @@ export class ScoutDaemonV2 {
     // （spec 明写）在实现层的唯一保证者——mapWithConcurrency 是 allSettled，单文件失败进不到
     // 这里，但 pass 级别的爆炸（库被锁、PRAGMA 读不出）会。
     try {
-      await this.backfillEmbeddedLangs()
+      this.enterStartupStep('backfill-embedded-langs'); await this.backfillEmbeddedLangs()
     } catch (e) {
       this.deps.log(`warn: boot embedded_langs 回填失败（隔离，不阻塞巡检，下次启动重试）: ${String(e)}`)
     }
@@ -664,7 +704,7 @@ export class ScoutDaemonV2 {
     // 独立 try/catch 而不是与上面共用一个：共用时 embedded_langs 那支的 pass 级爆炸会
     // **跳过**本支，于是"ffprobe 二进制缺失"这种与 TMDB 毫不相干的故障会连带让 imdb 永远补不上。
     try {
-      await this.backfillProviderIds()
+      this.enterStartupStep('backfill-provider-ids'); await this.backfillProviderIds()
     } catch (e) {
       this.deps.log(`warn: boot provider_ids 回填失败（隔离，不阻塞巡检，下次启动重试）: ${String(e)}`)
     }
@@ -678,7 +718,7 @@ export class ScoutDaemonV2 {
     // 独立 try/catch 而不是与上面共用：共用时 provider_ids 那支的 pass 级爆炸会**跳过**本支，
     // 于是一个与背景图毫不相干的 external_ids 故障会连带让活动页永远退化成模糊海报。
     try {
-      await this.backfillBackdropPaths()
+      this.enterStartupStep('backfill-backdrop-paths'); await this.backfillBackdropPaths()
     } catch (e) {
       this.deps.log(`warn: boot backdrop_path 回填失败（隔离，不阻塞巡检，下次启动重试）: ${String(e)}`)
     }
@@ -692,7 +732,7 @@ export class ScoutDaemonV2 {
     // 于是一个与季集表毫不相干的 external_ids 故障会连带让媒体库页的虚线卡片永远画不出来。
     // 这条 catch 是"TMDB 抓不到季集表只是媒体库页少个虚线、绝不阻塞主巡检"的唯一保证者。
     try {
-      await this.backfillSeasonCatalog()
+      this.enterStartupStep('backfill-season-catalog'); await this.backfillSeasonCatalog()
     } catch (e) {
       this.deps.log(`warn: boot 应有集回填失败（隔离，不阻塞巡检，下次启动重试）: ${String(e)}`)
     }
@@ -736,6 +776,8 @@ export class ScoutDaemonV2 {
   /** 主车道：维护拍 + 24h 巡检闸 + 带外扫描取件。run() 的 boot 段结束后进入，与
    *  translateLoop 并行（2026-08-20 前这里就是 run() 的 while 主体，逐字提出）。 */
   private async mainLoop(signal: AbortSignal): Promise<void> {
+    // 进主循环 = 启动阶段结束（提案 10.1）。从这里起 requestInspect() 才敢说 queued 就是「马上取件」。
+    this.startupStep = null
     while (!this.stopping) {
       // 维护循环跑在时间闸**之外**（旧 daemon 的既有分界：产工作循环受闸、维护循环不受）。
       // 巡检一天一次，WAL checkpoint 若跟着变成一天一次，等于把一整天的写入押在"今天不掉电"上。

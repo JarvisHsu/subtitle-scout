@@ -311,7 +311,8 @@ async function cmdWatch() {
   //    false，端点据此答 503（"扫描触发器尚未就绪"），与它既有的"watch 没跑 → 503"同一档。
   const daemonHolder: { current: {
     requestScan: () => void
-    requestInspect: () => 'queued' | 'already_running'
+    requestInspect: () => 'queued' | 'already_running' | 'accepted_starting'
+    getStartupStep: () => string | null
   } | null } = { current: null }
 
   /** 三个调用点共用的"踢一脚扫描"。daemon 尚未就绪 → 返回 false（调用方答 503），
@@ -323,11 +324,18 @@ async function cmdWatch() {
     return true
   }
 
-  const requestInspect = (): 'queued' | 'already_running' | 'not_ready' => {
+  const requestInspect = (): 'queued' | 'already_running' | 'accepted_starting' | 'not_ready' => {
     const d = daemonHolder.current
     if (!d) return 'not_ready'
     return d.requestInspect()
   }
+
+  /** daemon 启动阶段的当前步骤；未就绪（holder 为 null）时返回 null。
+   *
+   *  与 requestInspect 分开：那个是**动作语义**，这个是**状态读数**（提案 10.1/10.3）。
+   *  holder 为 null 时返回 null 而不是编一个阶段名——'还不知道'与'不在启动阶段'
+   *  都表现为 null，而这两者对用户的下一步动作是一样的（都会走 queued 那一支）。 */
+  const startupPhase = (): string | null => daemonHolder.current?.getStartupStep() ?? null
 
   const buildCurrent = async (): Promise<WatchClients> => {
     const { mappings, tmdb, reasoningModel } = await assemble(cfg, warn)
@@ -539,6 +547,7 @@ async function cmdWatch() {
       // 手动点火完整巡检（POST /api/v2/library/inspect）。与 requestScan 共用 daemonHolder：
       // daemon 尚未 new 出来 → 'not_ready'，端点答 503。不复用 scan 路由。
       requestInspect,
+      startupPhase,
 
       // R-F10：SSE 通道的消费端（GET /api/v2/events）。与下方 daemon 的 emit 是同一个实例。
       events: scoutEvents,

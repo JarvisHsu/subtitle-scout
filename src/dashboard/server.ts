@@ -153,9 +153,22 @@ export interface DashboardOpts {
   requestScan?: () => boolean
   /** 手动点火完整巡检（`runInspection`），不是 scan-only。
    *
-   *  返回三态而不是 requestScan 的 boolean：`already_running` 是独立的 409
-   *  （正在跑一轮巡检时再点不应假装 queued）。字段缺席 / `'not_ready'` 答 503。 */
-  requestInspect?: () => 'queued' | 'already_running' | 'not_ready'
+   *  返回四态而不是 requestScan 的 boolean：
+   *   · `'already_running'` 是独立的 409（正在跑一轮巡检时再点不应假装 queued）；
+   *   · `'accepted_starting'`（提案第 10 组，2026-09-18）= **已受理，但 daemon 还在启动阶段**
+   *     的 boot 段里跑回填，主循环尚未开始转 → 200 + 阶段标识。在此之前这个状态被折进
+   *     `'queued'`，用户拿到的是一个**真的但无用**的 `{ok:true}`：它没撒谎，却让人分不出
+   *     该等 1 秒还是 1 小时。标志照旧置位，boot 段一结束主循环就会取件。
+   *   · 字段缺席 / `'not_ready'` 答 503 —— `'not_ready'` 的含义**只**是"真的不可服务"
+   *     （没跑 watch / daemon 还没构造完），不许拿它兼职表达"还在启动"（提案 10.1 点名）。 */
+  requestInspect?: () => 'queued' | 'already_running' | 'accepted_starting' | 'not_ready'
+  /** daemon 启动阶段的当前步骤标识；已进主循环返回 null（提案 10.1/10.3）。
+   *
+   *  可选依赖，缺席时回执里就不带 `phase`（不编一个假的阶段名）。与 requestInspect
+   *  分开两个 dep 而不是合并成一个返回对象：`requestInspect` 的返回值是**动作语义**
+   *  （受理/已在跑/不可服务），而这是**状态读数**，两者的生命周期与消费点都不同
+   *  （前者只有这一个端点读，后者将来还要给 /health 与启动横幅读）。 */
+  startupPhase?: () => string | null
   /** 字幕校验三端点（GET verify / POST correct / POST revert）的依赖注入口。
    *
    *  与 jobs/tmdb 那几个"缺席就 503"的可选依赖**不同**：这三个端点的默认实现
@@ -441,7 +454,7 @@ function serveStatic(distDir: string, pathname: string): { status: number; body:
 
 /** 启动只读监控 HTTP 端点。port=0 让内核分配（测试用）。 */
 export function startDashboard(opts: DashboardOpts): Promise<Server> {
-  const { db, port, host, token, distDir, env = process.env, jobs, tmdb, requestScan, requestInspect, subtitleWriteDeps, subtitleCompareDeps, cacheRoot, setupDeps: setupDepsOverride, events, eventsHeartbeatMs } = opts
+  const { db, port, host, token, distDir, env = process.env, jobs, tmdb, requestScan, requestInspect, startupPhase, subtitleWriteDeps, subtitleCompareDeps, cacheRoot, setupDeps: setupDepsOverride, events, eventsHeartbeatMs } = opts
   const settingsRepo = new SettingsRepo(db)
   // spec A §4.4：setup 面依赖——默认接真实实现（cfg 的 dbGet 惰性读库，wizard 落库后下一次
   // status/validate 调用自然反映），测试经 opts.setupDeps 部分覆盖（同 subDeps 先例）。
@@ -901,8 +914,12 @@ export function startDashboard(opts: DashboardOpts): Promise<Server> {
           res.end(JSON.stringify({ error: 'already running' }))
           return
         }
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
-        res.end(JSON.stringify({ ok: true }))
+        // 🔴 提案 10.2：200 的回执**必须**带上受理语义（MUST NOT 只回 {ok:true}）。
+        // 只回一个 true 的后果是实测过的——用户点完看到'成功'，而 daemon 卡在 boot 段的
+        // 回填里一个多小时，界面上什么都不会发生。
+        const phase = startupPhase?.() ?? null
+        res.writeHead(200, JSON_CT)
+        res.end(JSON.stringify(phase === null ? { ok: true, outcome } : { ok: true, outcome, phase }))
         return
       }
 
