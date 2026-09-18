@@ -907,7 +907,14 @@ export class ScoutDaemonV2 {
     while (!this.stopping) {
       // 维护循环跑在时间闸**之外**（旧 daemon 的既有分界：产工作循环受闸、维护循环不受）。
       // 巡检一天一次，WAL checkpoint 若跟着变成一天一次，等于把一整天的写入押在"今天不掉电"上。
+      //
+      // 🔴 #19（第 43 轮）：**收尾也要留痕**。第 40 轮我加了"维护拍: 开始"却漏了"结束"，
+      // 于是"维护拍跑完了、主循环在等闸"与"维护拍自己卡住了"在日志上**仍然同形**——
+      // 第 42 轮就是被这个坑住：闸已过 249 分钟、runs 空、缺口没跑，却分不出是哪一种。
+      // 这一行（含用时）把那段静默**归属**下来：有"结束"= 卡在别处，没"结束"= 就卡在维护拍里。
+      const maintT = Date.now()
       await this.runMaintenance()
+      this.deps.log(`维护拍: 结束（用时 ${Math.round((Date.now() - maintT) / 1000)}s）`)
 
       const now = this.deps.now?.() ?? Date.now()
       const lastInspectAt = this.readLastInspectAt()
