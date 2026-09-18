@@ -47,6 +47,11 @@ function mkdirToleratingExisting(p: string): void {
   // 只在出错后**立刻** stat 一次是不够的：那一刻视图仍是旧的 → 判"不是目录" → 原样抛出，
   // 修复形同没做（实测：`Mediary Scout` 那个根就这样继续报红）。
   // 故：短暂等待后重试，**每次**都重新 stat 复核；三次仍不成才抛。
+  //
+  // ⚠️ 有意**不**按错误码筛"值不值得重试"（只让 EIO 重试之类）：这个预算只花在**失败**路径上
+  // （成功路径一次 mkdir 就返回、零额外成本），而代价是"猜错 errno 就漏掉 #14"——rclone 把
+  // 后端语义差异翻译成什么 errno 并不由我们定（本次事故里它是 EIO，但 EEXIST/EPERM/ENOTDIR
+  // 都有可能）。故宁可让 ENOENT/EROFS 也白等 520ms（失败路径本来就慢），也不加一条会漏判的筛子。
   retryUntilDirectory(
     () => mkdirSync(p),
     () => isDirectoryNow(p),
@@ -54,11 +59,15 @@ function mkdirToleratingExisting(p: string): void {
     MKDIR_TOLERATE_ATTEMPTS,
     MKDIR_TOLERATE_RETRY_DELAYS_MS,
     // 留痕：容错悄悄生效 = 没人知道 #14 又发生过一次，也就没人能判断这个重试预算够不够。
+    // ⚠️ 只报**观察到的事实**，不断言成因：这里同样会收到 ENOENT/EROFS/EACCES（一个占位的
+    //    文件、没挂上的盘、只读挂载都会走到这条分支），把它们都说成"#14 后端 409"会误导下一个
+    //    读者。故把 #14 写成"若属这一类，重试即可成功"，而不是"这就是 409"。
     (n, e) => {
       console.error(
-        `staging mkdir 需重试（第 ${n} 次失败，共 ${MKDIR_TOLERATE_ATTEMPTS} 次预算）：${p} —— ` +
-        `${describeFsError(e)}；此刻本地视图还看不见它（#14：后端对已存在的目录回 409、` +
-        `rclone 把它上抛成 EIO，而本地 FUSE 视图滞后毫秒~秒级）。等待后重试。`,
+        `staging mkdir 失败，准备重试（第 ${n} 次失败，共 ${MKDIR_TOLERATE_ATTEMPTS} 次预算）：${p} —— ` +
+        `${describeFsError(e)}；此刻该路径在本视图里还不是目录。` +
+        `若属 #14（后端把已存在当 409、rclone 上抛成 EIO，而本地 FUSE 视图滞后毫秒~秒级），` +
+        `等待后重试即可成功；预算耗尽仍不成则原样抛出这条错误。`,
       )
     },
   )
@@ -107,11 +116,13 @@ export function retryUntilDirectory(
 }
 
 /** 把一条 fs 错误压成"`code: message`"——日志里要能一眼认出 EIO/EROFS/EACCES。
- *  `code` 不是 Error 的既有属性，故显式取；缺失时只留 message，不写 `undefined:`。 */
+ *  Node 的 `message` **已经**带 code 前缀（`EEXIST: file already exists, mkdir '…'`），
+ *  故先看开头，避免刷出 "EEXIST: EEXIST: file already exists…" 这种双前缀。 */
 function describeFsError(e: unknown): string {
   const code = (e as NodeJS.ErrnoException | undefined)?.code
   const msg = e instanceof Error ? e.message : String(e)
-  return code ? `${code}: ${msg}` : msg
+  if (!code || msg.startsWith(code)) return msg
+  return `${code}: ${msg}`
 }
 
 /** 同步睡眠。`allocate()` 是**同步**函数（回调链上不能 await），故不能用 Promise 版 `sleep`。
