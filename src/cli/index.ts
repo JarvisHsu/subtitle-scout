@@ -33,7 +33,7 @@ import { SubdlClient } from '../adapters/providers/subdl.js'
 import { curlFetch, SUBHD_BASE } from '../adapters/providers/subhd.js'
 import { makeAdapterConfigResolver, SECRET_NAMES, type AdapterConfigResolver } from '../v2/secrets.js'
 import { setupSatisfied, workPermitted, makeSecretsWatcher, makeSatisfactionTracker, type ClientsHolder } from './watchClients.js'
-import { clampTranslateAfterAttempts } from '../v2/subtitleScheduler.js'
+import { clampTranslateAfterAttempts, type SubtitleFetchReceipt, type SubtitleFetchTarget } from '../v2/subtitleScheduler.js'
 import { openDb } from '../v2/db.js'
 import { JobsRepo } from '../v2/jobsRepo.js'
 import { LibraryRepo } from '../v2/libraryRepo.js'
@@ -312,6 +312,7 @@ async function cmdWatch() {
   const daemonHolder: { current: {
     requestScan: () => void
     requestInspect: () => 'queued' | 'already_running' | 'accepted_starting'
+    requestSubtitleFetch: (target: SubtitleFetchTarget) => SubtitleFetchReceipt
     getStartupStep: () => string | null
   } | null } = { current: null }
 
@@ -328,6 +329,15 @@ async function cmdWatch() {
     const d = daemonHolder.current
     if (!d) return 'not_ready'
     return d.requestInspect()
+  }
+
+  /** 按需取字幕（openspec 第 12 组）。holder 为 null（daemon 还没构造完）→ `not_ready`，
+   *  端点答 503；**绝不**在 dashboard 线程里退化成"直接跑一次"——那正是 requestScan
+   *  头注释里禁的形状（HTTP 线程里跑付费流水线）。 */
+  const requestSubtitleFetch = (target: SubtitleFetchTarget): SubtitleFetchReceipt => {
+    const d = daemonHolder.current
+    if (!d) return { outcome: 'not_ready' }
+    return d.requestSubtitleFetch(target)
   }
 
   /** daemon 启动阶段的当前步骤；未就绪（holder 为 null）时返回 null。
@@ -548,6 +558,7 @@ async function cmdWatch() {
       // 手动点火完整巡检（POST /api/v2/library/inspect）。与 requestScan 共用 daemonHolder：
       // daemon 尚未 new 出来 → 'not_ready'，端点答 503。不复用 scan 路由。
       requestInspect,
+      requestSubtitleFetch,
       startupPhase,
 
       // R-F10：SSE 通道的消费端（GET /api/v2/events）。与下方 daemon 的 emit 是同一个实例。

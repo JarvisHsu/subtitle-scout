@@ -73,8 +73,22 @@ export interface SubtitleQueueOpts {
    *  默认 false = daemon 的取件语义（"现在该取哪件"）。
    *
    *  🔴 daemon 侧**绝不许**传 true：那会让退避中的文件当轮就被重选，
-   *  即 C26 的付费 LLM 热循环。这条由 subtitleScheduler.test.ts 的守卫用例钉着。 */
+   *  即 C26 的付费 LLM 热循环。这条由 subtitleScheduler.test.ts 的守卫用例钉着。
+   *
+   *  ⚠️ 2026-09-18（第 12 组按需取字幕）唯一的例外，以及为什么它不是 C26：
+   *  用户**点名某一集**发起的一次性取件（`daemonV2.runSubtitlePhase(..., {admitBackoff:true})`）
+   *  会传 true。C26 的形态是「**daemon 的巡检循环**每轮把退避中的行重新捞回来」——
+   *  那是一个**循环**，跑完立刻又跑。按需取件是**一次性**的：它跑完之后
+   *  `runSubtitleWorkDir` 照旧写退避（成功 `markInstalled` 写 +1 天、失败写 nextRetryAt），
+   *  所以**下一拍不会再被捞回来**——热循环缺了"再"这个字。 */
   includeBackoff?: boolean
+  /** 只取这些**具体文件**（= openspec 第 12 组 12.3 的"范围收窄"）。
+   *
+   *  它**不**替换那三条谓词，只是在它们之上再加一条 `f.path IN (…)`——取件判据仍只有
+   *  `SUBTITLE_QUEUE_WHERE` 那一份（12.2 的红线）。省略 = 不收窄（自动巡检）。
+   *  空数组 = **谁都不取**（返回 []），而不是"不过滤"——把"没点名"与"点名了零个"分开，
+   *  否则一个手滑传进来的 `[]` 会静默变成整库取件。 */
+  paths?: readonly string[]
 }
 
 /** 这一项现在**会不会被 daemon 取走**（至少一个文件到点）。
@@ -126,6 +140,10 @@ export function listSubtitleQueue(
   db: ScoutDb, roots?: string[], now = Date.now(), opts: SubtitleQueueOpts = {},
 ): SubtitleQueueItem[] {
   const includeBackoff = opts.includeBackoff === true
+  // `paths: []`（点名了零个）与"没点名"必须分开：见 SubtitleQueueOpts.paths 的论证。
+  if (opts.paths !== undefined && opts.paths.length === 0) return []
+  const scopePaths = opts.paths === undefined ? null : [...opts.paths]
+  const scopeClause = scopePaths === null ? '' : `AND f.path IN (${scopePaths.map(() => '?').join(', ')})`
   const rows = db.prepare(`
     SELECT w.id AS work_id, w.title, w.original_title, w.year, w.overview, w.chinese_titles, w.media_type,
            w.backdrop_path,
@@ -133,8 +151,9 @@ export function listSubtitleQueue(
            f.sub_recheck_at
     FROM files f JOIN works w ON f.work_id = w.id
     WHERE ${SUBTITLE_QUEUE_WHERE}
+    ${scopeClause}
     ORDER BY w.id, f.season, f.episode
-  `).all(includeBackoff ? 1 : 0, now) as Array<{
+  `).all(includeBackoff ? 1 : 0, now, ...(scopePaths ?? [])) as Array<{
     work_id: string; title: string; original_title: string | null; year: number | null;
     overview: string | null; chinese_titles: string | null; media_type: string;
     backdrop_path: string | null;
@@ -169,6 +188,158 @@ export function listSubtitleQueue(
     })
   }
   return [...byWork.values()]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 按需取字幕（openspec 第 12 组；spec: `subtitle/on-demand-fetch`）
+//
+// 这一段**只是既有关卡的"读"侧**：它回答"用户点名的这一集现在能不能抓、该抓哪几个文件"。
+// 真正干活的那条路一字不改（`runSubtitleWorkDir`），取件谓词也仍只有上面那一份
+// `SUBTITLE_QUEUE_WHERE`——本段不复制任何一条 WHERE（12.2 的红线）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 按需取件**被拒**的原因。回给前端的是这个稳定枚举，文案由前端 i18n 决定
+ *  （与 `identifyBindApi` 的既有口径一致：服务端不做展示文案）。 */
+export type SubtitleFetchRejection =
+  | 'work-not-found'
+  | 'no-video-files'
+  | 'not-judged'
+  | 'no-subtitle-needed'
+  | 'already-covered'
+  | 'translate-workbench'
+
+export interface SubtitleFetchSkipped { path: string; reason: SubtitleFetchRejection }
+
+export interface SubtitleFetchPlan {
+  ok: true
+  workId: string
+  title: string
+  /** 本次真正要送进工作台的文件（已过全部关卡）。 */
+  paths: string[]
+  /** 需要把 `recheck_after` 拉回当下、好让停牌复查闸放回 `sub_status = NULL` 的文件
+   *  （= 停牌态 `unsolvable`。spec 12.4 原文：「受理，实现为把该行的复查时刻提前到当下」）。 */
+  revive: string[]
+  /** 同一次点名里**被关卡挡下**的文件。受理了别的文件时如实回报，绝不静默吞掉。 */
+  skipped: SubtitleFetchSkipped[]
+}
+
+export type SubtitleFetchDecision =
+  | SubtitleFetchPlan
+  | { ok: false; reason: SubtitleFetchRejection; detail: string }
+
+/** 按需取件要点名的东西：一个作品，**可选**再收窄到某一集。
+ *  省略 `season` / `episode` = 整个作品（电影就是"单片"，它的 season/episode 本来就是 NULL）。
+ *  ⚠️ 两个必须**同时**给：只给 season 会把"整季"变成一次批量抓取，而 spec 12.6 明令
+ *  不提供批量入口（一季 24 集 = 24 次付费调用）。故 `planSubtitleFetch` 只在**两者都有**
+ *  时才按集收窄，其余一律按作品——"只给 season"不会静默变成整季。 */
+export interface SubtitleFetchTarget {
+  workId: string
+  season?: number | null
+  episode?: number | null
+}
+
+/** 按需取件的受理回执。**复用第 10 组落下的受理态机制**（spec 12.9 明写不另造第二套反馈）：
+ *  取值与 `requestInspect` 的四态同源，只是多一个 `rejected`——因为按需请求会被**关卡**
+ *  拒绝（12.4），而"拒绝"与"已受理/正在跑"对用户的含义完全不同，必须分开表达。 */
+export interface SubtitleFetchReceipt {
+  outcome: 'accepted' | 'accepted_starting' | 'already_running' | 'not_ready' | 'rejected'
+  /** `rejected` 时必有：为什么拒绝（枚举；展示文案由前端 i18n 决定，服务端不写文案）。 */
+  reason?: SubtitleFetchRejection
+  /** 人读细节（日志/排障用；展示仍走 i18n）。 */
+  detail?: string
+  /** 受理时：本次要点名抓取的文件数。 */
+  targets?: number
+  /** 受理时：同一次点名里**被关卡挡下**的文件数（点整部作品时会出现）。 */
+  skipped?: number
+  /** 受理时：本次要等正在跑的那一轮巡检结束才执行（主循环是串行的）。 */
+  queuedBehindRound?: boolean
+}
+
+/** 按需取字幕的**全部关卡**（spec 12.4 / 12.7）。
+ *
+ *  ── 为什么判据住在这里，而不是写在 dashboard 的端点里 ────────────────────────
+ *  这些关卡说的是"这个文件在字幕流水线上的**处境**"，与取件谓词是同一件事的两面。
+ *  放进端点里就等于在 HTTP 层复写第二份"什么算 covered / 什么算停牌"——本仓对
+ *  "两份判据必漂移"（C30）已经栽过多次。
+ *
+ *  ── 每条判据都读**现值** ───────────────────────────────────────────────
+ *  `needs_subtitle` / `skip_reason` / `sub_status` 才是现况；`sub_attempt` / `last_error`
+ *  是识别轨与字幕轨**共用且历史累计**的列（生产库里 `needs_subtitle=0` 却 `sub_attempt>0`
+ *  的行真实存在 14 行——判决在尝试之后翻转）。拿累计列判活会把"不需要字幕"的文件
+ *  重新拖进付费抓取。
+ *
+ *  ── 为什么"未识别"不是一个返回码 ───────────────────────────────────────
+ *  spec 12.7 要求对未识别的资源不提供入口。而未识别目录在库里**没有 `work_id`**，
+ *  所以它根本表达不成一个 work 定位——一律落到 `work-not-found`。少一个状态、
+ *  少一条会与"作品被删"混淆的分支；前端对这两种情形给同一句"先绑定作品"。 */
+export function planSubtitleFetch(
+  db: ScoutDb,
+  target: SubtitleFetchTarget,
+): SubtitleFetchDecision {
+  const work = db.prepare('SELECT id, title FROM works WHERE id = ?')
+    .get(target.workId) as { id: string; title: string } | undefined
+  if (!work) {
+    return {
+      ok: false, reason: 'work-not-found',
+      detail: `库里没有作品 ${target.workId}（未识别的目录名下没有 work_id，走人工绑定通道）`,
+    }
+  }
+  const byEpisode = target.season != null && target.episode != null
+  const rows = db.prepare(`
+    SELECT path, needs_subtitle, skip_reason, sub_status
+    FROM files
+    WHERE work_id = ?${byEpisode ? ' AND season = ? AND episode = ?' : ''}
+    ORDER BY season, episode, path
+  `).all(...(byEpisode ? [target.workId, target.season, target.episode] : [target.workId])) as Array<{
+    path: string; needs_subtitle: number | null; skip_reason: string | null; sub_status: string | null
+  }>
+  if (rows.length === 0) {
+    return {
+      ok: false, reason: 'no-video-files',
+      detail: byEpisode
+        ? `作品「${work.title}」的 S${target.season}E${target.episode} 不在库里`
+        : `作品「${work.title}」名下没有任何视频文件`,
+    }
+  }
+  const paths: string[] = []
+  const revive: string[] = []
+  const skipped: SubtitleFetchSkipped[] = []
+  for (const r of rows) {
+    if (r.needs_subtitle === 0) { skipped.push({ path: r.path, reason: 'no-subtitle-needed' }); continue }
+    if (r.needs_subtitle !== 1) { skipped.push({ path: r.path, reason: 'not-judged' }); continue }
+    if (r.sub_status === 'covered') { skipped.push({ path: r.path, reason: 'already-covered' }); continue }
+    if (r.sub_status === 'handoff_translate') { skipped.push({ path: r.path, reason: 'translate-workbench' }); continue }
+    paths.push(r.path)
+    if (r.sub_status === 'unsolvable') revive.push(r.path)
+  }
+  if (paths.length === 0) {
+    const reason = dominantRejection(skipped.map((s) => s.reason))
+    return { ok: false, reason, detail: `${reason}（作品「${work.title}」，本次点名 ${rows.length} 个文件）` }
+  }
+  return { ok: true, workId: work.id, title: work.title, paths, revive, skipped }
+}
+
+/** 一个文件都放行不了时，用哪条理由回绝。**优先级是有意的**：
+ *  先说"磁盘上已经有了"（用户自己能去验、最不容易引起争议），
+ *  再说"不需要"（一条已裁决的终态判决），最后才是"还没判决"（可恢复、用户等一会儿再来）。 */
+const REJECTION_PRIORITY: readonly SubtitleFetchRejection[] = [
+  'already-covered', 'no-subtitle-needed', 'translate-workbench', 'not-judged',
+]
+function dominantRejection(reasons: readonly SubtitleFetchRejection[]): SubtitleFetchRejection {
+  for (const r of REJECTION_PRIORITY) if (reasons.includes(r)) return r
+  return 'no-video-files'
+}
+
+/** 把点名文件的 `recheck_after` 拉回「立即到点」（哨兵 **0**，同 `IMMEDIATE_RECHECK` 的取值口径：
+ *  这一列唯一的读者是"`<= now`"的谓词，0 既到点又不会被误读成"某个真实时刻"）。
+ *
+ *  只对**停牌**行调用（spec 12.4 只对 `unsolvable` 承诺这件事）。停牌复查闸的取件谓词是
+ *  `recheck_after IS NOT NULL AND recheck_after <= now`，所以"提前到当下"就是把它写小。 */
+export function pullRecheckForFetch(db: ScoutDb, paths: readonly string[], now: number): number {
+  if (paths.length === 0) return 0
+  return db.prepare(
+    `UPDATE files SET recheck_after = 0, updated_at = ? WHERE path IN (${paths.map(() => '?').join(', ')})`,
+  ).run(now, ...paths).changes as number
 }
 
 /** 一个作品的字幕任务的 jobId——**身份串**，不是 staging 沙盒的目录名。

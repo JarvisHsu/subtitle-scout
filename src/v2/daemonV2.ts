@@ -15,7 +15,7 @@ import { statSync } from 'node:fs'
 import { toMediaFileRow, isScannable, PARSER_VERSION } from './scanner.js'
 import type { ScoutDb } from './db.js'
 import { listIdentifyQueue, runIdentifyWorkDir, type IdentifySchedulerDeps } from './identifyScheduler.js'
-import { listSubtitleQueue, runSubtitleWorkDir, subtitleJobId, type SubtitleQueueItem } from './subtitleScheduler.js'
+import { listSubtitleQueue, runSubtitleWorkDir, subtitleJobId, planSubtitleFetch, pullRecheckForFetch, type SubtitleQueueItem, type SubtitleFetchPlan, type SubtitleFetchReceipt, type SubtitleFetchTarget } from './subtitleScheduler.js'
 import { targetKey, targetLabel, itemIdToKey } from './subtitleTargets.js'
 import type { RunsRepo } from './runsRepo.js'
 import { judgePendingFiles } from './judgePending.js'
@@ -474,6 +474,12 @@ export class ScoutDaemonV2 {
    *  requestInspect 靠它返回 already_running，而不是再排队第二轮。 */
   private inspecting = false
 
+  /** 按需取字幕的待办（openspec 第 12 组）。**只有主循环取件**：HTTP 线程在
+   *  `requestSubtitleFetch` 里只 push + 叫醒 idle，绝不 await 跑流水线
+   *  （同 `scanRequested` 的论证：那会让"用户点一下"变成 HTTP 请求挂着两个小时的付费调用，
+   *  并与巡检并发）。元素里存的是**受理那一刻的判决结果**，取件时还会再过一次现值。 */
+  private pendingSubtitleFetches: Array<{ plan: SubtitleFetchPlan }> = []
+
   /** 启动阶段的当前步骤标识；`null` = **已进主循环**（提案第 10 组，2026-09-18）。
    *
    *  ── 它回答的是哪个问题 ────────────────────────────────────────────────────
@@ -573,6 +579,89 @@ export class ScoutDaemonV2 {
     this.inspectRequested = true
     this.wakeIdle?.()
     return this.startupStep === null ? 'queued' : 'accepted_starting'
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // 按需取字幕（openspec 第 12 组；spec `subtitle/on-demand-fetch`）
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /** 用户点名"就给这一个找字幕"。
+   *
+   *  ── 与 requestScan / requestInspect 是同一个形状 ──────────────────────────
+   *  HTTP 线程**只受理、不干活**：这里只做**不烧 LLM 的判决**（关卡 + 作品级互斥，
+   *  纯 DB 读），把请求放进待办，然后叫醒 idle。真正跑流水线的是主循环里的
+   *  `runSubtitleFetchNow`。理由与 `requestScan` 头注释里写的那条完全一样（daemonV2:551-556）：
+   *  在 HTTP 线程里 await 一条付费流水线，会让"用户点一下"变成"HTTP 请求挂着两个小时的 LLM 调用"，
+   *  并且与巡检并发。
+   *
+   *  ── 为什么**受理前**就把关卡判掉 ────────────────────────────────────────
+   *  spec 12.4 要求"拒绝并如实给出理由"。理由必须是**此刻**的事实，故在受理时读一次库
+   *  （`planSubtitleFetch`），把 `reason` 直接回给用户；而不是先收下、两分钟后在日志里说
+   *  "其实不需要字幕"。取件时 `listSubtitleQueue` 还会再滤一次（那一刻的现值），
+   *  两道之间若状态变了，取件面为空 → 什么也不跑（下面有日志留痕）。
+   *
+   *  ── 重复请求：**明确拒绝**，不静默排队（spec 12.5）──────────────────────
+   *  判据是那条流水线**真实**的登记集合 `inFlightStagingJobIds`（`subtitleJobId(workId)`），
+   *  不是另建一份"正在跑"名单——两份必然漂移，而漂移的后果是同一作品两个任务撞同一个
+   *  jobId、同一个试错沙盒、同一条 trace 通道。 */
+  requestSubtitleFetch(target: SubtitleFetchTarget): SubtitleFetchReceipt {
+    const plan = planSubtitleFetch(this.deps.db, target)
+    if (!plan.ok) return { outcome: 'rejected', reason: plan.reason, detail: plan.detail }
+    if (this.inFlightStagingJobIds.has(subtitleJobId(plan.workId))) {
+      return { outcome: 'already_running', detail: '该作品的字幕任务正在进行' }
+    }
+    if (this.pendingSubtitleFetches.some((p) => p.plan.workId === plan.workId)) {
+      return { outcome: 'already_running', detail: '该作品的按需请求已在待办里（不重复排队）' }
+    }
+    this.pendingSubtitleFetches.push({ plan })
+    this.wakeIdle?.()
+    return {
+      outcome: this.startupStep === null ? 'accepted' : 'accepted_starting',
+      targets: plan.paths.length,
+      skipped: plan.skipped.length,
+      // 巡检正在跑 → 本次会在那一轮结束之后才被执行（主循环是串行的）。
+      // 如实告诉用户，否则"已受理"会被读成"已经在找了"。
+      queuedBehindRound: this.inspecting,
+    }
+  }
+
+  /** 主循环里的按需取件（见 `requestSubtitleFetch`）。串行执行，逐条隔离失败。 */
+  private async runSubtitleFetchNow(): Promise<void> {
+    const pending = this.pendingSubtitleFetches
+    // 先摘下来再跑：跑的过程中新来的请求进新的数组，下一圈再取（同 requestScan 的"先清标志"）。
+    this.pendingSubtitleFetches = []
+    for (const req of pending) {
+      if (this.stopping) break
+      const { plan } = req
+      try {
+        // ① 停牌行：把复查时刻提前到当下，停牌复查闸才可能把它放回 `sub_status = NULL`
+        //    （spec 12.4 对 `unsolvable` 的承诺就是这一句）。复查闸本身是**全局**的，
+        //    但它只做 DB 写、不烧 LLM，且本轮的取件面已被收窄到点名文件，故不会顺手多跑别人。
+        if (plan.revive.length > 0) {
+          const n = pullRecheckForFetch(this.deps.db, plan.revive, this.deps.now?.() ?? Date.now())
+          this.deps.log(`按需取字幕：提前 ${n} 个停牌文件的复查时刻（${plan.title}）`)
+          this.reviewParkedOnce()
+        }
+        // ② 取件面 = 点名的那些文件 + 含退避窗（spec 12.4：退避中的文件本次不得被跳过）。
+        //    取件判据仍是 SUBTITLE_QUEUE_WHERE 那一份，`paths` 只是在它之上加一条 IN。
+        const queue = listSubtitleQueue(
+          this.deps.db, this.writableRoots(), this.deps.now?.() ?? Date.now(),
+          { includeBackoff: true, paths: plan.paths },
+        )
+        if (queue.length === 0) {
+          this.deps.log(
+            `按需取字幕：${plan.title} 点名 ${plan.paths.length} 个文件，取件时已无一符合` +
+            `（受理后被覆盖/重新判决？）——本次不跑`,
+          )
+          continue
+        }
+        this.deps.log(`按需取字幕：${plan.title}（${queue.reduce((n, i) => n + i.files.length, 0)} 个文件）`)
+        await this.runSubtitleQueue(queue)
+      } catch (e) {
+        // 隔离：一次按需取件失败绝不许掀翻主循环（同带外扫描的口径）。
+        this.deps.log(`warn: 按需取字幕失败（隔离，不影响主循环）: ${plan.title}: ${String(e)}`)
+      }
+    }
   }
 
   /** One full inspection (scan → identify → judge → subtitles), ignoring the 24h watch gate.
@@ -873,6 +962,16 @@ export class ScoutDaemonV2 {
         continue
       }
 
+      // 按需取字幕取件（openspec 第 12 组）。位置与带外扫描同族、同样在**主循环里串行**：
+      // 于是它永远不会与 runInspection（或另一个按需任务）并发。spec 12.5 的"作品级互斥"
+      // 因此有两层：同一作品 → `requestSubtitleFetch` 当场明确拒绝；不同作品 → 就是这条串行队列。
+      if (this.pendingSubtitleFetches.length > 0) {
+        await this.runSubtitleFetchNow()
+        if (this.stopping) break
+        // 同 scanRequested：本圈已干实事，不睡，直接转下一圈。
+        continue
+      }
+
       // "歇着"：每 5min 一拍——既是时间闸的轮询（不是轮询工作台），也是维护循环的节拍。
       // 可被 requestScan() 提前唤醒（wakeIdle），否则带外请求要等满一拍才被取件。
       await this.idleSleep(this.deps.maintenanceTickMs ?? MAINTENANCE_TICK_MS, signal)
@@ -1045,6 +1144,24 @@ export class ScoutDaemonV2 {
       this.deps.db, this.writableRoots(), this.deps.now?.() ?? Date.now(),
       this.skipBackoffThisInspect ? { includeBackoff: true } : {},
     )
+    await this.runSubtitleQueue(subtitleQueue)
+  }
+
+  /** 阶段 3 的**实现**：消费一份字幕队列快照（R4 / C23）。
+   *
+   *  ── 为什么抽成方法（2026-09-18，openspec 第 12 组按需取字幕）────────────────
+   *  按需取字幕的唯一正确实现是"**给这条既有流水线换一个取件面**"，而不是另写一条
+   *  （spec 12.1 明令 MUST NOT 新建第二条流水线）。抽出来之后，两个调用方共用这一段：
+   *    · 常规：`runInspectionInner` 用它消费冻结快照（取件面 = 全库、滤退避）
+   *    · 按需：`runSubtitleFetchNow` 用它消费"只有点名文件"的那份队列（取件面 = 点名、含退避）
+   *  差别**只在传进来的 `subtitleQueue` 由谁构造**——活动卡、targets 覆盖格、trace 桥接、
+   *  `inFlightStagingJobIds` 的登记与摘除、C13 的补记、收工事件，两个入口逐字一致。
+   *  若这里改成"按需那条路自己再实现一遍"，上面每一项都会有两份，漂移形态是
+   *  "按需跑的时候活动页不动/沙盒 GC 保护漏登记"——都属于本仓反复栽过的那一类。
+   *
+   *  ⚠️ 这里**不接 signal**：本段历史上就没有用过它（停止靠 `this.stopping` + 每圈检查），
+   *  加一个不读的参数只会让下一个人以为"它会中途收手"。 */
+  private async runSubtitleQueue(subtitleQueue: SubtitleQueueItem[]): Promise<void> {
     let subtitleRounds = 0
     for (const frozen of subtitleQueue) {
       if (this.stopping) break

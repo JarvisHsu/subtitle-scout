@@ -36,6 +36,7 @@ import { eventFrame, helloFrame, parseResumeToken, resolveReplayFrom } from '../
 // ROOT_HEALTH_STALE_AFTER_MS 的论证——不在这里写死 48h）。**只引常量、不引 daemon 类**：
 // daemonV2 的模块图（48 个模块，已核）不含 dashboard/*，故无环。
 import { INSPECT_INTERVAL_MS } from '../v2/daemonV2.js'
+import type { SubtitleFetchReceipt, SubtitleFetchTarget } from '../v2/subtitleScheduler.js'
 import { AuthService, AUTH_KEYS, safeStrEqual } from './auth.js'
 import {
   buildVerifyDTOs, correctSubtitle, revertSubtitle, parseItemIds, parseItemIdBody,
@@ -162,6 +163,13 @@ export interface DashboardOpts {
    *   · 字段缺席 / `'not_ready'` 答 503 —— `'not_ready'` 的含义**只**是"真的不可服务"
    *     （没跑 watch / daemon 还没构造完），不许拿它兼职表达"还在启动"（提案 10.1 点名）。 */
   requestInspect?: () => 'queued' | 'already_running' | 'accepted_starting' | 'not_ready'
+  /** 按需取字幕（openspec 第 12 组 12.8）：用户点名一部影片/某一集，立刻给它找字幕。
+   *
+   *  与 `requestInspect` **同型**（HTTP 线程只受理、主循环串行执行、返回值是动作语义），
+   *  差别只有一处：它**会被关卡拒绝**（已有字幕 / 不需要字幕 / 归翻译台）——那三种不是
+   *  "服务不可用"，而是"你点名的这个东西现在不该抓"，故由 `reason` 枚举表达，端点回 409。
+   *  缺席 = 没跑 watch（纯 dashboard / 只读测试）→ 503，与两个兄弟端点口径一致。 */
+  requestSubtitleFetch?: (target: SubtitleFetchTarget) => SubtitleFetchReceipt
   /** daemon 启动阶段的当前步骤标识；已进主循环返回 null（提案 10.1/10.3）。
    *
    *  可选依赖，缺席时回执里就不带 `phase`（不编一个假的阶段名）。与 requestInspect
@@ -926,6 +934,84 @@ export function startDashboard(opts: DashboardOpts): Promise<Server> {
         const phase = startupPhase?.() ?? null
         res.writeHead(200, JSON_CT)
         res.end(JSON.stringify(phase === null ? { ok: true, outcome } : { ok: true, outcome, phase }))
+        return
+      }
+
+      // 按需取字幕（openspec 第 12 组 12.8）：**用户点名某一部影片 / 某一集，立刻给它找字幕**。
+      //
+      // 形状照抄上面两个兄弟端点（method 门 → 依赖缺席 503 → 受理 → 200 带受理语义），
+      // 但多一类结果：**被关卡拒绝**（spec 12.4：已有字幕 / 不需要字幕 / 归翻译台）。
+      // 这一类用 409 + `reason` 枚举返回——它是"你的请求与磁盘/判决的现状冲突"，
+      // 不是服务端故障（503）也不是参数错（400），且前端要靠 `reason` 决定给哪一句 i18n。
+      //
+      // 入参只收 `workId` + 可选的 `season`/`episode`，**不收文件路径**：路径是内部事实，
+      // 让前端拼路径等于把"作品 → 文件"的映射复制到浏览器里（漂移后前端会点错文件）。
+      if (rawPath === '/api/v2/subtitle/fetch') {
+        if (req.method !== 'POST') {
+          res.writeHead(405, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ error: 'method not allowed' }))
+          return
+        }
+        if (!requestSubtitleFetch) {
+          res.writeHead(503, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ error: 'subtitle fetch trigger not configured (watch daemon not running)' }))
+          return
+        }
+        const body = await readJsonBodyOrFail(req, res)
+        if (body === BODY_FAILED) return
+        const b = body as Record<string, unknown>
+        const workId = typeof b.workId === 'string' ? b.workId.trim() : ''
+        if (workId === '') {
+          res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ error: 'workId is required' }))
+          return
+        }
+        const rawSeason = b.season
+        const rawEpisode = b.episode
+        // season/episode 要么都给、要么都不给（只给一个 = 想把"整季"点成批量抓取，
+        // 而 spec 12.6 明令不提供批量入口）。给一半 → 400，不静默降级成整部作品。
+        const hasSeason = rawSeason !== undefined && rawSeason !== null
+        const hasEpisode = rawEpisode !== undefined && rawEpisode !== null
+        if (hasSeason !== hasEpisode) {
+          res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ error: 'season and episode must be provided together' }))
+          return
+        }
+        const season = hasSeason ? Number(rawSeason) : null
+        const episode = hasEpisode ? Number(rawEpisode) : null
+        if ((hasSeason && !Number.isInteger(season)) || (hasEpisode && !Number.isInteger(episode))) {
+          res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ error: 'season and episode must be integers' }))
+          return
+        }
+        const receipt = requestSubtitleFetch({ workId, season, episode })
+        if (receipt.outcome === 'not_ready') {
+          res.writeHead(503, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ error: 'subtitle fetch trigger not ready (daemon still starting up)' }))
+          return
+        }
+        if (receipt.outcome === 'rejected') {
+          res.writeHead(409, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ error: receipt.reason, reason: receipt.reason, detail: receipt.detail }))
+          return
+        }
+        if (receipt.outcome === 'already_running') {
+          res.writeHead(409, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ error: 'already running', reason: 'already-running', detail: receipt.detail }))
+          return
+        }
+        // 200 的回执**必须**带受理语义（同 10.2 的红线）：`outcome` + 要点名几个文件 +
+        // 有几个被挡下 + 是否要等正在跑的那轮巡检。只回 `{ok:true}` 会让"点了没反应"重现。
+        const phase = startupPhase?.() ?? null
+        res.writeHead(200, JSON_CT)
+        res.end(JSON.stringify({
+          ok: true,
+          outcome: receipt.outcome,
+          targets: receipt.targets ?? 0,
+          skipped: receipt.skipped ?? 0,
+          queuedBehindRound: receipt.queuedBehindRound === true,
+          ...(phase === null ? {} : { phase }),
+        }))
         return
       }
 
