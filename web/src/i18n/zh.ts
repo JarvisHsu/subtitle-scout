@@ -535,6 +535,11 @@ export const zh = {
   wb_inspect_unknown: '正在获取状态…',
   wb_inspect_never: '还没有自动检查过',
   wb_inspect_running: '正在自动检查',
+  // 提案 10.9：MUST 区分「已受理（等启动阶段结束）」与「正在运行」。
+  // 前者说的是"我收到了，引擎起来就开始"，后者说的是"它正在跑"——把前者说成后者，
+  // 用户会一直等一个还没开始的巡检。
+  wb_inspect_accepted: '已经收到，引擎还在启动，起来就开始',
+  wb_inspect_accepted_phase: '已经收到——引擎还在启动（正在{phase}），起来就开始',
   wb_inspect_stale: '自动检查好像没有在运行',
   wb_inspect_idle: '上次自动检查',
   wb_inspect_next: '下次自动检查',

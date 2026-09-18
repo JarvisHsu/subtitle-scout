@@ -351,6 +351,9 @@ function StatusBar({
 
   // "有没有工作台在跑" = 三槽任一非 null。⚠️ 不许只看某一个槽——那会在"只有翻译台在跑"
   // 时把 Run now 解禁、把巡检态报成 idle。
+  // 「已受理、但引擎还在启动阶段」时记下阶段名；null = 不在这个状态（提案 10.1/10.8/10.9）。
+  // '' 表示"确实已受理但拿不到阶段名"——与 null（没这回事）严格区分，因为两者要说的话不同。
+  const [acceptedStarting, setAcceptedStarting] = useState<string | null>(null)
   const busy = currents.identify ?? currents.subtitle ?? currents.translate
 
   // running 跟 SSE 三槽，不跟 health.currents：POST 200 只是 queued，
@@ -437,7 +440,13 @@ function StatusBar({
     setRunAlert(null)
     setPending(true)
     try {
-      await api.triggerInspect()
+      const r = await api.triggerInspect()
+      // 🔴 提案 10.8/10.9：受理回执**必须**分开对待。
+      // 「已受理，但引擎还在启动阶段」≠「正在运行」——把前者挂成"运行中"就是提案点名
+      // 禁止的那句假话（用户会一直等一个还没开始的巡检）。
+      // phase 优先取回执里的，回执没带就退回 /health 的快照（两条路同源，都来自 daemon
+      // 的同一个状态位；回执更实时，快照可能在这次点火之前取的）。
+      setAcceptedStarting(r.outcome === 'accepted_starting' ? (r.phase ?? health?.startupPhase ?? '') : null)
       reloadHealth()
       // 成功：pending / inFlight 留到 inspectRound end 或 workbench current。
     } catch (e) {
@@ -468,6 +477,15 @@ function StatusBar({
         </Button>
       )}
       {runAlert && <span role="alert">{runAlert}</span>}
+      {/* 「已受理，等启动阶段结束」（提案 10.9）。与 pending 的"正在运行"是**两个不同的说法**：
+          pending 表示按钮已按下、结果未知；这一行表示引擎明确回了"我收到了，但还在启动"。 */}
+      {acceptedStarting !== null && (
+        <span data-testid="wb-inspect-accepted" role="status" aria-live="polite">
+          {acceptedStarting === ''
+            ? t('wb_inspect_accepted')
+            : t('wb_inspect_accepted_phase').replace('{phase}', acceptedStarting)}
+        </span>
+      )}
 
       {/* 🟡 读数已过期。
           · **两通道**（Carbon）：文字本身把话说全（"可能已经不是最新的"）+ 点变成**空心**

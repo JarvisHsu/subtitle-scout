@@ -341,7 +341,15 @@ export const api = {
   // 调 scanDebouncer 时。判据是上面那条链断在任意一跳——不是"名字里有 library"。
   triggerScan: () => post<{ ok: true }>('/api/v2/library/scan'),
   // 完整巡检点火（runInspection），不是 scan-only。加根防抖仍走 triggerScan。
-  triggerInspect: () => post<{ ok: true }>('/api/v2/library/inspect'),
+  // 手动点火完整巡检。回执**不再是裸的 `{ok:true}`**（提案 10.2 明令 MUST NOT）：
+  // `outcome` 说明这次点火的语义（`queued` / `accepted_starting`），`phase` 在
+  // 「已受理但引擎还在启动阶段」时给出当前步骤。
+  //
+  // 🔴 消费方必须把两者分开对待：「已受理（等启动阶段结束）」与「正在运行」是**两件事**，
+  // 前者的正确反馈是"我收到了，引擎起来就开始"，不是把按钮挂在"运行中"上假装它在跑
+  //（提案 10.9：MUST NOT 把前者说成后者）。
+  triggerInspect: () =>
+    post<{ ok: true; outcome: 'queued' | 'accepted_starting'; phase?: string | null }>('/api/v2/library/inspect'),
 
   // Task ⑦：健康快照。SSE（events/）给的是**变化**，这个给的是**当前态**——断线期间丢了
   // 事件之后靠它纠正，这正是后端设立该端点的理由（server.ts 的 F-6 论证）。

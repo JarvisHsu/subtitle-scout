@@ -191,7 +191,7 @@ describe('BehaviorSection：单键即时 PUT', () => {
   })
 
   it('立即巡检按钮 → POST /api/v2/library/inspect（复用 api.triggerInspect）', async () => {
-    const inspect = vi.spyOn(api, 'triggerInspect').mockResolvedValue({ ok: true })
+    const inspect = vi.spyOn(api, 'triggerInspect').mockResolvedValue({ ok: true, outcome: 'queued' })
     renderSection(asyncOf(NULL_SETTINGS))
 
     fireEvent.click(screen.getByRole('button', { name: 'Scan now' }))

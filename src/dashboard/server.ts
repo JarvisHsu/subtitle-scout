@@ -270,6 +270,12 @@ export interface HealthDTO {
    *  这正是"什么都没发生"最常见的成因，也是本字段存在的全部理由。 */
   setupSatisfied: boolean
   roots: HealthRootDTO[]
+  /** daemon **启动阶段**的当前步骤标识；已进主循环 / 未接线时为 null（提案 10.1/10.3）。
+   *
+   *  它是 `requestInspect` 那个 `'accepted_starting'` 的**只读版本**：回执要求用户先点一次
+   *  才看得见阶段，而"还在启动"恰恰是**点之前**就该知道的事——用户看到按钮按下去很正常。
+   */
+  startupPhase: string | null
   /**
    * 「有几个目录我认不出来」——`files.work_id IS NULL` 的目录汇总。
    *
@@ -1094,6 +1100,16 @@ export function startDashboard(opts: DashboardOpts): Promise<Server> {
           stalledJobs: buildStalledJobs(db, Date.now()),
           // events 缺席 → 三槽全 null（见上方论证：不整体 503）。
           currents: events ? events.getCurrents() : { identify: null, subtitle: null, translate: null },
+          // daemon 启动阶段的当前步骤；**已进主循环 / dep 缺席都表现为 null**（提案 10.1/10.3）。
+          //
+          // 为什么放进 `/health` 而不是只留在 inspect 的回执里：回执那条路要求用户**先点一次
+          // 点火**才看得见阶段，而"还在启动"恰恰是**点之前**就该知道的事——用户看到按钮立刻
+          // 按下去很正常。放进只读快照后，前端可以在按钮旁直接说"引擎还在启动（正在回填 X）"。
+          //
+          // 与 unidentified/stalledJobs 同一档：**增益字段，缺席不 503**。老调用方拿到的
+          // health 少一个键，前端按 `?? null` 渲染成"不在启动阶段"——那是本仓对可选段
+          // 的既有口径（同 stalledJobs 的降级论证）。
+          startupPhase: startupPhase?.() ?? null,
         }
         res.writeHead(200, JSON_CT)
         res.end(JSON.stringify(body))

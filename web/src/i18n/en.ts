@@ -603,6 +603,11 @@ export const en = {
   wb_inspect_unknown: 'Checking status…',
   wb_inspect_never: 'No automatic check has run yet',
   wb_inspect_running: 'Automatic check in progress',
+  // Proposal 10.9: MUST distinguish "accepted (waiting for startup to finish)" from "running".
+  // The former means "got it, it will start once the engine is up"; saying it while nothing runs
+  // leaves the user waiting on an inspection that has not begun.
+  wb_inspect_accepted: 'Got it — the engine is still starting up; it will begin as soon as it is ready',
+  wb_inspect_accepted_phase: 'Got it — the engine is still starting up ({phase}); it will begin as soon as it is ready',
   // 「daemon 可能没在跑」——陈旧门（48h）覆盖不到容器挂掉这一档，见 inspectFreshness 债务二。
   wb_inspect_stale: 'The automatic check may not be running',
   wb_inspect_idle: 'Last automatic check',

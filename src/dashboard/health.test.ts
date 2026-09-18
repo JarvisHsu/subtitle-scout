@@ -488,11 +488,21 @@ describe('GET /api/v2/health（Task ⑤）', () => {
     // 会让活动页 total 与 SSE 的 total 对不上且越跑越飘）。
     const { base } = await start({ events: new ScoutEventBus() })
     const { body } = await getHealth(base)
+    // 键全集恒等——多一个字段这条就红。
+    //
+    // 2026-09-18（提案第 10 组）加了 `startupPhase`：daemon 启动阶段的当前步骤。
+    // 它是**有意识的新增**，不是漂移——这条用例要守的是"**不许出现 `queue`**"，
+    // 而 `startupPhase` 与 queue 毫无关系（它是 daemon 自身的状态读数，不来自任何队列）。
+    // 放在这里而不是别处，是因为回执那条路（`/library/inspect`）要求用户先点一次才看得见阶段，
+    // 而"还在启动"恰恰是点之前就该知道的事。
     expect(Object.keys(body).sort()).toEqual(
       ['currents', 'engineEnabled', 'lastInspectAt', 'nextInspectAt', 'roots', 'setupSatisfied', 'stalledJobs',
-       'unidentified', 'workPermitted'],
+       'startupPhase', 'unidentified', 'workPermitted'],
     )
     expect('queue' in body).toBe(false)
+    // 未接线 `startupPhase` 依赖时是 **null**，不是缺席、也不编一个阶段名——
+    // 「不知道」与「不在启动阶段」在前端都按"不显示"处理（同 stalledJobs 的降级口径）。
+    expect(body.startupPhase).toBeNull()
   })
 
   it('非 GET → 405（同隔壁 notifications/events 的既有 method 门）', async () => {

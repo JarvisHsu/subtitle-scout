@@ -104,7 +104,7 @@ describe('StepLaunch', () => {
   // fire-and-forget 触发首次巡检（POST /api/v2/library/inspect，即「现在跑」那个端点）。
   it('Launch 成功 → 触发首次巡检（POST /api/v2/library/inspect）', async () => {
     vi.spyOn(api, 'updateSettings').mockResolvedValue({} as never)
-    const inspect = vi.spyOn(api, 'triggerInspect').mockResolvedValue({ ok: true })
+    const inspect = vi.spyOn(api, 'triggerInspect').mockResolvedValue({ ok: true, outcome: 'queued' })
     const onComplete = vi.fn()
     renderStep({ onComplete })
     fireEvent.click(screen.getByRole('button', { name: 'Launch' }))
@@ -125,7 +125,7 @@ describe('StepLaunch', () => {
 
   it('PUT 失败 → 不触发巡检（引擎态没写成，点火无意义）', async () => {
     vi.spyOn(api, 'updateSettings').mockRejectedValue(new Error('boom'))
-    const inspect = vi.spyOn(api, 'triggerInspect').mockResolvedValue({ ok: true })
+    const inspect = vi.spyOn(api, 'triggerInspect').mockResolvedValue({ ok: true, outcome: 'queued' })
     renderStep()
     fireEvent.click(screen.getByRole('button', { name: 'Launch' }))
     expect(await screen.findByText(/boom/)).toBeInTheDocument()
