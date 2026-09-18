@@ -175,6 +175,27 @@ describe('allocate/cleanup — jobId 含冒号（生产形态）', () => {
     expect(readdirSync(root).filter(n => n.startsWith('.'))).toEqual(['.subtitle-staging'])
   })
 
+  it('🔴 #15：第一次删不掉、等一会儿删得掉 → 不抛、**不留痕**（秒级重试真的在跑）', () => {
+    const root = mediaRoot()
+    const dir = allocate('job-1', root)
+    let calls = 0
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    rmSyncOverride = (real, p, opts) => {
+      // 第一次模拟后端"子条目还没处理完"（最终一致后端的常态签名：directory not empty）
+      if (p === dir && calls++ === 0) {
+        throw Object.assign(new Error('directory not empty'), { code: 'ENOTEMPTY' })
+      }
+      return (real as unknown as (path: string, o?: unknown) => void)(p, opts)
+    }
+    cleanup('job-1', root)
+    rmSyncOverride = null
+    expect(calls).toBe(2)                 // 真的重试了一次
+    expect(existsSync(dir)).toBe(false)   // 第二次成功
+    // 既然最终删干净了，就**不该**报残留（与"删不掉必须留痕"那条互补）
+    expect(spy.mock.calls.flat().join(' ')).not.toContain('not removed')
+    spy.mockRestore()
+  })
+
   it('失败必须留痕：删不掉时打出含原始 jobId 与映射后目录名的 ERROR，且不抛错', () => {
     const root = mediaRoot()
     const dir = allocate('subtitle:tmdb:999999', root)

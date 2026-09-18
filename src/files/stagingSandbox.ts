@@ -17,6 +17,12 @@ const RETRYABLE_CODES = new Set(['EEXIST', 'EPERM', 'EBUSY'])
  *  （毫秒~秒级）；再多只会拖慢装盘前置。 */
 const MKDIR_TOLERATE_ATTEMPTS = 3
 const MKDIR_TOLERATE_RETRY_DELAYS_MS = [120, 400]
+/** `cleanup` 删沙盒的**有界**重试预算（#15）。只覆盖**秒级**那一档：
+ *  "子条目删完了但后端还没处理完 → rmdir 说 directory not empty"是最终一致后端的常态，
+ *  等一会再来一次通常就好了。更长的那一档仍由 boot 的 `gcOrphans ②` 兜（它逐字未改）。
+ *  ⚠️ 这个预算花在**任务尾部**（`finally`），所以刻意取小：每个真实任务都多等 1s 是不可接受的，
+ *  而"再晚一点 boot 会收"本来就是既有设计。 */
+const RM_RETRY_DELAYS_MS = [200, 800]
 
 /** `mkdir` 的「**已存在**」容错（#14，2026-09-18）。
  *
@@ -353,22 +359,49 @@ export function cleanup(jobId: string, mediaRootForVideo: string): void {
   const root = join(mediaRootForVideo, STAGING_DIRNAME)
   // 目录名与 allocate 同法映射（两处 MUST 同一个函数，见 core/mediaContext.ts 的 stagingDirName）。
   const dirName = stagingDirName(jobId)
-  // ① 删本 job 的沙盒：既有行为，逐字不变（除目录名映射）。
-  try {
-    rmSync(join(root, dirName), { recursive: true, force: true })
-  } catch {
-    // best-effort:清理失败不影响本次运行已产生的结论
+  // ① 删本 job 的沙盒。**加有界重试**（2026-09-18 第 28 轮，issues #15）。
+  //
+  // ── 为什么现在改主意了（推翻本函数上方"有意不加删除重试"那条）────────────────
+  // 那条依据的实测是「3 天真实任务里 `directory not empty` 只有 2 条、且全部来自人为探针；
+  // 真实任务时序下该竞态从未发生」。第 23 轮把这条**推翻**了：一轮真实巡检 13 个作品里
+  // **4 个**的 `<jobId>/` 留在了用户媒体根里，rclone 侧 `Dir.Remove … directory not empty` 9 条。
+  // ——决议的输入事实变了，所以这里按事实改，不是"我又想加一层"。
+  //
+  // 机制：这个后端是**最终一致**的。`rm -rf` 先把子条目删掉（异步回写），紧接着的 `rmdir`
+  // 在后端看来那些子条目**还在** → `directory not empty` → 本地目录项留下。
+  // 故"等一会儿再来一次"对这一档是**有效**的（后端只是还没处理完），这是它与 #14 那侧
+  // （mkdir 撞"刚动过的父目录"，重试无效）的关键区别。
+  //
+  // 预算 [200, 800]ms：只覆盖**秒级**那一档。实测也没有把握说窗口一定在秒级——所以
+  // **长的那一档仍然由 boot 的 gcOrphans ② 兜**（它逐字未改）。这一轮真正买到的是
+  // **可观测性**：①′ 现在把最后一次错误的 errno 一起打出来，于是"删不掉"到底属于哪一档
+  // 第一次变成可判的（此前 ①′ 只说"还在"，不说"为什么"）。
+  const target = join(root, dirName)
+  let lastRmError: unknown
+  for (let attempt = 0; ; attempt++) {
+    lastRmError = undefined
+    try {
+      rmSync(target, { recursive: true, force: true })
+    } catch (e) {
+      // best-effort：清理失败不影响本次运行已产生的结论（"不阻塞"从没变过，变的是"再试一次"）
+      lastRmError = e
+    }
+    if (!existsSync(target)) break
+    if (attempt >= RM_RETRY_DELAYS_MS.length) break
+    sleepSync(RM_RETRY_DELAYS_MS[attempt] ?? 0)
   }
-  // ①' 复核删除结果并留痕（2026-09-17 修订）。此前这里只有上面的空 catch：当沙盒目录**根本建不
-  // 出来**时（实测：jobId 的冒号被夸克/alist 拒绝，rclone 的 VFS 写缓存把 mkdir 失败伪装成本地
-  // 成功），删除会稳定失败并被无声吞掉——预防者在生产上连续停摆数十次任务而日志里一条痕迹都没有，
-  // 残留只能等启动时的孤儿回收被动兜住。"尽力而为"指的是**不阻塞**，不是**不留痕**。
+  // ①' 复核删除结果并留痕（2026-09-17 修订，2026-09-18 补 errno）。此前这里只有上面的空 catch：
+  // 当沙盒目录**根本建不出来**时（实测：jobId 的冒号被夸克/alist 拒绝，rclone 的 VFS 写缓存把
+  // mkdir 失败伪装成本地成功），删除会稳定失败并被无声吞掉——预防者在生产上连续停摆数十次任务
+  // 而日志里一条痕迹都没有，残留只能等启动时的孤儿回收被动兜住。
+  // "尽力而为"指的是**不阻塞**，不是**不留痕**。
   try {
-    if (existsSync(join(root, dirName))) {
+    if (existsSync(target)) {
       console.error(
-        `staging sandbox not removed: ${join(root, dirName)} still exists after cleanup ` +
+        `staging sandbox not removed: ${target} still exists after cleanup ` +
         `(jobId ${jobId} → dir name ${dirName}). Best-effort: the run's conclusion is unaffected; ` +
-        `boot-time orphan GC will retry.`,
+        `boot-time orphan GC will retry. 最后一次错误：` +
+        `${lastRmError === undefined ? '（rmSync 没抛，但路径仍在——多半是后端把删除吞了）' : describeFsError(lastRmError)}`,
       )
     }
   } catch {
