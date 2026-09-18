@@ -5,6 +5,7 @@ import {
   runSubtitleWorkDir, buildSubtitleTask, listSubtitleQueue, subtitleJobId,
   RETRY_LATER_STREAK_CAP, queueItemDueNow, queueItemEarliestRetryAt, type SubtitleQueueItem,
   clampTranslateAfterAttempts,
+  planSubtitleFetch, pullRecheckForFetch,
 } from './subtitleScheduler.js'
 import { traceBus } from '../core/traceBus.js'
 
@@ -1164,5 +1165,158 @@ describe('buildSubtitleTask — stagingRoot 接线（沙盒必须挂在配置媒
   it('jobId 与 in-flight 集合登记的目录名同源（字节一致）', () => {
     const task = buildSubtitleTask(mkItemAt('/media/Show', 1, 1), 'zh', ['/media'])
     expect(task.jobId).toBe(subtitleJobId('tmdb:603'))
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 按需取字幕（openspec 第 12 组）
+//
+// 这一组钉的是**用户点名前后的判据**：谁能被抓、谁必须被拒、点名之外的文件一个都不许被带上。
+// 最要紧的一条是 12.3：一次点名只处理被点名的那些文件——**队列形状与顺序都不变**，
+// 而 `paths` 只是在既有三条谓词之上加一条 IN（取件判据仍只有一份，12.2 的红线）。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('planSubtitleFetch / listSubtitleQueue({paths}) — 按需取字幕', () => {
+  let db: ReturnType<typeof openDb>
+
+  /** 一行视频 + 它的现值三列（needs_subtitle / skip_reason / sub_status）。 */
+  function seed(path: string, opts: {
+    workId?: string; season?: number | null; episode?: number | null
+    needs?: number | null; skip?: string | null; status?: string | null; recheck?: number | null
+  } = {}): void {
+    const season = opts.season === undefined ? (opts.episode === undefined ? null : 1) : opts.season
+    const episode = opts.episode === undefined ? null : opts.episode
+    db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, work_id, season, episode,
+                                    needs_subtitle, skip_reason, sub_status, recheck_after, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(path, path.slice(0, path.lastIndexOf('/')), path.slice(path.lastIndexOf('/') + 1),
+        100, 1000, path.slice(0, path.lastIndexOf('/')), opts.workId ?? 'tmdb:1', season, episode,
+        opts.needs === undefined ? 1 : opts.needs, opts.skip ?? null, opts.status ?? null,
+        opts.recheck === undefined ? null : opts.recheck, 1000)
+  }
+
+  beforeEach(() => {
+    db = openDb(':memory:')
+    db.prepare(`INSERT INTO works (id, title, media_type, created_at, updated_at) VALUES (?,?,?,?,?)`)
+      .run('tmdb:1', 'ShowA', 'tv', 1000, 1000)
+    db.prepare(`INSERT INTO works (id, title, media_type, created_at, updated_at) VALUES (?,?,?,?,?)`)
+      .run('tmdb:2', 'ShowB', 'tv', 1000, 1000)
+    seed('/media/TV/ShowA/S01/E01.mkv', { episode: 1 })
+    seed('/media/TV/ShowA/S01/E02.mkv', { episode: 2 })
+    seed('/media/TV/ShowA/S01/E03.mkv', { episode: 3 })
+  })
+
+  it('🔴 点名一集：队列里**只有**那一集（同作品其它集一个都不带——12.3）', () => {
+    const plan = planSubtitleFetch(db, { workId: 'tmdb:1', season: 1, episode: 2 })
+    expect(plan.ok).toBe(true)
+    if (!plan.ok) return
+    expect(plan.paths).toEqual(['/media/TV/ShowA/S01/E02.mkv'])
+    const queue = listSubtitleQueue(db, ['/media/TV'], Date.now(), { includeBackoff: true, paths: plan.paths })
+    expect(queue).toHaveLength(1)
+    expect(queue[0].workId).toBe('tmdb:1')
+    expect(queue[0].files.map((f) => f.filename)).toEqual(['E02.mkv'])
+  })
+
+  it('不点名到集 → 整个作品（电影就是单片）；`paths: []` = 谁都不取（不静默变成整库）', () => {
+    const plan = planSubtitleFetch(db, { workId: 'tmdb:1' })
+    expect(plan.ok).toBe(true)
+    if (!plan.ok) return
+    expect(plan.paths).toHaveLength(3)
+    // 🔴 空数组必须是"零个"而不是"不过滤"：否则一个手滑的 [] 会变成整库付费取件。
+    expect(listSubtitleQueue(db, ['/media/TV'], Date.now(), { paths: [] })).toEqual([])
+    expect(listSubtitleQueue(db, ['/media/TV'], Date.now(), { paths: ['/nope.mkv'] })).toEqual([])
+  })
+
+  it('队列形状与顺序不变：加了 paths 之后，同一作品的排序键仍是 (season, episode)', () => {
+    const all = listSubtitleQueue(db, ['/media/TV'], Date.now(), { includeBackoff: true })
+    expect(all.flatMap((i) => i.files.map((f) => f.episode)).every((e, i, a) => i === 0 || a[i - 1]! <= e!)).toBe(true)
+    const two = listSubtitleQueue(db, ['/media/TV'], Date.now(), {
+      includeBackoff: true, paths: ['/media/TV/ShowA/S01/E03.mkv', '/media/TV/ShowA/S01/E01.mkv'],
+    })
+    // 传进来的顺序是乱的，出去的仍是 (season, episode) 升序——范围收窄**不改**顺序语义。
+    expect(two[0].files.map((f) => f.episode)).toEqual([1, 3])
+  })
+
+  // ── 关卡（12.4）：拒绝的三态 / 受理的两态 ────────────────────────────────
+  it('🔴 已有该语言外挂字幕（covered）→ 拒绝 already-covered，且不产生任何取件', () => {
+    db.prepare(`UPDATE files SET sub_status = 'covered' WHERE path = ?`).run('/media/TV/ShowA/S01/E02.mkv')
+    const plan = planSubtitleFetch(db, { workId: 'tmdb:1', season: 1, episode: 2 })
+    expect(plan.ok).toBe(false)
+    if (plan.ok) return
+    expect(plan.reason).toBe('already-covered')
+  })
+
+  it('🔴 判为不需要字幕（needs_subtitle = 0）→ 拒绝 no-subtitle-needed', () => {
+    db.prepare(`UPDATE files SET needs_subtitle = 0, skip_reason = 'embedded' WHERE path = ?`)
+      .run('/media/TV/ShowA/S01/E02.mkv')
+    const plan = planSubtitleFetch(db, { workId: 'tmdb:1', season: 1, episode: 2 })
+    expect(plan.ok).toBe(false)
+    if (plan.ok) return
+    expect(plan.reason).toBe('no-subtitle-needed')
+  })
+
+  it('🔴 归翻译工作台的（handoff_translate）→ 拒绝 translate-workbench（不许两工作台互斥被打破）', () => {
+    db.prepare(`UPDATE files SET sub_status = 'handoff_translate' WHERE path = ?`).run('/media/TV/ShowA/S01/E02.mkv')
+    const plan = planSubtitleFetch(db, { workId: 'tmdb:1', season: 1, episode: 2 })
+    expect(plan.ok).toBe(false)
+    if (plan.ok) return
+    expect(plan.reason).toBe('translate-workbench')
+  })
+
+  it('🔴 停牌（unsolvable）→ **受理**，并且进 revive（把复查时刻提前到当下——12.4）', () => {
+    db.prepare(`UPDATE files SET sub_status = 'unsolvable', recheck_after = ? WHERE path = ?`)
+      .run(Date.now() + 6 * 24 * 3600 * 1000, '/media/TV/ShowA/S01/E02.mkv')
+    const plan = planSubtitleFetch(db, { workId: 'tmdb:1', season: 1, episode: 2 })
+    expect(plan.ok).toBe(true)
+    if (!plan.ok) return
+    expect(plan.paths).toEqual(['/media/TV/ShowA/S01/E02.mkv'])
+    expect(plan.revive).toEqual(['/media/TV/ShowA/S01/E02.mkv'])
+    const changed = pullRecheckForFetch(db, plan.revive, Date.now())
+    expect(changed).toBe(1)
+    const row = db.prepare('SELECT recheck_after FROM files WHERE path = ?')
+      .get('/media/TV/ShowA/S01/E02.mkv') as { recheck_after: number }
+    expect(row.recheck_after).toBe(0)   // 哨兵：立即到点（停牌复查闸的谓词是 <= now）
+  })
+
+  it('退避窗口内 → **受理**（用户比下一个窗口更早地想再试一次，这正是按需的唯一增量价值）', () => {
+    const future = Date.now() + 12 * 3600 * 1000
+    db.prepare(`UPDATE files SET recheck_after = ? WHERE path = ?`).run(future, '/media/TV/ShowA/S01/E02.mkv')
+    const plan = planSubtitleFetch(db, { workId: 'tmdb:1', season: 1, episode: 2 })
+    expect(plan.ok).toBe(true)
+    if (!plan.ok) return
+    // 默认（巡检语义）它不在队列里；按需那次带 includeBackoff 才取得到。
+    expect(listSubtitleQueue(db, ['/media/TV'], Date.now(), { paths: plan.paths })).toEqual([])
+    expect(listSubtitleQueue(db, ['/media/TV'], Date.now(), { includeBackoff: true, paths: plan.paths })).toHaveLength(1)
+  })
+
+  it('尚未判决（needs_subtitle 为 NULL）→ 拒绝 not-judged（而不是拿累计列猜它在不在处理）', () => {
+    db.prepare(`UPDATE files SET needs_subtitle = NULL WHERE path = ?`).run('/media/TV/ShowA/S01/E02.mkv')
+    const plan = planSubtitleFetch(db, { workId: 'tmdb:1', season: 1, episode: 2 })
+    expect(plan.ok).toBe(false)
+    if (plan.ok) return
+    expect(plan.reason).toBe('not-judged')
+  })
+
+  it('未识别的资源表达不成 work 定位 → work-not-found（12.7：走人工绑定，不是抓取）', () => {
+    const plan = planSubtitleFetch(db, { workId: 'tmdb:不存在' })
+    expect(plan.ok).toBe(false)
+    if (plan.ok) return
+    expect(plan.reason).toBe('work-not-found')
+  })
+
+  it('作品在库里但那一集不在 → no-video-files', () => {
+    const plan = planSubtitleFetch(db, { workId: 'tmdb:1', season: 9, episode: 9 })
+    expect(plan.ok).toBe(false)
+    if (plan.ok) return
+    expect(plan.reason).toBe('no-video-files')
+  })
+
+  it('混着来：整部作品点名时，被挡下的进 skipped、放行的进 paths（不静默吞掉）', () => {
+    db.prepare(`UPDATE files SET sub_status = 'covered' WHERE path = ?`).run('/media/TV/ShowA/S01/E01.mkv')
+    db.prepare(`UPDATE files SET needs_subtitle = 0 WHERE path = ?`).run('/media/TV/ShowA/S01/E03.mkv')
+    const plan = planSubtitleFetch(db, { workId: 'tmdb:1' })
+    expect(plan.ok).toBe(true)
+    if (!plan.ok) return
+    expect(plan.paths).toEqual(['/media/TV/ShowA/S01/E02.mkv'])
+    expect(plan.skipped.map((s) => s.reason).sort()).toEqual(['already-covered', 'no-subtitle-needed'])
   })
 })

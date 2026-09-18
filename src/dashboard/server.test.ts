@@ -18,6 +18,7 @@ import { SubtitleVerifyRepo } from '../v2/subtitleVerifyRepo.js'
 import type { SubtitleWriteDeps } from './subtitleVerifyApi.js'
 import type { SubtitleCompareDeps } from './subtitleCompareApi.js'
 import type { SetupDeps } from './setupApi.js'
+import type { SubtitleFetchReceipt, SubtitleFetchTarget } from '../v2/subtitleScheduler.js'
 
 // dashboard-F5：'search' 加入 Pick——GET /api/v2/tmdb/search 的 fake tmdb 注入复用同一个类型。
 type FakeTmdb = Pick<TmdbClient, 'getSeasonTable' | 'getSeasonEpisodes' | 'search'>
@@ -123,6 +124,8 @@ async function start(
     requestInspect?: () => 'queued' | 'already_running' | 'accepted_starting' | 'not_ready'
     /** 提案 10.1/10.3：daemon 启动阶段的当前步骤；已进主循环为 null。 */
     startupPhase?: () => string | null
+    /** 按需取字幕（openspec 第 12 组）：POST /api/v2/subtitle/fetch 的受理回调。 */
+    requestSubtitleFetch?: (target: SubtitleFetchTarget) => SubtitleFetchReceipt
   },
 ): Promise<{ base: string }> {
   server = await startDashboard({
@@ -133,6 +136,7 @@ async function start(
     tmdb: extra?.tmdbGetter ?? (tmdb ? () => tmdb : undefined),
     requestScan,
     requestInspect: extra?.requestInspect,
+    requestSubtitleFetch: extra?.requestSubtitleFetch,
     startupPhase: extra?.startupPhase,
     subtitleWriteDeps,
     subtitleCompareDeps,
@@ -2008,4 +2012,126 @@ describe('setup 面端点（spec A §4.4）', () => {
     })
   })
 
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/v2/subtitle/fetch —— 按需取字幕（openspec 第 12 组 12.8 / 12.10）
+//
+// 这一组钉的是**回执语义**：用户点一下之后，他拿到的那句话必须分得清四件完全不同的事——
+//   ① 已受理（并且知道要点名几个文件）② 被关卡拒绝（为什么）③ 同一作品正在跑 ④ 不可服务
+// 本仓已经栽过"把 ① 和 ④ 混成一句 {ok:true}"（提案第 10 组的实测背景），故这里逐态钉死。
+// 端点本身不做任何取件判决——判决在 daemon（`requestSubtitleFetch`），这组用例喂的是桩。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('POST /api/v2/subtitle/fetch（按需取字幕）', () => {
+  const post = (base: string, body: unknown, qs = '?token=tok') =>
+    fetch(`${base}/api/v2/subtitle/fetch${qs}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: typeof body === 'string' ? body : JSON.stringify(body),
+    })
+
+  it('依赖缺席（没跑 watch）→ 503 configured，与两个兄弟端点同档', async () => {
+    const { base } = await start(distWith('<!doctype html>'), 'tok')
+    const res = await post(base, { workId: 'tmdb:1' })
+    expect(res.status).toBe(503)
+    expect((await res.json()).error).toContain('not configured')
+  })
+
+  it('方法门：GET → 405', async () => {
+    const { base } = await start(distWith('<!doctype html>'), 'tok', undefined, undefined, undefined,
+      undefined, undefined, undefined, { requestSubtitleFetch: () => ({ outcome: 'accepted' }) })
+    const res = await fetch(`${base}/api/v2/subtitle/fetch?token=tok`)
+    expect(res.status).toBe(405)
+  })
+
+  it('鉴权走统一前置门：不带 token → 401', async () => {
+    const { base } = await start(distWith('<!doctype html>'), 'tok', undefined, undefined, undefined,
+      undefined, undefined, undefined, { requestSubtitleFetch: () => ({ outcome: 'accepted' }) })
+    const res = await post(base, { workId: 'tmdb:1' }, '')
+    expect(res.status).toBe(401)
+  })
+
+  it('🔴 入参只认 workId + 可选 season/episode，且**只给一个** → 400（不许静默降级成整部作品）', async () => {
+    const calls: SubtitleFetchTarget[] = []
+    const { base } = await start(distWith('<!doctype html>'), 'tok', undefined, undefined, undefined,
+      undefined, undefined, undefined, {
+        requestSubtitleFetch: (t) => { calls.push(t); return { outcome: 'accepted', targets: 1 } },
+      })
+
+    expect((await post(base, {})).status).toBe(400)
+    expect((await post(base, { workId: '   ' })).status).toBe(400)
+    // 只给 season → 400；只给 episode → 400（这两种都是"把整季/整剧点成批量抓取"的形状）
+    expect((await post(base, { workId: 'tmdb:1', season: 1 })).status).toBe(400)
+    expect((await post(base, { workId: 'tmdb:1', episode: 3 })).status).toBe(400)
+    expect((await post(base, { workId: 'tmdb:1', season: 'x', episode: 3 })).status).toBe(400)
+    expect((await post(base, 'not json')).status).toBe(400)
+    // 🔴 上面六次都不许摸到 daemon —— 参数错的请求绝不该惊动流水线
+    expect(calls).toHaveLength(0)
+
+    // 合法形态照原样透传（含"整部作品"：两个都不给）
+    expect((await post(base, { workId: 'tmdb:1' })).status).toBe(200)
+    expect((await post(base, { workId: 'tmdb:1', season: 1, episode: 3 })).status).toBe(200)
+    expect(calls).toEqual([
+      { workId: 'tmdb:1', season: null, episode: null },
+      { workId: 'tmdb:1', season: 1, episode: 3 },
+    ])
+  })
+
+  it('🔴 被关卡拒绝 → 409 + reason 枚举（**不是** 503：这不是服务端故障）', async () => {
+    const { base } = await start(distWith('<!doctype html>'), 'tok', undefined, undefined, undefined,
+      undefined, undefined, undefined, {
+        requestSubtitleFetch: () => ({
+          outcome: 'rejected', reason: 'already-covered', detail: '已有该语言字幕',
+        }),
+      })
+    const res = await post(base, { workId: 'tmdb:1', season: 1, episode: 3 })
+    expect(res.status).toBe(409)
+    expect(await res.json()).toMatchObject({ error: 'already-covered', reason: 'already-covered' })
+  })
+
+  it('🔴 同作品已有任务在跑 → 409 already running（明确拒绝，不静默排队——12.5）', async () => {
+    const { base } = await start(distWith('<!doctype html>'), 'tok', undefined, undefined, undefined,
+      undefined, undefined, undefined, {
+        requestSubtitleFetch: () => ({ outcome: 'already_running', detail: '该作品的字幕任务正在进行' }),
+      })
+    const res = await post(base, { workId: 'tmdb:1' })
+    expect(res.status).toBe(409)
+    expect(await res.json()).toMatchObject({ error: 'already running', reason: 'already-running' })
+  })
+
+  it('daemon 还在启动段 → 503 not ready', async () => {
+    const { base } = await start(distWith('<!doctype html>'), 'tok', undefined, undefined, undefined,
+      undefined, undefined, undefined, { requestSubtitleFetch: () => ({ outcome: 'not_ready' }) })
+    expect((await post(base, { workId: 'tmdb:1' })).status).toBe(503)
+  })
+
+  it('🔴 受理回执必须带受理语义：outcome + targets + skipped + queuedBehindRound（+ phase）', async () => {
+    const { base } = await start(distWith('<!doctype html>'), 'tok', undefined, undefined, undefined,
+      undefined, undefined, undefined, {
+        requestSubtitleFetch: () => ({
+          outcome: 'accepted_starting', targets: 1, skipped: 0, queuedBehindRound: true,
+        }),
+        startupPhase: () => 'backfill-embedded-langs',
+      })
+    const res = await post(base, { workId: 'tmdb:1', season: 1, episode: 3 })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({
+      ok: true, outcome: 'accepted_starting', targets: 1, skipped: 0,
+      queuedBehindRound: true, phase: 'backfill-embedded-langs',
+    })
+  })
+
+  it('未接 startupPhase 时回执里**不编**阶段名（键缺席，而不是 null）', async () => {
+    const { base } = await start(distWith('<!doctype html>'), 'tok', undefined, undefined, undefined,
+      undefined, undefined, undefined, {
+        requestSubtitleFetch: (): SubtitleFetchReceipt => ({ outcome: 'accepted', targets: 2, skipped: 3 }),
+      })
+    const res = await post(base, { workId: 'tmdb:1' })
+    const body = await res.json() as Record<string, unknown>
+    expect(body.outcome).toBe('accepted')
+    expect(body.targets).toBe(2)
+    expect(body.skipped).toBe(3)
+    expect(body.queuedBehindRound).toBe(false)
+    expect('phase' in body).toBe(false)
+  })
 })
