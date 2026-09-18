@@ -828,8 +828,12 @@ export function probeStagingPlacement(root: string): void {
   // 后端说有，rclone 把 409 上抛成 EIO）；探针目录名带 pid+计数器，**真建不出来时它并不存在**，
   // 故那条容错对它不生效、该抛还是抛——探针的判据强度没有被削弱。
   if (!stagingRootExisted) mkdirToleratingExisting(stagingRoot)
-  // 父目录补标记（不删）：父目录永驻之后它是稳态目录，缺了标记 Jellyfin 会扫进去。
-  if (!stagingRootExisted) ensureStagingMarker(stagingRoot)
+  // 父目录补标记（**无条件**，且不删它）：父目录永驻之后它是稳态目录，缺了标记 Jellyfin 会扫进去。
+  // ensureStagingMarker 自带 existsSync 短路，所以这不是每次 doctor 都写盘。
+  // 不能只在"刚建出来"时补——生产实测（第 27 轮）：父目录**可能先于**本次探针就存在
+  // （上一次任务/上一次探针留下的），而它当时是**空的**（没有标记）。只在新建分支补的话，
+  // 这种最长寿的稳态目录会永远缺标记。
+  ensureStagingMarker(stagingRoot)
   const probe = join(stagingRoot, `${PLACEMENT_PROBE_PREFIX}${process.pid}-${placementProbeCounter++}`)
   mkdirToleratingExisting(probe)
   try {
