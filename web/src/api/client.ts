@@ -4,6 +4,7 @@ import type {
   SubtitleVerifyListDTO,
   SubtitleCompareDTO,
   WorkflowPassDTO, RunTraceDTO, RedispatchInput, RedispatchOutcomeDTO,
+  TmdbSearchResultDTO,
   SettingsDTO, SettingsPatch, MediaRootDTO, RemoveRootResultDTO,
   AuthStatusDTO, AuthSecurityDTO,
   SetupStatusDTO, ProvidersDTO, PutSecretResultDTO, ValidateResultDTO, ValidateTarget, SecretName,
@@ -267,6 +268,28 @@ export const api = {
   // dashboard-F4：人类扳手①——手动重派。四态回执（created/revived/coalesced/blocked_dormant）
   // 都是 200，post() 的既有错误分支只在 zod 校验失败（400）/未配置（503）时触发。
   redispatch: (input: RedispatchInput) => post<RedispatchOutcomeDTO>('/api/v2/workflow/redispatch', input),
+  // ---------- 提案第 8 组：人工把一个认不出来的目录绑定到 TMDB 作品 ----------
+  // 三步：搜 TMDB → 用户挑一个 → 提交绑定。搜索端点是**只读代理**，服务端一直都有
+  // （`server.ts` 标注为 "只读搜索代理"）；它的前端消费方曾随「认领」退役，本组重新接上。
+  //
+  // ⚠️ `type` 是**必填**且只接受 'tv' | 'movie'（服务端 400 挡别的值）。用户不知道目录
+  // 是剧还是电影，所以弹窗两个都要能查——由 UI 决定怎么问（见 IdentifyBindDialog 的论证），
+  // 不在这里做隐式猜测。
+  tmdbSearch: (q: string, type: 'tv' | 'movie', signal?: AbortSignal) =>
+    get<{ results: TmdbSearchResultDTO[] }>(
+      `/api/v2/tmdb/search?q=${encodeURIComponent(q)}&type=${type}`,
+      signal,
+    ),
+  // 🔴 用户选定的 id **不是免检通道**：服务端会拿它过完整的机械核验（D-2/D-3/D-4 的全部证据腿）。
+  // 证据不过 → 422（可换一个 id 重试）；TMDB 侧问题 → 502；目录已识别 → 404；句柄畸形 → 400。
+  // 所以调用方**必须**把服务端那句 error 原样展示，不能自己编一句"绑定失败"——
+  // "你的 id 没过核验"与"这个目录已经被识别了"给用户的下一步动作完全不同。
+  identifyBind: (handle: string, tmdbId: string) =>
+    post<{ ok: true; tmdbId: string; written: number }>('/api/v2/identify/bind', { handle, tmdbId }),
+  // 撤销**只认** `work_id_source='human'` 的行（agent 的判定不许被这个端点抹掉）。
+  // 没有可撤销项时服务端报 409 —— 那是**正常结果**，不是错误。
+  identifyUnbind: (handle: string) =>
+    post<{ ok: true; cleared: number }>('/api/v2/identify/unbind', { handle }),
   // dashboard-F6：Settings tab——行为级设置读写 + 部署层只读展示 + 守备目录管理 + 目录浏览器。
   settings: (signal?: AbortSignal) => get<SettingsDTO>('/api/v2/settings', signal),
   // 单键提交（BehaviorSection 每行改动即时 PUT，body 只含那一个改动的键）；200 回执是写入后的

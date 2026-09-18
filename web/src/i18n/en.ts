@@ -716,6 +716,23 @@ export const en = {
   unidentified_note: "Still can't recognise these folders. A clearly recognisable name (like “title (year)”) helps most; after renaming, the next automatic check will retry them",
   /** 截断时的尾巴。`dirs` 只给前 8 个，总数一律读 dirCount（绝不用 dirs.length）。 */
   unidentified_more: 'and {n} more',
+  // ── Proposal group 8: point a folder at a TMDB work by hand (visible form of the D-5 endpoint).
+  // No internal vocabulary (handle / verifyEvidence / 422). `bind_failed` is a prefix — the caller
+  // appends the server's own message verbatim, because "didn't pass the checks (try another id)"
+  // and "this folder is already identified" call for completely different next steps.
+  bind_open: 'Say which work “{dir}” is',
+  bind_title: 'Pick the work',
+  bind_query_label: 'Search terms',
+  bind_type_label: 'Work type',
+  bind_type_tv: 'TV',
+  bind_type_movie: 'Movie',
+  bind_search: 'Search',
+  bind_searching: 'Searching…',
+  // Strictly separate from bind_no_results: one is "we never got an answer" (retry),
+  // the other is "we asked, there is none" (change the search terms).
+  bind_search_failed: 'Search failed',
+  bind_no_results: 'No such work found. Try different search terms or the other type',
+  bind_failed: "Couldn't bind",
   // 🔴-4: work recorded as failed that has not been retried since. States the fact only —
   // never promises a retry (untrue), never claims it will never retry (pins today's impl).
   stalled_jobs_note: '{n} task(s) recorded as failed',

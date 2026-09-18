@@ -628,6 +628,22 @@ export const zh = {
   // 诚实版：格式只是"最有帮助"，并交代改名后下轮巡检会重试。
   unidentified_note: '这些目录试过了还是认不出来。目录名清晰可辨（如「片名 (年份)」）最有帮助；改名后下轮巡检会重试',
   unidentified_more: '另外还有 {n} 个',
+  // ── 提案第 8 组：人工把目录指定到 TMDB 作品（D-5 端点的可见形态）────────────────
+  // 措辞纪律同本文件其余部分：不出现 handle/verifyEvidence/422 这类内部词。
+  // 🔴 但 `bind_failed` 后面**必须**接服务端原话（调用方拼的），不在这里写死一句
+  // "绑定失败"——"没过核验（可换个再试）"与"这个目录已经被识别了"给用户的下一步完全不同。
+  bind_open: '指定《{dir}》是哪部作品',
+  bind_title: '指定作品',
+  bind_query_label: '检索词',
+  bind_type_label: '作品类型',
+  bind_type_tv: '剧集',
+  bind_type_movie: '电影',
+  bind_search: '搜索',
+  bind_searching: '搜索中…',
+  // 与 bind_no_results 严格分开：一个"没问成"（可重试），一个"问到了、没有"（改检索词）。
+  bind_search_failed: '搜索失败',
+  bind_no_results: '没搜到这个作品。换个检索词或换个类型再试',
+  bind_failed: '没能绑定',
   // 🔴-4：记着失败、却再也没被重试的活。措辞纪律同上：不出现 job/queue/claim/
   // next_retry_at 这类内部词；也**不承诺**「它会重试」（那是假的），
   // 更不断言「永远不会」（那是把当前实现钉成结论）——只陈述"记着失败了、多久没动"。

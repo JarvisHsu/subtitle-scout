@@ -2713,6 +2713,49 @@ html {
    冒号，不存在同样的分辨负担。 */
 .wb-unidentified-paths { margin-left: 12px; }
 
+/* ── 提案第 8 组：目录名变成「指定作品」的入口（2026-09-18）────────────────────
+   为什么目录名本身当按钮，而不是另加一个「指定作品」按钮：
+   状态条那一行的排印语言是"一个标记 + 一句话 + 一串技术性读数"，再塞一个按钮会把
+   读数的连贯性打断。而这条提示**本来就在说"去改目录名"**——让名字自己可点，是把它
+   从"提到的东西"变成"能操作的东西"，形状没变、语汇也不用学第二套。
+   底/边框全去掉（不给它第二种"按钮"外观），只靠 pointer 与 hover 下划线表示可点——
+   与本仓 `button-variant-ghost` 的口径一致：状态行里的动作不该长得像主按钮。 */
+.wb-unidentified-dir {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+.wb-unidentified-dir:hover { text-decoration: underline solid; }
+.wb-unidentified-dir:focus-visible { outline: 2px solid var(--ring, currentColor); outline-offset: 2px; }
+
+/* 弹窗内部。目录名走 mono（同名单里那套"技术性读数"的排印语言）；
+   检索行是一行三件（输入 + 类型二选一 + 搜索），窄屏折行。 */
+.wb-bind-dir { font-family: var(--font-mono, ui-monospace, monospace); word-break: break-all; }
+.wb-bind-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
+.wb-bind-form > input { flex: 1 1 220px; }
+.wb-bind-type { display: inline-flex; gap: 4px; }
+.wb-bind-results { max-height: 320px; overflow-y: auto; }
+.wb-bind-msg { margin: 8px 0; font-size: 0.9em; }
+.wb-bind-error { color: var(--destructive, #e5484d); }
+.wb-bind-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.wb-bind-hit {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 6px 8px; text-align: left; cursor: pointer;
+  font: inherit; color: inherit; background: none;
+  border: 1px solid var(--border, #26282f); border-radius: 6px;
+}
+.wb-bind-hit:hover { background: var(--accent, rgba(255, 255, 255, 0.06)); }
+.wb-bind-hit:disabled { opacity: 0.5; cursor: default; }
+.wb-bind-poster { width: 28px; height: 42px; object-fit: cover; border-radius: 3px; flex: none; }
+.wb-bind-hit-name { flex: 1 1 auto; }
+.wb-bind-hit-year { color: var(--muted-foreground, #8b8f98); }
+.wb-bind-hit-id { font-family: var(--font-mono, ui-monospace, monospace); font-size: 0.8em; color: var(--muted-foreground, #8b8f98); }
+
 /* 🟡-3 海报卡上的缺集数（missingEpisodeCount 的第一个读取方，终局审计）。
    ── 为什么单独一行、且不是 mono ────────────────────────────────────────────
    上面那串（`subtitled 12 · on disk 30 · expected 62`）是**读数**，走 mono；

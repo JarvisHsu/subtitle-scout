@@ -495,8 +495,13 @@ function StatusBar({
           紧挨 RootHealthNote 是刻意的：那一行说"引擎**看不看得见**我的库"，这一行说
           "引擎**认不认得**我库里的东西"——同一个问题的第四个侧面，同形同语汇。
           dirCount 为 0 时组件自己返回 null，认得出来的库一个字都不占屏。
-          ⚠️ 这里**不给任何按钮**（R-F1「未识别资源不给用户改」）——完整论证见组件头注释。 */}
-      <UnidentifiedNote unidentified={health?.unidentified} />
+          ⚠️ 2026-09-18 变更（提案第 8 组）：这里**多了一个动作**——目录名可点，点开是
+          「指定作品」（`POST /api/v2/identify/bind`）。此前那句"这里不给任何按钮（R-F1）"
+          已按新前提推翻，完整论证见组件头注释（含为什么 R-F1 否掉的另外两个按钮
+          依然不许加回来）。
+          `onBound={reloadHealth}`：绑定成功后立刻重拉 `/health`，让那一行从名单里消失。
+          **不靠 SSE 撞运气**——本仓病 A 就是"加了能力却没定谁触发"。 */}
+      <UnidentifiedNote unidentified={health?.unidentified} onBound={reloadHealth} />
 
       {/* 🔴-4 记着失败、却再也没被重试的活。紧挨上面两行是刻意的：那两行说
           "引擎看不看得见 / 认不认得我的库"，这一行说"引擎记着有活没干完"——

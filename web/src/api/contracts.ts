@@ -93,6 +93,14 @@ export const HEALTH_SHAPE: Shape = obj({
   unidentified: obj({
     dirCount: num(),
     dirs: arr(obj({ dirName: str(), fileCount: num() })),
+    // 🔴 `dirs[].handle`（提案第 8 组的人工绑定句柄）**刻意不声明**——按本文件的判据它不是致命字段：
+    //  · 判据①不占：它只被解引用一层，且 `UnidentifiedNote` 按 `if (d.handle)` 降级
+    //    （缺席 → 那个目录不显示"指定作品"入口），**不崩页**。
+    //  · 判据②不占：它不是全局壳的判决源。
+    //  · 判据③不占：它缺席不影响这一段的"有几个目录认不出来"这个主结论。
+    // 声明它反而有害：老后端（或 handle 尚未接线）会让整条提示被拦下来，
+    // 而那正是本文件开头论证过的"拿少一个按钮换整条提示不可用"。
+    // 故降级路径写在消费点，不写在这里。
   }),
   // 🔴-4。**不声明**：老后端缺这个字段时 `StalledJobsNote` 的 `if (!stalledJobs) return null`
   // 会整段不渲染——那是正确的降级（不知道就不说话，同 RootHealthNote 的既有口径）。

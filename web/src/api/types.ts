@@ -400,15 +400,42 @@ export interface ScoutCurrentsDTO {
   translate: ScoutCurrentDTO | null
 }
 
-/** 一个认不出来的作品目录。**刻意只有两个字段**——后端点名的信息量边界
+/** 一个认不出来的作品目录。**字段面是后端点名的信息量边界**
  *  （R-F9/R-F10：last_error / attempt / next_retry_at / 绝对路径全是排障读数，不出）。 */
 export interface UnidentifiedDirDTO {
   /** 目录名（`work_dir` 最后一段），**不是绝对路径**。用户要改名的就是这个东西。 */
   dirName: string
   fileCount: number
+  /** 人工绑定时回传给 `POST /api/v2/identify/bind` 的**不透明句柄**（提案 §7.1）。
+   *
+   *  🔴 语义是「服务端生成的**摘要**」，前端只当它是一串字符串原样回传，**不解释、不拆解**。
+   *  它是 `base64url(sha256(work_dir))`——不含路径信息（D-5 第一版用的 `base64url(work_dir)`
+   *  可逆，已按规格收回）。服务端反查靠拿候选集撞摘要，所以它只对**当前仍未被识别**的目录有效。
+   *
+   *  ⚠️ **可选**，这是刻意的，不是历史遗留：
+   *   · 老后端（或 handle 尚未接线）不提供它 → 前端按 `if (d.handle)` 降级成**纯文本目录名**
+   *     （「指定作品」入口不渲染）。渲一个点了会 400 的按钮是在骗用户。
+   *   · 所以 `api/contracts.ts` 也**刻意不把它声明成致命字段**——见那处注释。
+   *  写成必填会强迫所有既有测试夹具补一个假值，而那些夹具测的根本不是绑定功能。
+   *
+   *  ⚠️ 它不是权限凭据：能不能绑由服务端另行判定（目录必须真的未识别）。 */
+  handle?: string
 }
 
-/** 「有几个目录我认不出来」。
+/** `GET /api/v2/tmdb/search` 的一个结果项。
+ *
+ *  ⚠️ 这个 DTO 曾随「认领」（ClaimDialog）退役而删除（见本文件上方那条墓碑注释）。
+ *  提案第 8 组重新需要它——人工绑定必须先让用户在 TMDB 上查到作品再拿 id。
+ *  服务端端点一直都在（`server.ts` 的 `GET /api/v2/tmdb/search`，标注为"只读搜索代理"），
+ *  退役的只是**前端消费方**。 */
+export interface TmdbSearchResultDTO {
+  id: number
+  name: string
+  year: number | null
+  posterPath: string | null
+}
+
+/** 🔴 「有几个目录我认不出来」。
  *
  *  ⚠️ 渲染纪律：`dirCount === 0` 时**整段不渲染**（沉默即好消息，同 RootHealthNote）。
  *  `dirs` 是**截断**的（后端上限 8），说"有几个"一律用 `dirCount`，
