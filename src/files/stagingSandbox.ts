@@ -222,6 +222,26 @@ export function isStagingHusk(dir: string): boolean {
   return prefix !== null && prefix.startsWith(HUSK_MARKER_PREFIX)
 }
 
+/** 沙盒目录里**还有残留**吗：除 `.ignore` 标记之外还有别的条目（= 有 `<jobId>` 剩下来）。
+ *  目录不存在 / 读不出来 → false（"不知道"不能当"有"，同 isStagingHusk 的代价不对称口径）。
+ *
+ *  ── 为什么这个判据取代了 isStagingHusk 当"残留"的判据（2026-09-18 第 27 轮）────────
+ *  `isStagingHusk` 说的是"**只剩**一个标记文件"——在父目录**会被收掉**的旧设计下，
+ *  那正是"可以删的空壳"。现在父目录**永驻**（见 cleanup ②），那句描述的是**正常稳态**：
+ *  拿它当垃圾判据就会每轮 boot 把正常目录删一次（并重新打开 #14 的窗口）。
+ *  而用户真正看到的是**残留**：媒体根里躺着带 `<jobId>` 子目录的隐藏文件夹（#15）。
+ *  这个函数回答的正是那件事——它也顺带补上了 `staging-husks` 检查原来的盲区（#16）：
+ *  "有 jobId 残留"这种形态以前**报不出来**（isStagingHusk 在那种情况下恒 false）。 */
+export function hasStagingLeftovers(dir: string): boolean {
+  let entries: Dirent[]
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return false
+  }
+  return entries.some((e) => e.name !== '.ignore')
+}
+
 /** 尽力 fsync 目录:rename 落盘后目录 inode 本身(条目指针)也该 fsync 一次,防止断电场景下
  *  目录项没跟着落盘、重启后 rename "消失"。部分平台/文件系统(Windows、部分 FUSE/SMB 挂载)不
  *  支持对目录 fd 调 fsync——那类环境直接吞掉失败,不让这个尽力而为的加固步骤反噬本已成功的安装。 */
@@ -354,18 +374,24 @@ export function cleanup(jobId: string, mediaRootForVideo: string): void {
   } catch {
     // 复核本身失败（目录读不出来等）不该反噬主流程；上面的日志已经覆盖了"删不掉"这一主要情形
   }
-  // ② 收尾父目录：只在"此刻只剩我们自己写的那一个标记文件"时才动手。
-  try {
-    if (!isStagingHusk(root)) return // 还有别的 jobId / 任何残留条目 → 原地保留（含标记）
-    unlinkSync(join(root, '.ignore'))
-    try {
-      rmdirSync(root) // 原子判据：此刻若冒出新 <jobId> 会 ENOTEMPTY，绝不连根删掉在用沙盒
-    } catch {
-      ensureStagingMarker(root) // 父目录仍在用 → 标记必须立刻补回，不留屏蔽空窗
-    }
-  } catch {
-    // best-effort：收尾失败只留一个空壳（= 本变更之前的行为），由 gcOrphans / doctor 兜底
-  }
+  // ② 收尾父目录：**不再删除它**（2026-09-18 第 27 轮，#14 的根因修法）。
+  //
+  // ── 为什么把这里从"空了就删"改成"永驻" ────────────────────────────────────
+  // 旧口径（fix-staging-husk-leak 的 design D3）：父目录只剩 `.ignore` 时连标记一起收掉。
+  // 它在**本地文件系统**上完全正确，但在这个后端上有一个致命的副作用：
+  //   `allocate()` 建 `<root>/.subtitle-staging/<jobId>/` 是**两级** MKCOL，而这一层父目录
+  //   在**刚被删除后的一段时间里**（实测以**分钟**计）无法作为父目录被解析 → 子目录 MKCOL
+  //   得到 409 → rclone 上抛成 **EIO** → 装盘前置直接抛错（#14）。而"每个任务收尾都会把父目录删掉、
+  //   下一个任务立刻重建"意味着**每个任务都重新打开一次这个窗口**——这才是它会反复发作的机制。
+  //   第 23 轮的受控实测：3 次「删父目录 → 立刻建」3 次都失败，重试 3 次 ×2 也全部失败。
+  // 故：父目录**建一次就留着**。窗口只在"这个根**有史以来第一次**建沙盒"时出现一次，
+  // 而 `mkdirToleratingExisting` 的短重试足以覆盖那一档（毫秒级视图滞后）。
+  //
+  // ── 代价（如实记，不许下一个人替我辩护）──────────────────────────────────
+  // 每个媒体根常驻**一个**隐藏目录 `.subtitle-staging/`（内含 `.ignore`，Jellyfin 不扫）。
+  // 与用户最初抱怨的"36 个残留"**不是同一量级**：那些是**每个视频目录**下各一个（旧设计），
+  // 这是**每个媒体根**一个。取舍已在 `issues.md` #14 里写明：常量代价 2 个 vs 装盘路径不再有窗口。
+  ensureStagingMarker(root)
 }
 
 export interface InstallOptions {
@@ -648,8 +674,10 @@ function walkForHusks(dir: string, found: Set<string>, visited: Set<string>): vo
     if (entry.name === STAGING_DIRNAME || entry.name === TRANSLATE_STAGING_DIRNAME) {
       // 🔴 顺序要紧：先认沙盒目录名、再判垃圾前缀。两个名字都是点前缀，被下面的
       // isJunkDirName 剪掉就永远找不到它们了。
-      if (isStagingHusk(full)) found.add(full)
-      continue // 无论是不是空壳都不下钻——沙盒内部不是媒体树
+      // 判据是"**有残留**"（除标记文件之外还有条目），见 hasStagingLeftovers 的论证：
+      // 父目录永驻之后，"只剩标记"是正常稳态，不再是可回收物。
+      if (hasStagingLeftovers(full)) found.add(full)
+      continue // 无论是不是残留都不下钻——沙盒内部不是媒体树
     }
     if (isJunkDirName(entry.name)) continue
     walkForHusks(full, found, visited)
@@ -715,17 +743,18 @@ export function gcOrphans(mediaRoots: string[], activeJobIds: ReadonlySet<string
     return false
   }
 
-  // ① 任意深度的空壳（只剩标记文件的沙盒根）。**不含 <jobId> 的沙盒一律不碰**——
-  //    深层只收空壳，扩大删除面要另案论证（design Non-Goals）。
-  for (const husk of findStagingHusks(mediaRoots)) {
-    try {
-      if (shouldKeep(husk)) continue
-      rmSync(husk, { recursive: true, force: true })
-      cleaned++
-    } catch {
-      // best-effort:单个空壳清理失败不影响其它空壳/其它根
-    }
-  }
+  // ① **已删除**（2026-09-18 第 27 轮）——旧口径是"任意深度的空壳（只剩标记的沙盒根）也要收掉"。
+  //
+  //  为什么删掉它：父目录现在**永驻**（见 cleanup ② 的论证），于是"只剩一个标记文件的
+  //  `.subtitle-staging/`"正是**正常稳态**，而不是垃圾。保留 ① 的后果是每次 boot 都把那个
+  //  正常目录删一次——既重新打开了 #14 那个"刚删过的父目录当不了父目录"的窗口，
+  //  又让 doctor 的 `staging-husks` 把稳态报成残留。
+  //
+  //  ⚠️ 这一刀是**收窄**删除面而不是扩大：旧 ① 是全文最宽的删除面（任意深度、`rm -rf`），
+  //  而它唯一不可替代的服务对象是"旧设计散落在视频目录里的空壳"——那个形态由
+  //  `fix-staging-husk-leak` 之后就再没有任何代码路径能造出来了，生产实测也是 0 个
+  //  （第 20 轮 7.4 双视角核对）。现在只剩 ②：根一级的直接子条目，逐字未改。
+  //  若将来真在深层发现残留，它由 `findStagingHusks` **报出来**（doctor / 人工），不再自动删。
 
   // ② 根一级条目清扫：既有行为，逐字保留（含"从不删 .subtitle-staging 这一层自身"——
   //    这一层由 ① 在确认它只剩标记文件后负责收掉）。
@@ -777,17 +806,20 @@ let placementProbeCounter = 0
  *  `cleanup` 的留痕日志负责。把这条写在这里，是为了防止下一个读者看到"doctor ✓"就以为
  *  "盘上一定建得出冒号目录"。
  *
- *  ── 清理口径 ────────────────────────────────────────────────────────
+ *  ── 清理口径（2026-09-18 第 27 轮修订：**不再回删父目录**）──────────────────
  *  best-effort（同 isDirWritable 的 2026-07-29 事故口径：判据只看"建得出"，删除失败不改结论）。
- *  探针目录建不出来时 mkdirToleratingExisting 会（重试后仍不成而）先抛，此时不留任何东西。清理失败留下的空目录由 gcOrphans ②
- *  兜底收（在 `.subtitle-staging/` 一层、名字不匹配在飞集合、也不会被 gcOrphans ① 当空壳——它
- *  不是沙盒根）。**父目录是本探针顺手建的时候（此前不存在）才回删它**：否则 doctor 会留下一个
- *  0 条目的 `.subtitle-staging/`，而它既不是空壳（isStagingHusk 要求恰好一个 `.ignore`）也不在
- *  任何回收面的判据里，会永久留着。 */
+ *  探针目录建不出来时 mkdirToleratingExisting 会（重试后仍不成而）先抛，此时不留任何东西。
+ *  探针目录自己删掉；**父目录 `.subtitle-staging/` 一旦建出来就留着**，并顺手补上 `.ignore`。
+ *
+ *  为什么改掉"父目录是本探针顺手建的就回删它"：父目录现在**永驻**（见 cleanup ② 的完整论证）。
+ *  探针每次运行都"建父目录 → 删父目录"，等于**每跑一次 doctor 就重新打开一次 #14 那个
+ *  「刚动过的父目录当不了父目录」的窗口**——而探针正是来查这个窗口的，它在**制造**自己要查的东西。
+ *  实测（第 23 轮）：连续 3 次「删父目录 → 立刻 doctor」把 `Mediary Scout` 打进一个持续数分钟的 ✗。
+ *  留着它还有个副作用：稳态下每个媒体根常驻一个带 `.ignore` 的隐藏目录，Jellyfin 本来就不扫。 */
 export function probeStagingPlacement(root: string): void {
   const stagingRoot = join(root, STAGING_DIRNAME)
-  // existsSync 在 FUSE/网盘上也只有本地视图可信——但这里问的是"父目录本来在不在"，
-  // 判错的后果只是"该不该回删父目录"，不影响探针结论。
+  // existsSync 在 FUSE/网盘上也只有本地视图可信——但这里问的是"要不要建"，判错只会多一次
+  // mkdirToleratingExisting（它容"后端已存在"），不影响探针结论。
   const stagingRootExisted = existsSync(stagingRoot)
   // 🔴 两级都**不使用** recursive：媒体根不存在（未挂载/挂错）时必须抛 ENOENT，而不是顺着
   // 递归把挂载点当普通目录建出来——那会在宿主上凭空造出一个同名的本地空目录，把"盘没挂上"
@@ -796,11 +828,12 @@ export function probeStagingPlacement(root: string): void {
   // 后端说有，rclone 把 409 上抛成 EIO）；探针目录名带 pid+计数器，**真建不出来时它并不存在**，
   // 故那条容错对它不生效、该抛还是抛——探针的判据强度没有被削弱。
   if (!stagingRootExisted) mkdirToleratingExisting(stagingRoot)
+  // 父目录补标记（不删）：父目录永驻之后它是稳态目录，缺了标记 Jellyfin 会扫进去。
+  if (!stagingRootExisted) ensureStagingMarker(stagingRoot)
   const probe = join(stagingRoot, `${PLACEMENT_PROBE_PREFIX}${process.pid}-${placementProbeCounter++}`)
   mkdirToleratingExisting(probe)
   try {
     rmdirSync(probe)
-    if (!stagingRootExisted) rmdirSync(stagingRoot) // 非空即失败（别人刚建了沙盒）→ 忽略，正确
   } catch {
     console.error(
       `placement probe left behind: ${probe}（删除失败）。best-effort：结论不受影响，` +
