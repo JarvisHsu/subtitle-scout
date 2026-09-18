@@ -789,7 +789,17 @@ export class ScoutDaemonV2 {
     // （spec 明写）在实现层的唯一保证者——mapWithConcurrency 是 allSettled，单文件失败进不到
     // 这里，但 pass 级别的爆炸（库被锁、PRAGMA 读不出）会。
     try {
-      this.enterStartupStep('backfill-embedded-langs'); await this.backfillEmbeddedLangs()
+      // 🔴 #20（2026-09-18 第 38 轮）：**不再 await** —— 这一支实测吃掉 **7 分 01 秒 / 12 分 15 秒**
+      // （第 37 轮的 boot 时间线：每次都只有 **3 行**，而它是逐行 ffprobe 走 FUSE；本仓多处注释
+      // 记过"probe 在 FUSE 上代价放大约 46 倍"）。它阻塞的正是**"重启之后多久才能开始扫盘/找字幕"**
+      // ——而这一程部署了十几次，每次都白等这几分钟。
+      // 改成后台 pass：主循环立刻开跑，回填在后台慢慢追。缺了它只是详情页晚几分钟显示"已判定"，
+      // 下一轮巡检照样重判（judgeOnce 的输入就是这一列）；`.catch` 仍留痕，只是不再阻塞
+      // （与 translateLoop 那条并行车道的隔离口径一致）。
+      this.enterStartupStep('backfill-embedded-langs')
+      void this.backfillEmbeddedLangs().catch((e) => {
+        this.deps.log(`warn: boot embedded_langs 回填失败（隔离，不阻塞巡检，下次启动重试）: ${String(e)}`)
+      })
     } catch (e) {
       this.deps.log(`warn: boot embedded_langs 回填失败（隔离，不阻塞巡检，下次启动重试）: ${String(e)}`)
     }
