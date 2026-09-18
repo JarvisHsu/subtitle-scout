@@ -175,6 +175,37 @@ export function verifyEvidence(
   // 它修的是扁平文件目录（`01.mp4`、无季子目录）那一类——`hasSeasonDirs` 为假，
   // 原来一律落进下面那条 movie 分支或最终拒绝。
   if (dirFacts.dirHasSeasonToken === true && candidate.mediaType === 'tv') return { ok: true }
+  //  - 集数（D-3.4，2026-09-18）：**单季最大集数**与文件数同数量级。
+  //
+  //  它补的是哪一个洞（生产实案）：`G 爱G公寓5 (2020)`（36 文件）标题证据充分，却四条腿
+  //  一条都不命中——目录名里是**裸数字**季号，而 D-4 刻意不把裸数字当季号
+  //  （防 `2004`/`265`/`521G` 误判），于是它既无季子目录、又无合法季标记、年份也对不上。
+  //
+  //  🔴 **用"单季最大集数"，不用全剧总量**（`number_of_episodes`）。理由是生产实况：
+  //  `12.Monkeys` 的 S01–S04 是四个独立 work_dir、爱情公寓的 2/3/4/5 季也各自一个——
+  //  **一个 work_dir 几乎总是一部剧的一季**。拿全剧总量去比会把"同数量级"撑到
+  //  `36 vs 100+` 也算成立，而那种判据对错误 id 毫无约束力。
+  //
+  //  容差 `[0.5×, 2×]` 是"同数量级"的具体化，两端都有理由：
+  //   · **下界必须存在**：只有上界的话，1 个文件的垃圾目录会匹配上任何"集数 ≥1"的剧
+  //     （生产里那 3 个垃圾目录正是 1–3 文件）。
+  //   · **下界取 0.5 而不是更高**：生产里存在"一个目录装两三季"的形状
+  //     （`[毒枭][全1-3季]` 30 文件），按"一季"卡死会把它排除。
+  //   · **movie 永不适用**：④已覆盖纯电影，这条腿加进去只会放大 movie 的放行面。
+  //  ⚠️ 已知残余：fileCount=2–3 的目录若该剧单季恰为 4–6 集仍可能命中。接受它——
+  //     它们还必须**同时**过标题腿。反例表见 ops 的 task-3.4-decision.md。
+  if (
+    candidate.mediaType === 'tv'
+    && candidate.episodeCount !== undefined
+    // 🔴 **`>= 2` 而不是 `> 0`**（我自己的测试当场逮住）：`episodeCount === 1` 时
+    // 下界 `ceil(0.5×1) = 1`、上界 `2` —— 于是**一个 1 文件的垃圾目录会匹配上"单季 1 集"的作品**。
+    // 而"1 个文件 ≈ 1 集"这条判据携带的信息约等于零，恰恰是生产里垃圾目录的形状
+    // （`龙餐馆` / `路=之-刹` / `B 侠G猎车手6…实机赏析` 都是 1–3 文件）。
+    // 单季 1 集的作品极少，放弃它换"垃圾不误放"是划算的。
+    && candidate.episodeCount >= 2
+    && dirFacts.fileCount >= Math.ceil(0.5 * candidate.episodeCount)
+    && dirFacts.fileCount <= 2 * candidate.episodeCount
+  ) return { ok: true }
   if (!dirFacts.hasSeasonDirs && candidate.mediaType === 'movie' && dirFacts.fileCount <= 10) {
     return { ok: true }
   }

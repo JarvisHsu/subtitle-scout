@@ -433,6 +433,7 @@ async function cmdWatch() {
               // provider_ids=null（留给回填 pass 重试）。在这里再兜一层会把"失败"伪装成
               // "TMDB 确认没有"，那一行从此永久收敛、永不重试。
               getExternalIds: (mt, id) => tmdb.getExternalIds(mt, id),
+
               // R-F5 接线：季集表采集，供 daemonV2.backfillSeasonCatalog 把 TMDB 应有集写进
               // tmdb_seasons（媒体库页虚线小卡片的数据来源）。**与上一行同一个坑的第六次**：
               // deps 上它是 optional，漏接线时回填 pass 整支静默休眠（探针缺席不动列），

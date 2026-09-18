@@ -63,6 +63,7 @@ export interface IdentifyWorkerDeps {
      *  让 external_ids 的一次 5xx 把整次识别打回退避轨，代价是一整个作品目录明天才重试、
      *  外加一次白烧的付费 LLM session。 */
     getExternalIds?: (mediaType: 'tv' | 'movie', tmdbId: string) => Promise<{ imdbId: string | null }>
+
     /** 季表 + 逐季集清单（`/tv/{id}`、`/tv/{id}/season/{n}`，tmdb.ts:203/381）——R-F5 应有集
      *  缓存（tmdb_seasons）的采集来源，供媒体库页画"TMDB 说这季有、磁盘上没有"的虚线小卡片。
      *

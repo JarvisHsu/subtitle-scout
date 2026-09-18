@@ -185,12 +185,31 @@ export async function runIdentifyWorkDir(
       // 两种类型都查过 → 这才是真·404
       return { ok: false as const, error: 'tmdb-404' }
     }
+    // 提案 3.4：剧集取一次季表，算**单季最大集数**（判据与理由见 identify.ts 的第 ⑤ 条腿
+    // 与 ops 的 task-3.4-decision.md）。取不到 → **不填**，那条腿不参与、行为与改动前逐字一致。
+    // 整支 try 住：季表是**增益**，它挂了不该把一次成功的识别打回退避轨。
+    let episodeCount: number | undefined
+    if (mediaType === 'tv' && deps.worker.tmdb.getSeasonTable) {
+      try {
+        const table = await deps.worker.tmdb.getSeasonTable(input.tmdbId)
+        // **排除 season 0**：TMDB 用它装"特别篇"，那不是一季的集数。拿它算 max 会让
+        // 一个"特别篇有 30 集"的作品凭特典集数放行一个 30 文件的目录。
+        const seasonsOnly = table ? table.filter((s) => s.seasonNumber > 0) : []
+        if (seasonsOnly.length > 0) {
+          const max = Math.max(...seasonsOnly.map((s) => s.episodeCount))
+          // 只接受有限正整数：季表里出现 NaN/0/负数时**不填**而不是填它——
+          // 填 0 会让"集数>0"的前置恒假（腿永久失效），填负数会让下界恒真（凭空放行）。
+          if (Number.isFinite(max) && max > 0) episodeCount = max
+        }
+      } catch { /* 季表缺席/失败 = 这条腿不参与，绝不是"集数为 0" */ }
+    }
     const evidence: TmdbEvidence = {
       id: input.tmdbId,
       title: details.title,
       originalTitle: details.originalTitle ?? null,
       year: details.year,
       mediaType,
+      episodeCount,
     }
     const check = verifyEvidence(evidence, {
       dirName: facts.dirName,

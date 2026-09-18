@@ -453,3 +453,69 @@ describe('applyYearFolderTypoGate', () => {
     expect(out.no_safe_match).toHaveLength(1)
   })
 })
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 提案 3.4（2026-09-18）：`episodeCount` 结构证据腿。
+//
+// 🔴 验收标准不是"救回了那个实案"，而是「**救回它的同时，四条反例一条都没被误放**」
+//    ——这条腿**只增加放行面、不减少**，所以反例断言才是它的真正护栏。
+//    判据与反例表见 ops/servers/43.134.191.43/task-3.4-decision.md。
+//
+// 测试构造法：让**标题腿通过**（candidate.title === targetTitle），把年份设成与目录名不同、
+// 且 dirFacts 无季子目录/无季标记 → 于是 ②③④ 与年份腿全部不命中，
+// **只剩第 ⑤ 条腿能决定结果**。这样每条断言都精确地测第 ⑤ 条。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('verifyEvidence · 第 ⑤ 条腿：单季最大集数（提案 3.4）', () => {
+  const flat = (fileCount: number, dirName = 'iPartment') => ({
+    dirName, fileCount, seasons: [] as number[], hasSeasonDirs: false,
+    fileTitles: [] as string[], dirHasSeasonToken: false,
+  })
+  const cand = (episodeCount?: number) => ({
+    id: 'tmdb:68809', title: 'iPartment', originalTitle: 'iPartment',
+    year: 2011,            // ≠ 目录名里的年份（若有）→ 年份腿不命中
+    mediaType: 'tv' as const, episodeCount,
+  })
+
+  it('✅ 救回实案 `G 爱G公寓5 (2020)`：36 文件 vs 单季 36 集 → 过', () => {
+    const r = verifyEvidence(cand(36), flat(36, 'G 爱G公寓5 (2020)'), 'iPartment', [])
+    expect(r.ok).toBe(true)
+  })
+
+  it('🔴 反例一：同一目录绑到**单季 10 集**的另一部剧 → 必须拒（36 不在 [5,20]）', () => {
+    const r = verifyEvidence(cand(10), flat(36, 'G 爱G公寓5 (2020)'), 'iPartment', [])
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toContain('no independent structural evidence')
+  })
+
+  it('🔴 反例二：合集目录（2 文件）配单季 13 集的剧 → 必须拒（2 不在 [7,26]）', () => {
+    const r = verifyEvidence(cand(13), flat(2, '惩罚者 两部合集 4K REMUX原盘'), 'iPartment', [])
+    expect(r.ok).toBe(false)
+  })
+
+  it('🔴 反例三：垃圾目录（1 文件）配任何多集剧 → 必须拒（下界挡住了它）', () => {
+    for (const ep of [1, 5, 10, 40]) {
+      const r = verifyEvidence(cand(ep), flat(1, '龙餐馆'), 'iPartment', [])
+      expect(r.ok).toBe(false)
+    }
+  })
+
+  it('🔴 反例四：movie **永不**走这条腿（episodeCount 再匹配也不放行）', () => {
+    const movieCand = { ...cand(36), mediaType: 'movie' as const }
+    // movie + 36 文件：④要求 fileCount ≤ 10，故也不命中 → 必须拒
+    expect(verifyEvidence(movieCand, flat(36, 'iPartment'), 'iPartment', []).ok).toBe(false)
+  })
+
+  it('🔴 episodeCount 缺席（季表取不到）→ 行为与改动前**逐字一致**（腿不参与）', () => {
+    const r = verifyEvidence(cand(undefined), flat(36, 'G 爱G公寓5 (2020)'), 'iPartment', [])
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('no independent structural evidence (year/type/episodes)')
+  })
+
+  it('边界：正好 0.5× 与 2× 都算同数量级（含边界，不是开区间）', () => {
+    expect(verifyEvidence(cand(72), flat(36, 'x'), 'iPartment', []).ok).toBe(true)   // 36 === 0.5×72
+    expect(verifyEvidence(cand(18), flat(36, 'x'), 'iPartment', []).ok).toBe(true)   // 36 === 2×18
+    expect(verifyEvidence(cand(73), flat(36, 'x'), 'iPartment', []).ok).toBe(false)  // 36 < ceil(36.5)=37
+    expect(verifyEvidence(cand(17), flat(36, 'x'), 'iPartment', []).ok).toBe(false)  // 36 > 34
+  })
+})
