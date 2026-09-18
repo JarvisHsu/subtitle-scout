@@ -681,40 +681,40 @@ function latestMtimeMs(dir: string): number {
  *  doctor 只报告不删（design D5）。
  *
  *  返回去重后的绝对路径（配置根嵌套时同一棵树不会被走两遍，也不会重复上报同一个空壳）。 */
+ *  🔴 **2026-09-18 第 35 轮（#19）：改为只扫根一级，不再递归。**
+ *  旧的递归版会**走完整棵媒体树**——在这一仓的 FUSE 挂载上那正是"全库遍历会超时"那条红线，
+ *  而它**在 boot 里跑**（`gcStaging`）且**一行日志都不打**：实测每次重启都会撞上
+ *  **8~15 分钟"日志全黑"**的窗口，让人分不出"正在走"与"卡死了"（#19 的完整证据）。
+ *  递归本来就是为**旧设计**准备的（空壳散落在视频目录 1–4 层）；沙盒现在只可能在**根一级**
+ *  （`<root>/.subtitle-staging/<jobId>`），而那个旧形态自 `fix-staging-husk-leak` 后再无代码路径
+ *  能造出来（第 20 轮实测 0 个，第 27 轮又把 GC ① 段整段删了）。所以每次 boot
+ *  从"走完整棵树"降到"**每个根两次 readdir**"。
+ *
+ *  代价如实记：**深层残留不再被自动发现**（若将来真出现，它由 doctor 报不出来、
+ *  只能靠人看——这条取舍写在这里，免得下一个人以为函数坏了）。 */
 export function findStagingHusks(roots: string[]): string[] {
   const found = new Set<string>()
-  const visited = new Set<string>()
   for (const root of roots) {
-    walkForHusks(resolve(root), found, visited)
+    const base = resolve(root)
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(base, { withFileTypes: true })
+    } catch (e) {
+      // 单个根读不出来（权限/挂载抖动/坏点）只记日志继续——不让一棵坏树中断整轮回收
+      console.error(`staging-husk scan: skip unreadable path ${base}: ${e instanceof Error ? e.message : String(e)}`)
+      continue
+    }
+    for (const entry of entries) {
+      // Dirent 口径（lstat）：符号链接的 isDirectory() 为 false → 天然不跟随链接。
+      if (!entry.isDirectory()) continue
+      if (entry.name !== STAGING_DIRNAME && entry.name !== TRANSLATE_STAGING_DIRNAME) continue
+      // 🔴 顺序要紧：先认沙盒目录名、再看垃圾前缀。两个名字都是点前缀，被
+      // isJunkDirName 剪掉就永远找不到它们了。
+      const full = join(base, entry.name)
+      if (hasStagingLeftovers(full)) found.add(full)
+    }
   }
   return [...found]
-}
-
-function walkForHusks(dir: string, found: Set<string>, visited: Set<string>): void {
-  if (visited.has(dir)) return
-  visited.add(dir)
-  let entries: Dirent[]
-  try {
-    entries = readdirSync(dir, { withFileTypes: true })
-  } catch (e) {
-    console.error(`staging-husk scan: skip unreadable path ${dir}: ${e instanceof Error ? e.message : String(e)}`)
-    return
-  }
-  for (const entry of entries) {
-    // Dirent 口径（lstat）：符号链接的 isDirectory() 为 false，因此天然不跟随链接。
-    if (!entry.isDirectory()) continue
-    const full = join(dir, entry.name)
-    if (entry.name === STAGING_DIRNAME || entry.name === TRANSLATE_STAGING_DIRNAME) {
-      // 🔴 顺序要紧：先认沙盒目录名、再判垃圾前缀。两个名字都是点前缀，被下面的
-      // isJunkDirName 剪掉就永远找不到它们了。
-      // 判据是"**有残留**"（除标记文件之外还有条目），见 hasStagingLeftovers 的论证：
-      // 父目录永驻之后，"只剩标记"是正常稳态，不再是可回收物。
-      if (hasStagingLeftovers(full)) found.add(full)
-      continue // 无论是不是残留都不下钻——沙盒内部不是媒体树
-    }
-    if (isJunkDirName(entry.name)) continue
-    walkForHusks(full, found, visited)
-  }
 }
 
 /** activeJobIds 收成 `ReadonlySet`（2026-08-08 第 2 步 / C34）：本函数只对它调 `.has()`，
