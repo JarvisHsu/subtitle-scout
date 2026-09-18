@@ -235,9 +235,15 @@ export function checkMediaRoots(
 /** 报告样例上限：残留可能是几十上百条，报告里列全了会把其余检查项挤出屏幕。 */
 const MAX_LISTED_HUSKS = 5
 
-/** 只读检查：媒体根下**任意深度**的空壳沙盒（只剩一个 `.ignore` 标记的
- *  `.subtitle-staging` / `.subtitle-translate` 目录）。这些是任务收尾没做干净、或历史版本
- *  遗留的净残留——用户看到的"视频目录里多了个隐藏文件夹"就是它。
+/** 只读检查：媒体根下**任意深度**有**残留**的沙盒目录（`.subtitle-staging` / `.subtitle-translate`
+ *  里除 `.ignore` 标记之外还有条目，典型形态是躺着一个没删掉的 `<jobId>` 子目录）。
+ *  这些是任务收尾没做干净留下的净残留——用户看到的"视频目录里多了个隐藏文件夹"就是它。
+ *
+ *  🔴 判据在 2026-09-18 第 27 轮**反转**过（旧文与旧实现在此，供对照）：旧口径找的是
+ *  "**只剩**一个 `.ignore` 标记的空壳"。父目录改成**永驻**之后（#14 的根因修法），
+ *  "只剩标记"正是**正常稳态**而不是垃圾，于是旧判据两头都错：既会把稳态报成残留，
+ *  又对真正的残留（有 `<jobId>` 的那种）**完全失明**（isStagingHusk 在那种情况下恒 false，
+ *  = issues #16 记的那条盲区）。现在它回答的是用户真正看得见的那件事。
  *
  *  **绝不删除**（design D5）：删除的时机与并发保护（bootTime、10 分钟活性窗口、单实例前提）
  *  是 files/stagingSandbox.gcOrphans 的契约，而 doctor 在有别的进程正在跑的时候被调用是常态
@@ -273,7 +279,7 @@ export function checkStagingHusks(
   const more = husks.length > sample.length ? `（另有 ${husks.length - sample.length} 个未列出）` : ''
   return {
     name: 'staging-husks', ok: false,
-    detail: `发现 ${husks.length} 个沙盒残留（只剩 .ignore 标记的空目录，不是你的文件）：` +
+    detail: `发现 ${husks.length} 个沙盒残留（隐藏沙盒目录里还有没删掉的东西，不是你的文件）：` +
       `${sample.join('、')}${more}`,
     hint: '重启 watch：启动回收（gcOrphans）会清掉它们。若正在跑翻译/字幕任务，先等它跑完再重启，' +
       '以免中断在飞行中的工作台。',
