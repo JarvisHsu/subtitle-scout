@@ -1993,6 +1993,9 @@ export class ScoutDaemonV2 {
     // 不依赖 ffprobe，凭一个 fileExists 就能做。合成一个名单就等于"没装 ffprobe 的机器
     // 连字幕都不认了"。
     const toDetect: string[] = []
+    // 本轮**新加进来**的文件（库里此前没有这一行）。与 toProbe/toDetect 刻意分开：
+    // 那两个装的是"新增 **或** 指纹变化"，而新片抢跑只认前者（见下面 push 处的论证）。
+    const newlyAdded: string[] = []
     // D23：本轮被跳过的根（R8 两种形态 + D20 嵌套）。名单要传给 detectSubtitles——B 档的挑选
     // 谓词是全库查询、**不分根**，光看库里的列推不出"这个根本轮可不可信"。
     const skippedRoots: string[] = []
@@ -2209,6 +2212,12 @@ export class ScoutDaemonV2 {
           // 生产上一个守备目录是 115 网盘的 rclone FUSE 挂载，全库重探是几万 × 12s。
           toProbe.push(f)
           rootDetect.push(f)
+          // 🔴 **新加进来的文件**（库里此前没有这一行）——与"指纹变化"分开记。
+          // 用户 2026-09-18 的原话：「如果发现新加了视频，立即触发，为这个视频找字幕」。
+          // `existing === undefined` 就是这里唯一的分类依据（本仓没有 created_at 列，
+          // 也没必要为这一件事加一个）：指纹变化说明**同一个文件换了片源**，
+          // 而"新加"说明用户刚放进来一部新片——后者才该抢跑。
+          if (!existing) newlyAdded.push(f)
         }
 
         if (nestedRoots.has(root)) {
@@ -2282,6 +2291,28 @@ export class ScoutDaemonV2 {
       await this.judgeOnce()
     } catch (e) {
       this.deps.log(`warn: scan 后 judge 失败（隔离，不阻断扫盘）: ${String(e)}`)
+    }
+
+    // 🔴 新片抢跑（用户 2026-09-18 点名的需求）：本轮扫到**新加进来**的文件就立刻再跑一轮巡检，
+    // 而不是等下一次自然巡检（最长等 2 小时 + 那一轮里这部片排到的位置）。
+    //
+    // ── 为什么是"再跑一轮巡检"而不是"直接给这几个文件找字幕" ──────────────────
+    // 新文件通常**还没有 work_id**（识别是另一条轨）。直接进字幕工作台等于要求它先被识别——
+    // 那正是巡检里阶段 2 干的事。复用整轮巡检 = 识别 → 判定 → 字幕 → 翻译**四段全部照旧**，
+    // 没有第二份编排，也没有"新片走的是一条和自然巡检不同的路"这种漂移面。
+    //
+    // ── 成本与为什么不会变成热循环 ──────────────────────────────────────────
+    // ① 只在"本轮真的新增了行"时才触发；紧接着那一轮巡检里的扫描会发现这些文件**已在库里**
+    //    （`existing` 不再是 undefined）→ 不会再触发第二次。触发链天然只有一跳。
+    // ② 抢跑的那一轮巡检**照旧走退避过滤**（`skipBackoffThisInspect` 不为它置位），
+    //    所以"库里的老片"不会被这次抢跑顺带重跑一遍——只有新片是到点的（它的 recheck_after 是 NULL）。
+    // ③ 已知代价（如实记）：抢跑的那轮会**再走一次扫盘**。加一个"跳过扫描"的参数能省掉它，
+    //    但那要给 runInspection/runInspectionInner 多穿一层参数；本轮不做，留待需要时再说。
+    if (newlyAdded.length > 0) {
+      this.deps.log(`scan: 新增 ${newlyAdded.length} 个文件 → 立刻抢跑一轮巡检（新片不必等下一次自然巡检）`)
+      // 走既有那一根线（requestInspect → 主循环取件）：它自己会处理"巡检正在跑"的情形
+      // （此时新片本来就会被这一轮的字幕阶段处理），并在启动阶段如实返回 accepted_starting。
+      this.requestInspect()
     }
   }
 
