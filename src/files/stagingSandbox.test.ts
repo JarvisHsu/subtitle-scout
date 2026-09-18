@@ -169,8 +169,10 @@ describe('allocate/cleanup — jobId 含冒号（生产形态）', () => {
     rmSyncOverride = null
 
     expect(existsSync(dir)).toBe(false)
-    expect(existsSync(join(root, '.subtitle-staging'))).toBe(false)
-    expect(readdirSync(root).filter(n => n.startsWith('.'))).toEqual([])
+    // 父目录留着（第 27 轮：父目录永驻），但里面**不许**再有本任务的目录名形态
+    expect(existsSync(join(root, '.subtitle-staging'))).toBe(true)
+    expect(readdirSync(join(root, '.subtitle-staging')).filter(n => n !== '.ignore')).toEqual([])
+    expect(readdirSync(root).filter(n => n.startsWith('.'))).toEqual(['.subtitle-staging'])
   })
 
   it('失败必须留痕：删不掉时打出含原始 jobId 与映射后目录名的 ERROR，且不抛错', () => {
@@ -814,7 +816,7 @@ describe('gcOrphans', () => {
   // 都要等下一个 boot（rmSync 一个子条目会把父目录 mtime 刷成"现在"）。锁它等于把一件
   // 本不该是契约的事变成契约。
 
-  it('🔴 空壳回收：任意深度的空壳被整目录回收（含 ≥3 层深）', () => {
+  it('🔴 深层**只剩标记**的沙盒现在**不再**被回收（第 27 轮有意收窄删除面）', () => {
     const root = mediaRoot()
     const deep = join(root, 'Show', 'Season 01', 'Extra', '.subtitle-staging')
     mkdirSync(deep, { recursive: true })
@@ -825,8 +827,11 @@ describe('gcOrphans', () => {
 
     const cleaned = gcOrphans([root], new Set(), Date.now())
 
-    expect(existsSync(deep)).toBe(false)
-    expect(cleaned).toBe(1)
+    // 旧口径（gcOrphans ①）会把它整目录删掉。第 27 轮删掉了那一段：父目录永驻之后
+    // "只剩标记"是**正常稳态**，删它既会重开 #14 的窗口，又会把稳态报成残留。
+    // 仍然可见：findStagingHusks 会在它**有残留**时报出来（下面几条用例守着）。
+    expect(existsSync(deep)).toBe(true)
+    expect(cleaned).toBe(0)
   })
 
   it('空壳回收：mtime 新于 bootTime 的空壳被保留（R6-9 语义对深层同样生效）', () => {
@@ -935,10 +940,15 @@ describe('probeStagingPlacement — doctor 的落点探针', () => {
   it('可建的根：建得出来、也删得掉，且不留任何痕迹', () => {
     const root = mediaRoot()
     expect(() => probeStagingPlacement(root)).not.toThrow()
-    // 父目录是探针顺手建的 → 必须一并收掉，否则 doctor 会在媒体根里留一个 0 条目的
-    // .subtitle-staging（它既不是空壳也不在任何回收面的判据里）
-    expect(existsSync(join(root, '.subtitle-staging'))).toBe(false)
-    expect(readdirSync(root)).toEqual([])
+    // 第 27 轮起：父目录**留着**（父目录永驻是 #14 的根因修法；探针每跑一次就删一次父目录，
+    // 等于每跑一次 doctor 就重开一次它自己要查的那个窗口）。留着 + 补标记，Jellyfin 不扫。
+    expect(existsSync(join(root, '.subtitle-staging'))).toBe(true)
+    expect(existsSync(join(root, '.subtitle-staging', '.ignore'))).toBe(true)
+    // 探针自己的目录必须一个都不留
+    const probes = readdirSync(join(root, '.subtitle-staging'))
+      .filter(n => n.startsWith(PLACEMENT_PROBE_PREFIX))
+    expect(probes).toEqual([])
+    expect(readdirSync(root)).toEqual(['.subtitle-staging'])
   })
 
   it('已有 .subtitle-staging（如在跑任务）时只删探针目录，父目录与标记原样保留', () => {
@@ -990,14 +1000,20 @@ describe('probeStagingPlacement — doctor 的落点探针', () => {
 describe('cleanup — 父目录收尾（净残留必须为 0）', () => {
   afterEach(() => { rmSyncOverride = null; unlinkSyncOverride = null })
 
-  it('🔴 收尾：任务结束后 <base> 下不留任何由本系统创建的隐藏条目', () => {
+  it('🔴 收尾：任务结束后 `<jobId>` 不留，**父目录与共用标记留着**（第 27 轮起的新不变量）', () => {
     const root = mediaRoot()
     const dir = allocate('job-1', root)
     writeFileSync(join(dir, 'leftover.srt'), 'junk')
     cleanup('job-1', root)
-    expect(existsSync(join(root, '.subtitle-staging'))).toBe(false)
-    // 红线断言：整个 base 下不该有任何隐藏条目（渲染用户可见现象的是这一条，不是上面那条）
-    expect(readdirSync(root).filter(n => n.startsWith('.'))).toEqual([])
+    // ① 本任务的沙盒与文件必须干干净净地消失（这一条从来没变）
+    expect(existsSync(dir)).toBe(false)
+    // ② 父目录**留着**：父目录永驻是 #14 的根因修法（每任务删一次 = 每任务重新打开一次
+    //    "刚删过的父目录当不了父目录"的窗口）。这是**有意反转**的旧不变量，故写在这里。
+    expect(existsSync(join(root, '.subtitle-staging'))).toBe(true)
+    // ③ 且必须带标记（否则 Jellyfin 会扫进这个隐藏目录）
+    expect(existsSync(join(root, '.subtitle-staging', '.ignore'))).toBe(true)
+    // ④ 除父目录之外，base 下不该再有任何别的隐藏条目
+    expect(readdirSync(root).filter(n => n.startsWith('.'))).toEqual(['.subtitle-staging'])
   })
 
   it('收尾：同根还有另一个 jobId 时，父目录与共用标记都原样保留', () => {
@@ -1030,14 +1046,15 @@ describe('cleanup — 父目录收尾（净残留必须为 0）', () => {
     const root = mediaRoot()
     allocate('job-1', root)
     const ignorePath = join(root, '.subtitle-staging', '.ignore')
-    // 精确模拟 D3 承认的那条窗口：在"删标记"与"删空目录"之间插入一个并发 allocate。
+    // 旧口径下这里有一条真实竞争窗口（"删标记"与"删空目录"之间被并发 allocate 插入）。
+    // 第 27 轮起 cleanup **根本不删标记、也不删父目录**，那条窗口从构造上消失了：
+    // 并发 allocate 插进来也好、不插也好，标记与父目录都必须原样在。
     unlinkSyncOverride = (real, p) => {
       if (p === ignorePath) mkdirSync(join(root, '.subtitle-staging', 'job-2'), { recursive: true })
       return real(p)
     }
     cleanup('job-1', root)
     unlinkSyncOverride = null
-    // rmdirSync 撞 ENOTEMPTY → ensureStagingMarker 把标记补回：新沙盒继续被屏蔽
     expect(existsSync(ignorePath)).toBe(true)
     expect(readFileSync(ignorePath, 'utf8')).toContain('subtitle-scout staging')
     expect(existsSync(join(root, '.subtitle-staging', 'job-2'))).toBe(true)
@@ -1061,56 +1078,67 @@ describe('findStagingHusks', () => {
     writeFileSync(join(dir, '.ignore'), MARKER)
     return dir
   }
+  /** "有残留"的沙盒：里面躺着一个 `<jobId>` 子目录（父目录永驻之后的**唯一**残留形态）。 */
+  const mkLeftover = (dir: string): string => {
+    mkdirSync(join(dir, 'job-1'), { recursive: true })
+    return dir
+  }
 
-  it('只返回"唯一条目是本项目标记文件"的沙盒目录', () => {
+  it('🔴 只返回**有残留**的沙盒目录（除标记之外还有条目）；只剩标记是正常稳态，不上报', () => {
     const root = mediaRoot()
-    const husk = mkHusk(join(root, 'Show', '.subtitle-staging'))
-    // ① 含 <jobId> 的沙盒 → 不是空壳
-    mkdirSync(join(root, 'Live', '.subtitle-staging', 'job-1'), { recursive: true })
-    writeFileSync(join(root, 'Live', '.subtitle-staging', '.ignore'), MARKER)
-    // ② 同名目录但还含别的文件 → 不是空壳
-    mkdirSync(join(root, 'Other', '.subtitle-staging'), { recursive: true })
-    writeFileSync(join(root, 'Other', '.subtitle-staging', '.ignore'), MARKER)
-    writeFileSync(join(root, 'Other', '.subtitle-staging', 'keep.srt'), 'x')
-    // ③ 标记内容不是我们的 → 不是空壳
-    mkdirSync(join(root, 'Foreign', '.subtitle-staging'), { recursive: true })
-    writeFileSync(join(root, 'Foreign', '.subtitle-staging', '.ignore'), 'handmade\n')
-    // ④ 条目只有 .ignore 但它是目录而非文件 → 不是空壳
-    mkdirSync(join(root, 'Weird', '.subtitle-staging', '.ignore'), { recursive: true })
+    // ① **只剩标记**（父目录永驻之后的稳态）→ **不上报**（这是第 27 轮反转的判据）
+    mkHusk(join(root, 'Show', '.subtitle-staging'))
+    // ② 有一个 <jobId> 残留 → 上报（这正是用户看得见的形态，也是 isStagingHusk 时代的盲区）
+    const live = join(root, 'Live', '.subtitle-staging')
+    mkdirSync(join(live, 'job-1'), { recursive: true })
+    writeFileSync(join(live, '.ignore'), MARKER)
+    // ③ 同名目录里还有别的文件（非 .ignore）→ 上报
+    const other = join(root, 'Other', '.subtitle-staging')
+    mkdirSync(other, { recursive: true })
+    writeFileSync(join(other, '.ignore'), MARKER)
+    writeFileSync(join(other, 'keep.srt'), 'x')
+    // ④ 空目录（连标记都没有）→ 不上报：没有"残留"可言（它由 doctor 的落点探针正常留下）
+    mkdirSync(join(root, 'Empty', '.subtitle-staging'), { recursive: true })
 
-    expect(findStagingHusks([root])).toEqual([husk])
+    expect(findStagingHusks([root]).sort()).toEqual([live, other].sort())
   })
 
-  it('能命中深层空壳（≥3 层），且翻译工作台的标记同样被认作空壳', () => {
+  it('深层（≥3 层）同样按"有残留"判；翻译工作台的残留也上报', () => {
     const root = mediaRoot()
-    const deep = mkHusk(join(root, 'A', 'B', 'C', '.subtitle-staging'))
-    const translate = mkHusk(join(root, 'A', '.subtitle-translate'))
+    const deep = join(root, 'A', 'B', 'C', '.subtitle-staging')
+    mkdirSync(join(deep, 'job-9'), { recursive: true })
+    const translate = join(root, 'A', '.subtitle-translate')
+    mkdirSync(join(translate, 'job-8'), { recursive: true })
+    // 深层只剩标记的（= 旧设计散落在视频目录里的空壳形态）**不再上报**：
+    // 当前代码路径造不出它，而它也不再是可回收物（第 27 轮收窄删除面，理由见 gcOrphans ①）
+    mkHusk(join(root, 'A', 'B', '.subtitle-staging'))
 
-    const found = findStagingHusks([root]).sort()
-    expect(found).toEqual([deep, translate].sort())
+    expect(findStagingHusks([root]).sort()).toEqual([deep, translate].sort())
   })
 
   it('不进入隐藏目录内部（剪枝按 isJunkDirName 口径）', () => {
     const root = mediaRoot()
-    // 埋在 .cache 这类隐藏树里的空壳：遍历不该下钻进去
-    mkHusk(join(root, '.cache', 'deep', '.subtitle-staging'))
-    mkHusk(join(root, '@eaDir', 'deep', '.subtitle-staging'))
+    // 埋在 .cache / @eaDir 这类隐藏树里的**残留**：遍历不该下钻进去
+    // （夹具用"有残留"的形态：只剩标记的目录在现行判据下本来就不上报，拿它当夹具这条守卫会变成空的）
+    mkLeftover(join(root, '.cache', 'deep', '.subtitle-staging'))
+    mkLeftover(join(root, '@eaDir', 'deep', '.subtitle-staging'))
     expect(findStagingHusks([root])).toEqual([])
   })
 
   it('不穿过符号链接目录，也不把链接当作沙盒删', () => {
     const root = mediaRoot()
     const outside = mkdtempSync(join(tmpdir(), 'husk-outside-'))
-    mkHusk(join(outside, '.subtitle-staging'))
+    mkLeftover(join(outside, '.subtitle-staging'))
     symlinkSync(outside, join(root, 'link-out'))
 
     expect(findStagingHusks([root])).toEqual([])
-    expect(existsSync(join(outside, '.subtitle-staging'))).toBe(true)
+    expect(existsSync(join(outside, '.subtitle-staging', 'job-1'))).toBe(true)
   })
 
-  it('配置根嵌套时同一棵树不被走两遍，同一空壳只上报一次', () => {
+  it('配置根嵌套时同一棵树不被走两遍，同一残留只上报一次', () => {
     const root = mediaRoot()
-    const husk = mkHusk(join(root, 'Show', '.subtitle-staging'))
+    mkLeftover(join(root, 'Show', '.subtitle-staging'))
+    const husk = join(root, 'Show', '.subtitle-staging')
     expect(findStagingHusks([root, join(root, 'Show')])).toEqual([husk])
   })
 

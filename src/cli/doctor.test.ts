@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { checkAssrt, checkOpenSubtitles, checkZimuku, checkJimaku, checkR3sub, checkSubdl, checkSubhd, checkLlm, checkTmdb, checkMediaRoots, checkStagingHusks, checkStagingPlacement, formatDoctorReport, overallOk, withTimeout, checkDatabase, checkStuckJobs, checkMountCapabilities, relevantSourceForDoctor } from './doctor.js'
@@ -182,12 +182,16 @@ describe('checkStagingHusks', () => {
     expect(r.detail).toContain('mount gone')
   })
 
-  it('真接缝：默认参数就是 findStagingHusks（空目录 → ✓），不是 stub', () => {
+  it('🔴 真接缝：默认参数就是 findStagingHusks——只剩标记是**正常稳态**（✓），有 `<jobId>` 残留才 ✗', () => {
     const root = mkdtempSync(join(tmpdir(), 'doctor-husk-'))
     expect(checkStagingHusks([root])).toMatchObject({ ok: true })
+    // ① 只剩标记（父目录永驻之后的稳态）→ 仍然 ✓（第 27 轮反转：它不再是残留）
     mkdirSync(join(root, '.subtitle-staging'), { recursive: true })
     writeFileSync(join(root, '.subtitle-staging', '.ignore'),
       'subtitle-scout staging area — media servers should not scan this directory\n')
+    expect(checkStagingHusks([root])).toMatchObject({ ok: true })
+    // ② 里面躺着一个 <jobId> → 这才是用户看得见的残留（旧判据在这里是**瞎的**：#16）
+    mkdirSync(join(root, '.subtitle-staging', 'subtitle-tmdb-121860'), { recursive: true })
     expect(checkStagingHusks([root])).toMatchObject({ ok: false })
   })
 })
@@ -243,11 +247,16 @@ describe('checkStagingPlacement（doctor 的落点探针，2026-09-17）', () =>
     expect(r.detail).toContain('plain string')
   })
 
-  it('真接缝：默认参数就是 probeStagingPlacement（真临时根可建可删 → ✓ 且不留痕）', () => {
+  it('真接缝：默认参数就是 probeStagingPlacement（真临时根可建 → ✓；探针目录不留、父目录留着）', () => {
     const root = mkdtempSync(join(tmpdir(), 'doctor-placement-'))
     expect(checkStagingPlacement([root])).toMatchObject({ ok: true })
-    // 探针是只读倾向的：跑完不许在媒体根里留下 .subtitle-staging（否则 doctor 自己制造残留）
-    expect(existsSync(join(root, '.subtitle-staging'))).toBe(false)
+    // 第 27 轮起父目录**留着**（父目录永驻是 #14 的根因修法；探针每跑一次删一次父目录，
+    // 等于每跑一次就重开一次它自己要查的那个窗口），并且补上标记。
+    expect(existsSync(join(root, '.subtitle-staging'))).toBe(true)
+    expect(existsSync(join(root, '.subtitle-staging', '.ignore'))).toBe(true)
+    // 但**探针自己的目录**一个都不许留（否则 doctor 自己在媒体根里堆垃圾）
+    const probes = readdirSync(join(root, '.subtitle-staging')) as string[]
+    expect(probes.filter((n) => n.startsWith('.subtitle-scout-placement-'))).toEqual([])
   })
 
   it('真接缝：挂载点不可达 → ✗ 而不是把盘没挂上当 ✓（探针不许 recursive 建出父目录）', () => {
