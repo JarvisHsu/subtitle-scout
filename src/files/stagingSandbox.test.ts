@@ -1118,3 +1118,48 @@ describe('findStagingHusks', () => {
     expect(findStagingHusks([join(tmpdir(), 'definitely-not-there-9f3a')])).toEqual([])
   })
 })
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #14（2026-09-18）：`mkdir` 已存在的目录 → 后端 409 → rclone 上抛 EIO → 装盘全断。
+//
+// 这三条钉的是**判据的两侧**：容错必须生效（否则装盘断），而真失败必须照抛
+// （否则就是本仓最怕的假绿）。外加一条顺带修掉的隐患。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('allocate / probeStagingPlacement · 「后端说已存在」容错（#14）', () => {
+  it('🔴 allocate 对**已存在**的沙盒目录不再抛（同一条分支覆盖 EEXIST 与 EIO）', () => {
+    // 先手工建出两级（模拟"上次任务留下/后端已有而本地视图刚刷新"）
+    const root = mediaRoot()
+    const stagingRoot = join(root, '.subtitle-staging')
+    mkdirSync(stagingRoot, { recursive: true })
+    mkdirSync(join(stagingRoot, 'subtitle-tmdb-1'), { recursive: true })
+
+    // 旧实现在这里抛 EEXIST（`recursive:true` 会吞 EEXIST，但**不吞 EIO**——
+    // 而后端 409 翻译来的正是 EIO，生产实测就是这么断的）
+    expect(() => allocate('subtitle:tmdb:1', root)).not.toThrow()
+    expect(existsSync(join(stagingRoot, 'subtitle-tmdb-1'))).toBe(true)
+  })
+
+  it('🔴 真失败**必须照抛**：`.subtitle-staging` 的位置被一个文件占着 → 抛', () => {
+    // 这一侧是护栏：容错判据是"**它确实是个目录**"，而不是"忽略一切 mkdir 错误"。
+    // 吞掉真失败会让"装盘全断"变成"看起来一切正常"——比缺陷本身更糟。
+    const root = mediaRoot()
+    writeFileSync(join(root, '.subtitle-staging'), 'not a dir')
+    expect(() => allocate('subtitle:tmdb:1', root)).toThrow()
+  })
+
+  it('🔴 顺带修掉：allocate **不再**把未挂载的媒体根递归建出来', () => {
+    // 原实现用 `mkdirSync(dir, {recursive:true})`——媒体根没挂上时它会顺着把
+    // `/mnt/.../影视` 建成本地空目录，把"盘没挂上"伪装成成功（本仓 2026-07-29 留过 175 个残留）。
+    // probeStagingPlacement 一直为这条不用 recursive，allocate 此前没跟上。
+    const ghost = join(mkdtempSync(join(tmpdir(), 'scout-ghost-')), 'not-mounted-root')
+    expect(() => allocate('subtitle:tmdb:1', ghost)).toThrow()
+    expect(existsSync(ghost)).toBe(false)          // 关键断言：没被凭空造出来
+  })
+
+  it('探针在同样的"已存在"情形下不再抛（doctor 的 staging-placement 不该报假红）', () => {
+    const root = mediaRoot()
+    mkdirSync(join(root, '.subtitle-staging'), { recursive: true })   // 父目录已存在
+    expect(() => probeStagingPlacement(root)).not.toThrow()
+  })
+})

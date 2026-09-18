@@ -3,7 +3,7 @@
 import {
   existsSync, mkdirSync, rmSync, rmdirSync, writeFileSync, readFileSync,
   renameSync, openSync, fsyncSync, closeSync, unlinkSync,
-  readdirSync, readSync, lstatSync, type Dirent,
+  readdirSync, readSync, lstatSync, statSync, type Dirent,
 } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { writeAll } from './fsUtil.js'
@@ -13,6 +13,45 @@ import {
 
 const INSTALL_RETRY_DELAYS_MS = [50, 150, 400, 1000]
 const RETRYABLE_CODES = new Set(['EEXIST', 'EPERM', 'EBUSY'])
+
+/** `mkdir` 的「**已存在**」容错（#14，2026-09-18）。
+ *
+ *  ── 修的是什么 ────────────────────────────────────────────────────────────
+ *  后端（alist → 夸克 WebDAV）对**已存在**的目录再 `mkdir` 返回 **409 Conflict**，
+ *  而 rclone **不**把它当"已存在、可忽略"——它上抛，FUSE 层表现为 **EIO**。
+ *  Node 的 `mkdirSync` **只**吞 `EEXIST`，于是 EIO 被抛出，两处同时中招：
+ *   · `allocate()` 抛 → **字幕装盘全断**（新字幕一件都装不上）
+ *   · `probeStagingPlacement()` 抛 → doctor 的 `staging-placement` 报红（用户看到的第一现场）
+ *
+ *  ── 判据 ──────────────────────────────────────────────────────────────────
+ *  出错**之后**用 `statSync` 复核**那个具体路径**：
+ *   · 确实是目录 → 视为成功。这正是"后端语义与我们的假设不一致"的那一点。
+ *   · 不存在 / 不是目录 → **原样抛出**。那是真失败（挂载死了、权限不足、名字被拒），
+ *     吞掉它会造出本仓最怕的那类假绿。
+ *
+ *  ⚠️ **不先用 `existsSync` 判"要不要建"**：那个判据本身就是 #14 的成因
+ *  （本地视图说没有、后端说有）。正确姿势是**照建、出错再复核**。
+ *
+ *  ⚠️ **刻意不带 `recursive`**：递归会把"未挂载的媒体根"顺着建成本地空目录，把
+ *  "盘没挂上"这件最该被发现的事伪装成成功（`probeStagingPlacement` 为此已论证过，
+ *  本仓 2026-07-29 云盘误判留过 175 个残留）。**调用方负责逐级调用本函数。** */
+function mkdirToleratingExisting(p: string): void {
+  try {
+    mkdirSync(p)
+  } catch (e) {
+    if (isDirectoryNow(p)) return
+    throw e
+  }
+}
+
+/** 那个路径**此刻**是不是一个目录。任何 stat 失败都答 false——"不知道"不能当"是"。 */
+function isDirectoryNow(p: string): boolean {
+  try {
+    return statSync(p).isDirectory()
+  } catch {
+    return false
+  }
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -159,7 +198,14 @@ export function allocate(jobId: string, mediaRootForVideo: string): string {
   // 这样的身份串，而媒体根所在的文件系统/网盘驱动可能拒绝其中的字符（夸克拒绝冒号，且 rclone 的
   // VFS 写缓存会把 mkdir 失败伪装成本地成功）。详见 core/mediaContext.ts 的 stagingDirName。
   const dir = join(root, stagingDirName(jobId))
-  mkdirSync(dir, { recursive: true })
+  // 🔴 逐级建、每级都容"后端说已存在"（#14）。原实现是 `mkdirSync(dir, { recursive: true })`，
+  // 两个问题：
+  //  ① Node 只吞 EEXIST，后端 409 翻译来的 **EIO 直接上抛** → 装盘全断；
+  //  ② `recursive` 会把**未挂载的媒体根**建成本地空目录——`probeStagingPlacement` 一直
+  //     为这条不用 recursive，而 allocate 没跟上（同一个隐患，两处两种写法）。
+  // 逐级调用的另一个好处：EIO 来自哪一级是可分辨的。
+  mkdirToleratingExisting(root)
+  mkdirToleratingExisting(dir)
   ensureStagingMarker(root)
   return dir
 }
@@ -653,9 +699,12 @@ export function probeStagingPlacement(root: string): void {
   // 🔴 两级都**不使用** recursive：媒体根不存在（未挂载/挂错）时必须抛 ENOENT，而不是顺着
   // 递归把挂载点当普通目录建出来——那会在宿主上凭空造出一个同名的本地空目录，把"盘没挂上"
   // 这件最该被发现的事伪装成 ✓（本仓已有 2026-07-29 云盘误判的先例，代价是 175 个残留）。
-  if (!stagingRootExisted) mkdirSync(stagingRoot)
+  // 两级都走 mkdirToleratingExisting：父级容"后端已存在"（#14 的直接成因——本地视图说没有、
+  // 后端说有，rclone 把 409 上抛成 EIO）；探针目录名带 pid+计数器，**真建不出来时它并不存在**，
+  // 故那条容错对它不生效、该抛还是抛——探针的判据强度没有被削弱。
+  if (!stagingRootExisted) mkdirToleratingExisting(stagingRoot)
   const probe = join(stagingRoot, `${PLACEMENT_PROBE_PREFIX}${process.pid}-${placementProbeCounter++}`)
-  mkdirSync(probe)
+  mkdirToleratingExisting(probe)
   try {
     rmdirSync(probe)
     if (!stagingRootExisted) rmdirSync(stagingRoot) // 非空即失败（别人刚建了沙盒）→ 忽略，正确
