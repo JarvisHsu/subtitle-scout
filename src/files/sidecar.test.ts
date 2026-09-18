@@ -193,4 +193,31 @@ describe('onListing sink 与 listTargetSidecarNames', () => {
   it('空清单 → 空结果（不抛）', () => {
     expect(listTargetSidecarNames('/media/T/ep1.mkv', [], new Set(['zh-Hans']))).toEqual([])
   })
+
+  // ── #1 的投影：编号重复品被当成"语言"写进了 sidecar_langs（2026-09-18 生产实测）──────
+  it('🔴 编号重复品**不是语言**：`ep1.zh-Hans(1).ass` 不许进 sidecar_langs', () => {
+    // 生产库实测有两行被写成了 ["zh-Hans","zh-Hans(1)"]（12.Monkeys S02 与狂赌之渊 S01 ——
+    // 正是那两个出过重复字幕的目录）。危害不只是难看：`sidecar_langs` 是**换语言重判的输入**
+    // （retarget 按这一列决定"磁盘上已有哪种语言"），一个 `zh-Hans(1)` 会让它以为存在一个
+    // 额外的语言变体。而它真正的身份只是**规范件的兄弟**，归清理逐字节比对后删除。
+    const names = ['ep1.mkv', 'ep1.zh-Hans.ass', 'ep1.zh-Hans(1).ass', 'ep1.zh-Hans(2).ass']
+    const langs = listSidecarLanguages('/media/T/ep1.mkv', () => names)
+
+    expect(langs).toEqual(['zh-Hans'])
+    expect(langs).not.toContain('zh-Hans(1)')
+    expect(langs).not.toContain('zh-Hans(2)')
+  })
+
+  it('编号重复品排除后，**规范件仍被正常识别**（没把整条腿一起关掉）', () => {
+    const names = ['ep1.en.srt', 'ep1.en(1).srt', 'ep1.zh-Hant.ass']
+    expect(listSidecarLanguages('/media/T/ep1.mkv', () => names)).toEqual(['en', 'zh-Hant'])
+  })
+
+  it('边界：tag 里带括号但**不是**纯数字编号的仍按语言处理（不许扩大排除面）', () => {
+    // `zh-Hans(forced)` 是真实的粉丝标注写法，不是后端编号；连它一起排除会让这类字幕凭空消失。
+    // 不锁具体字符串（languageForTag 对未知 tag 的规范化策略不是本用例的被测对象），
+    // 只锁"没被当成编号重复品排除掉"。
+    const langs = listSidecarLanguages('/media/T/ep1.mkv', () => ['ep1.zh-Hans(forced).ass'])
+    expect(langs).toHaveLength(1)
+  })
 })

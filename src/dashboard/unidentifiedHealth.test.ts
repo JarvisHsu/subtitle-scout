@@ -12,7 +12,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { openDb, type ScoutDb } from '../v2/db.js'
 import { buildUnidentifiedHealth, MAX_LISTED_DIRS } from './unidentifiedHealth.js'
-import { decodeWorkDirHandle, encodeWorkDirHandle } from '../core/workDirHandle.js'
+import { encodeWorkDirHandle, resolveWorkDirHandle } from '../core/workDirHandle.js'
 
 let db: ScoutDb
 const NOW = 1_700_000_000_000
@@ -118,7 +118,7 @@ describe('buildUnidentifiedHealth', () => {
     expect(h).toBeTruthy()
     // 机器指针的正确性判据：解出来必须**正好**是库里那个 work_dir。
     // 差一个字符，绑定端点就会去查一个不存在的目录、把一次正确的用户操作报成 404。
-    expect(decodeWorkDirHandle(h)).toBe('/hostroot/media/test-library/TV/Mystery')
+    expect(resolveWorkDirHandle(h, ['/hostroot/media/test-library/TV/Mystery'])).toBe('/hostroot/media/test-library/TV/Mystery')
     // 而它是编码过的——明文片段不出现在响应体里（与上一条字段全集断言共同构成破例的边界）。
     expect(h).not.toContain('/')
     expect(h).not.toContain('hostroot')

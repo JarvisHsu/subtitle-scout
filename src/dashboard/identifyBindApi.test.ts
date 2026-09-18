@@ -9,65 +9,74 @@
 import { describe, it, expect } from 'vitest'
 import { openDb } from '../v2/db.js'
 import { bindUnidentifiedDir, unbindUnidentifiedDir } from './identifyBindApi.js'
-import { encodeWorkDirHandle, decodeWorkDirHandle } from '../core/workDirHandle.js'
+import { encodeWorkDirHandle, isWorkDirHandle, resolveWorkDirHandle } from '../core/workDirHandle.js'
 import type { IdentifyWorkerDeps } from '../agent/identifyWorker.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 句柄编解码：不透明指针，必须无损往返且对垃圾输入**返回 null 而不是抛**
+// 句柄：**摘要**，不是编码后的路径（规格 §7.1「服务端生成的摘要，非路径」）。
+//
+// 第一版用 base64url(work_dir)——可逆，等于把绝对路径换个字母表发出去。本轮按规格收回。
+// 现在反查靠"拿候选集去撞摘要"（候选有界且已知），所以**没有 decode 可测**；
+// 这一组改为钉摘要的三个性质 + 形状判据 + 反查语义。
 // ─────────────────────────────────────────────────────────────────────────────
-describe('workDirHandle · 不透明句柄编解码', () => {
-  it('往返无损（含 CJK / 空格 / 方括号 / 反斜杠 等真实发布组命名）', () => {
+describe('workDirHandle · 不透明句柄是摘要', () => {
+  it('🔴 句柄**不含路径**：不同目录的句柄互不相同，且都是 43 字符 URL 安全串', () => {
     const cases = [
       '/media/quark/影视/[西虹市首富] (2018)',
       'C:\\Media\\TV\\Show S01',
       '/mnt/quark/动漫/[爱情公寓][全1-5季+电影+番外篇][国语中字][4K高码][203G]',
       '/a/b/c',
+      '/a/b/c ',          // 尾随空格 → 必须是另一个句柄（不许规范化掉，否则两个目录撞同一个句柄）
     ]
+    const seen = new Set<string>()
     for (const dir of cases) {
-      expect(decodeWorkDirHandle(encodeWorkDirHandle(dir))).toBe(dir)
-    }
-  })
-
-  it('句柄是 URL 安全的（不含 + / = 这三个要不要转义的字符）', () => {
-    // 这是选 base64**url** 而不是 base64 的全部理由：句柄要被前端原样塞进 JSON / query，
-    // 一旦产出 `+` `=`，某些前端框架的表单编码会把它改成空格 → 服务端解出另一个目录。
-    for (const dir of ['/media/a?b', '/media/~~', '/media/ÿ', '/x'.repeat(40)]) {
       const h = encodeWorkDirHandle(dir)
-      expect(h).not.toMatch(/[+/=]/)
+      expect(h).toHaveLength(43)
+      expect(h).toMatch(/^[A-Za-z0-9_-]+$/)   // URL 安全：无 + / = 需转义
+      expect(isWorkDirHandle(h)).toBe(true)
+      expect(seen.has(h)).toBe(false)
+      seen.add(h)
     }
   })
 
-  it('垃圾输入 → null（不是抛异常，也不是解出半个路径）', () => {
-    for (const bad of ['', '=', 'not-base64!!', '!!', '----', '____']) {
-      expect(decodeWorkDirHandle(bad)).toBeNull()
-    }
+  it('确定性：同一目录永远得到同一句柄（前端拿着它跨请求回传必须成立）', () => {
+    expect(encodeWorkDirHandle('/media/x')).toBe(encodeWorkDirHandle('/media/x'))
   })
 
-  it('长度 ≡ 1 (mod 4) → null：往返校验**唯一**能拒绝的形状（实测，不是推算）', () => {
-    // 实测结论（node -e 打过一遍，`probe` 见下）——base64 对"畸形"的容忍度比直觉宽得多：
-    //   · `'L2E'` / `'L2Ev'` / `'L2EvYg'` 都是**完全合法**的非填充句柄（分别是 '/a'、'/a/'、'/a/b'）；
-    //   · 在合法句柄尾部**追加**字符也是合法的——它只是指向另一个路径
-    //     （`'/a/b' + 'A'` → 解出 `'/a/b\u0000'`，一个真实的字符串，往返一致）。
-    // 唯一无法被**任何**字符串编出来的形状是长度 4k+1：那种长度下最后 2 个 bit 无处安放，
-    // canonical 编码永远不会产出它。所以往返校验拦的就是"位宽对不上"这一类。
-    //
-    // 这条界桩是写给下一个人的：别把"追加了字符 / 截短了"想当然当成篡改判据——它们各有各的
-    // 合法读法，写了那种断言只会得到一条假红。真正的防线不是句柄的不可伪造性，而是**服务端
-    // 另行判定**（目录必须真的未识别；撤销只认 work_id_source='human'）。
-    for (const bad of ['A', 'AAAAA', 'Zm9vY', encodeWorkDirHandle('/a/b').slice(0, 5)]) {
-      expect(bad.length % 4).toBe(1)
-      expect(decodeWorkDirHandle(bad)).toBeNull()
-    }
+  it('🔴 摘要不可逆：句柄里**看不出**路径的任何片段', () => {
+    const dir = '/media/quark/影视/[毒枭][全1-3季]'
+    const h = encodeWorkDirHandle(dir)
+    // 明文片段与 base64 形态都不许出现在句柄里（旧实现 `base64url(dir)` 会整段出现）。
+    expect(h).not.toContain('毒枭')
+    expect(h).not.toContain(Buffer.from(dir, 'utf8').toString('base64url'))
+    expect(h).not.toContain('/media')
   })
 
-  it('格式合法但目录不存在的句柄 → **照样解得出**（"解不开" ≠ "没有这个目录"）', () => {
-    // 界桩：往返校验只回答"这是不是我们发出的句柄"，不回答"这个目录在不在库里"。
-    // 后者由 DB 查询回答（→ 404）。把两者混进一个判据，一个**完全合法**的句柄就会被
-    // 报成 400 "invalid handle"——用户看到"你给的句柄有问题"，而真相是"这个目录没有
-    // 未识别文件"。这两句话给用户的下一步动作完全不同。
-    const h = encodeWorkDirHandle('foo')
-    expect(h).toBe('Zm9v')
-    expect(decodeWorkDirHandle(h)).toBe('foo')
+  it('形状判据 isWorkDirHandle：长度/字母表不符 → false（畸形走 400，不是 404）', () => {
+    for (const bad of ['', '@@@', 'short', 'a'.repeat(42), 'a'.repeat(44), 'Zm9v', 'x'.repeat(43) + '!']) {
+      expect(isWorkDirHandle(bad)).toBe(false)
+    }
+    expect(isWorkDirHandle(encodeWorkDirHandle('/x'))).toBe(true)
+  })
+
+  it('resolveWorkDirHandle：命中候选集里那一个；撞不中就 null', () => {
+    const a = '/media/A'
+    const b = '/media/B'
+    const cands = [a, b]
+
+    expect(resolveWorkDirHandle(encodeWorkDirHandle(b), cands)).toBe(b)
+    // 🔴 候选集外的目录**必须**撞不中——这正是"目录穿越不可能"的实现方式：
+    // 句柄算不出原像，而反查只能落在调用方给的候选集里。
+    expect(resolveWorkDirHandle(encodeWorkDirHandle('/etc/passwd'), cands)).toBeNull()
+    expect(resolveWorkDirHandle(encodeWorkDirHandle(a), [])).toBeNull()
+    expect(resolveWorkDirHandle('@@@', cands)).toBeNull()          // 形状不对也返回 null
+  })
+
+  it('⚠️ 摘要**不是**不可伪造的：知道目录名就能算出它的句柄', () => {
+    // 这条钉的是一个**事实**，不是缺陷——写成用例是为了防止有人误以为句柄本身有鉴权能力。
+    // 句柄只回答"指哪个目录"；能不能绑、能不能撤由服务端另行判定
+    //（目录必须真的未识别；撤销只认 work_id_source='human'），且端点整体在鉴权前置门之后。
+    expect(resolveWorkDirHandle(encodeWorkDirHandle('/media/secret'), ['/media/secret'])).toBe('/media/secret')
   })
 })
 

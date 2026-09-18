@@ -42,12 +42,14 @@
 import type { ScoutDb } from '../v2/db.js'
 import { runIdentifyWorkDir, type IdentifySchedulerDeps } from '../v2/identifyScheduler.js'
 import type { IdentifyWorkerDeps } from '../agent/identifyWorker.js'
-import { decodeWorkDirHandle, encodeWorkDirHandle } from '../core/workDirHandle.js'
+import { encodeWorkDirHandle, isWorkDirHandle, resolveWorkDirHandle } from '../core/workDirHandle.js'
 
-// 编解码住在 core/workDirHandle.ts（中立模块）：只读的 unidentifiedHealth 也要用它，
-// 不该为一个 base64 把整条识别轨（→ agent → LLM SDK）拖进只读路径。这里只做转出，
+// 句柄的映射住在 core/workDirHandle.ts（中立模块）：只读的 unidentifiedHealth 也要用它，
+// 不该为一个摘要把整条识别轨（→ agent → LLM SDK）拖进只读路径。这里只做转出，
 // 让绑定 API 的调用方有一个入口。
-export { decodeWorkDirHandle, encodeWorkDirHandle }
+//
+// ⚠️ 不再转出 `decodeWorkDirHandle`——句柄是**摘要**，本来就没有可转出的解码（规格 §7.1）。
+export { encodeWorkDirHandle, isWorkDirHandle, resolveWorkDirHandle }
 
 export type BindResult =
   | { ok: true; workDir: string; tmdbId: string; written: number; title: string | null }
@@ -69,23 +71,37 @@ export async function bindUnidentifiedDir(
   deps: BindDeps,
   input: { handle: string; tmdbId: string },
 ): Promise<BindResult> {
-  const workDir = decodeWorkDirHandle(input.handle)
-  if (workDir === null) {
+  // 句柄是**摘要**，算不出原像——只能拿候选去撞。
+  // 而这里用的候选集（库里 `work_id IS NULL` 的 work_dir）**同时就是允许绑定的白名单**，
+  // 一举两得：目录穿越不可能发生（撞不中任何候选），且绝对路径根本不上线路。
+  //
+  // 探针顺序（畸形 → 数字 → 命中）与三种状态码的语义分工见下方注释。
+  if (!isWorkDirHandle(input.handle)) {
     return { ok: false, status: 400, error: 'invalid handle' }
   }
   if (!/^\d+$/.test(input.tmdbId)) {
     return { ok: false, status: 400, error: 'tmdbId must be a numeric TMDB id' }
   }
 
+  const candidateDirs = (
+    deps.db.prepare('SELECT DISTINCT work_dir FROM files WHERE work_id IS NULL').all() as Array<{ work_dir: string }>
+  ).map((r) => r.work_dir)
   // 该目录必须**真的存在且尚未识别**。两道都必要：
-  //  · `work_id IS NULL` 过滤掉"已经识别成功"的目录——否则用户可以用一个人工请求把一部
-  //    已正确识别的作品改绑到别的 id 上，而那条路径本来有 agent 的证据链把关。
-  //  · 目录存在性靠这个查询本身（COUNT=0 即不存在或已识别），不另做文件系统探测——那是
-  //    FUSE 上的昂贵操作（生产实测全库遍历会超时），而这里的信息全在库里。
+  //  · 候选集里的 `work_id IS NULL` 过滤掉"已经识别成功"的目录——否则用户可以用一个人工请求把
+  //    一部已正确识别的作品改绑到别的 id 上，而那条路径本来有 agent 的证据链把关。
+  //  · 目录存在性靠这个候选集本身，不另做文件系统探测——那是 FUSE 上的昂贵操作
+  //    （生产实测全库遍历会超时），而这里的信息全在库里。
+  const workDir = resolveWorkDirHandle(input.handle, candidateDirs)
+  if (workDir === null) {
+    // 形状对但没命中任何未识别目录 → 404（"可能刚被识别掉"），与"句式畸形 → 400"严格区分。
+    return { ok: false, status: 404, error: 'no unidentified files under this handle (already identified or unknown)' }
+  }
+
   const row = deps.db
     .prepare('SELECT COUNT(*) AS n FROM files WHERE work_dir = ? AND work_id IS NULL')
     .get(workDir) as { n: number }
   if (row.n === 0) {
+    // 候选集与这条 COUNT 之间理论上无窗口（同一次调用内），留作防御。
     return { ok: false, status: 404, error: 'no unidentified files under this handle (already identified or unknown)' }
   }
 
@@ -169,9 +185,21 @@ export function unbindUnidentifiedDir(
   deps: { db: ScoutDb; now?: () => number },
   input: { handle: string },
 ): UnbindResult {
-  const workDir = decodeWorkDirHandle(input.handle)
-  if (workDir === null) {
+  if (!isWorkDirHandle(input.handle)) {
     return { ok: false, status: 400, error: 'invalid handle' }
+  }
+  // 🔴 撤销的候选集**不是**"未识别目录"——人工绑定之后那个目录就已经是 `work_id IS NOT NULL`，
+  //    不在未识别集合里了（这正是它要能被撤销的原因）。所以这里必须另取一份候选集：
+  //    只含 `work_id_source = 'human'` 的目录。
+  //    候选集给错的后果很具体：拿未识别集去反查，一次成功的人工绑定**永远撤销不了**
+  //    （句柄撞不中任何候选 → 报 409"没有可撤销的"），而用户看到的是"我明明绑过"。
+  const candidateDirs = (
+    deps.db.prepare("SELECT DISTINCT work_dir FROM files WHERE work_id_source = 'human'").all() as Array<{ work_dir: string }>
+  ).map((r) => r.work_dir)
+  const workDir = resolveWorkDirHandle(input.handle, candidateDirs)
+  if (workDir === null) {
+    // 形状对但没有任何人工绑定命中 → 409"没有可撤销的"，与"句式畸形 → 400"严格区分。
+    return { ok: false, status: 409, error: 'nothing to undo: no human-bound files under this handle' }
   }
   const now = deps.now?.() ?? Date.now()
   const r = deps.db

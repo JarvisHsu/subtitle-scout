@@ -24,7 +24,7 @@ import { openDb, type ScoutDb } from '../v2/db.js'
 import { startDashboard, buildRootHealth } from './server.js'
 import { TEST_HOST, baseOf } from './testServerHost.js'
 import { ScoutEventBus } from '../core/scoutEvents.js'
-import { decodeWorkDirHandle, encodeWorkDirHandle } from '../core/workDirHandle.js'
+import { encodeWorkDirHandle, resolveWorkDirHandle } from '../core/workDirHandle.js'
 import { SettingsRepo } from '../v2/settingsRepo.js'
 // 🔴-2：端点的 workPermitted 必须与 daemon 逐字同源。测试直接调 daemon 那一侧用的同一个
 // 函数来比对，**不在这里复述判据**——复述就是第三处手写实现（D7/C30 的既有形态）。
@@ -366,7 +366,7 @@ describe('GET /api/v2/health（Task ⑤）', () => {
     // 这是"端点接线正确"的唯一证据：句柄只是一串合法字符串，接错了 HTTP 层不会有任何报错，
     // 只会让前端拿到一个绑不到任何东西的指针（表现为用户点了"就是它"之后得到 404）。
     expect(dir).toEqual({ dirName: 'Unknown Show', fileCount: 1, handle: encodeWorkDirHandle('/media/Unknown Show') })
-    expect(decodeWorkDirHandle(dir!.handle)).toBe('/media/Unknown Show')
+    expect(resolveWorkDirHandle(dir!.handle, ['/media/Unknown Show'])).toBe('/media/Unknown Show')
   })
 
   it('🔴 接了总线：currents 来自 ScoutEventBus 的三槽快照（getCurrents）', async () => {

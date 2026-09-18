@@ -148,6 +148,17 @@ function sidecarLanguageOf(videoBase: string, name: string): SubtitleLanguage | 
   const tag = stem.slice(videoBase.length + 1)
   // 单段 tag（不含点）——多段的是别的视频的字幕或带修饰的文件名，不归本视频（C30）。
   if (tag === '' || tag.includes('.')) return null
+  // 🔴 编号重复品**不是语言**（#1 的投影，2026-09-18 生产实测）。
+  //
+  // 网盘后端在重名时不覆盖、把新文件改名成 `<base>(1)<ext>`（见 #1）。落到这里就成了
+  // `<base>.<tag>(1)<ext>`，抽出来的 tag 是 `zh-Hans(1)`——一个**不存在的语言**。
+  // 生产库里实测确有两行被这么写了进去：`["zh-Hans","zh-Hans(1)"]`。
+  //
+  // 为什么这不只是好看问题：`sidecar_langs` 是**换语言重判的输入**（retarget 按这一列决定
+  // "磁盘上已有哪种语言、要不要重新找一遍"）。一个 `zh-Hans(1)` 条目会让它以为存在一个额外的
+  // 语言变体，从而做出错误的重判结论。而它真正的身份只是**规范件的兄弟**，
+  // 归 `cleanupNumberedDuplicates` 逐字节比对后清除——那是清理，不是语言。
+  if (/\(\d+\)$/.test(tag)) return null
   return languageForTag(tag)
 }
 
