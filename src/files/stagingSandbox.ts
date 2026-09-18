@@ -8,7 +8,7 @@ import {
 import { join, dirname, resolve } from 'node:path'
 import { writeAll } from './fsUtil.js'
 import {
-  isJunkDirName, STAGING_DIRNAME, TRANSLATE_STAGING_DIRNAME, stagingDirName,
+  STAGING_DIRNAME, TRANSLATE_STAGING_DIRNAME, stagingDirName,
 } from '../core/mediaContext.js'
 
 const INSTALL_RETRY_DELAYS_MS = [50, 150, 400, 1000]

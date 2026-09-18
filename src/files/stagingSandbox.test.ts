@@ -1102,36 +1102,23 @@ describe('findStagingHusks', () => {
     return dir
   }
 
-  it('🔴 只返回**有残留**的沙盒目录（除标记之外还有条目）；只剩标记是正常稳态，不上报', () => {
+  it('🔴 只扫**根一级**：根下有残留就上报；深层与"只剩标记"都不上报（第 35 轮收窄，为 #19 提速）', () => {
     const root = mediaRoot()
-    // ① **只剩标记**（父目录永驻之后的稳态）→ **不上报**（这是第 27 轮反转的判据）
-    mkHusk(join(root, 'Show', '.subtitle-staging'))
-    // ② 有一个 <jobId> 残留 → 上报（这正是用户看得见的形态，也是 isStagingHusk 时代的盲区）
-    const live = join(root, 'Live', '.subtitle-staging')
-    mkdirSync(join(live, 'job-1'), { recursive: true })
-    writeFileSync(join(live, '.ignore'), MARKER)
-    // ③ 同名目录里还有别的文件（非 .ignore）→ 上报
-    const other = join(root, 'Other', '.subtitle-staging')
-    mkdirSync(other, { recursive: true })
-    writeFileSync(join(other, '.ignore'), MARKER)
-    writeFileSync(join(other, 'keep.srt'), 'x')
-    // ④ 空目录（连标记都没有）→ 不上报：没有"残留"可言（它由 doctor 的落点探针正常留下）
-    mkdirSync(join(root, 'Empty', '.subtitle-staging'), { recursive: true })
+    // ① 根一级的 .subtitle-staging 里有 <jobId> 残留 → 上报（用户看得见的形态）
+    const atRoot = join(root, '.subtitle-staging')
+    mkdirSync(join(atRoot, 'job-1'), { recursive: true })
+    writeFileSync(join(atRoot, '.ignore'), MARKER)
+    // ② 另一个根的 .subtitle-staging 只剩标记（父目录永驻后的**稳态**）→ 不上报
+    const root2 = mediaRoot()
+    mkHusk(join(root2, '.subtitle-staging'))
+    // ③ **深层残留**（旧设计的形态）→ **不再**自动发现。这条断言把那个取舍**显式钉住**：
+    //    遍历改成根一级，换来的是 boot 从"走完整棵媒体树"降到"每根两次 readdir"（#19）。
+    mkLeftover(join(root, 'Show', 'Season 01', 'Extra', '.subtitle-staging'))
+    // ④ 根一级的翻译工作台同理
+    const translate = join(root, '.subtitle-translate')
+    mkdirSync(join(translate, 'job-2'), { recursive: true })
 
-    expect(findStagingHusks([root]).sort()).toEqual([live, other].sort())
-  })
-
-  it('深层（≥3 层）同样按"有残留"判；翻译工作台的残留也上报', () => {
-    const root = mediaRoot()
-    const deep = join(root, 'A', 'B', 'C', '.subtitle-staging')
-    mkdirSync(join(deep, 'job-9'), { recursive: true })
-    const translate = join(root, 'A', '.subtitle-translate')
-    mkdirSync(join(translate, 'job-8'), { recursive: true })
-    // 深层只剩标记的（= 旧设计散落在视频目录里的空壳形态）**不再上报**：
-    // 当前代码路径造不出它，而它也不再是可回收物（第 27 轮收窄删除面，理由见 gcOrphans ①）
-    mkHusk(join(root, 'A', 'B', '.subtitle-staging'))
-
-    expect(findStagingHusks([root]).sort()).toEqual([deep, translate].sort())
+    expect(findStagingHusks([root, root2]).sort()).toEqual([atRoot, translate].sort())
   })
 
   it('不进入隐藏目录内部（剪枝按 isJunkDirName 口径）', () => {
