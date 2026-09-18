@@ -318,8 +318,11 @@ function SubtitleFetchBar({ workId, season, episode, label }: {
   return (
     <div className="media-fetch-bar" data-testid="media-fetch-bar">
       <span className="text-[13px] text-muted-foreground">
-        {label ? `${label} · ` : ''}
-        {t('media_fetch_cost')}
+        {label ? <span className="font-mono">{label}</span> : null}
+        {label ? ' · ' : ''}
+        {/* 成本文案单独一个元素：它是 12.6 的硬要求，既要在视觉上可读，
+            也要能被单独取到（拼进同一段文本里就会被"这一集的定位串"淹掉）。 */}
+        <span data-testid="media-fetch-cost">{t('media_fetch_cost')}</span>
       </span>
       <Button variant="secondary" size="sm" disabled={busy} onClick={() => void run()} data-testid="media-fetch-subtitle">
         {t('media_fetch_button')}

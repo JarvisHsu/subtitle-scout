@@ -771,7 +771,7 @@ describe('按需取字幕：点格子选中 → 动作条上点按钮才真抓�
     fireEvent.click(cellOf(2))
     expect(screen.getByTestId('media-fetch-bar')).toBeTruthy()
     // 12.6：成本必须常驻可见——按集线性放大是这条文案存在的全部理由
-    expect(screen.getByText(en.media_fetch_cost)).toBeTruthy()
+    expect(screen.getByTestId('media-fetch-cost').textContent).toBe(en.media_fetch_cost)
   })
 
   it('🔴 12.6「不许批量入口」：页面上动作条恒只有一个、里面只有一个按钮', () => {
