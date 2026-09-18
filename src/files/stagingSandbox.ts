@@ -284,7 +284,15 @@ export interface InstallCleanupNote {
  *  只认 `<base>(<n>)<ext>` 且 n 是纯数字的相邻兄弟；不会去匹配任何别的命名形态。
  *  额外记录：`--dir-cache-time 5m` 也让**删除**可能被缓存挡住，所以删除失败是预期内的，
  *  函数只报告、不抛错——装盘结论不受影响。 */
-export function cleanupNumberedDuplicates(finalPath: string): InstallCleanupNote[] {
+/** 清掉与 `finalPath` **逐字节相同**的 `<base>(n)<ext>` 兄弟文件（网盘后端在重名时不覆盖、
+ *  改名加 `(n)` 制造的副本）。返回删除/失败清单；任何一步失败都不抛，只记 note。
+ *
+ *  @param knownEntries 调用方**已经在手上**的目录条目。
+ *    存在的理由（成本，不是便利）：扫描侧（`daemonV2.observeSubtitle`）已经在同一目录上
+ *    readdir 过一次拿外挂字幕清单了，传进来就省掉第二次 syscall。
+ *    ⚠️ 必须与 `dirname(finalPath)` 一致，传别的目录的清单会得到错误结论。
+ */
+export function cleanupNumberedDuplicates(finalPath: string, knownEntries?: string[]): InstallCleanupNote[] {
   const notes: InstallCleanupNote[] = []
   let base = finalPath
   let ext = ''
@@ -295,11 +303,27 @@ export function cleanupNumberedDuplicates(finalPath: string): InstallCleanupNote
     ext = finalPath.slice(dot)
   }
   let entries: string[]
-  try {
-    entries = readdirSync(dirname(finalPath))
-  } catch {
-    return notes // 列不出目录（云盘抖动等）→ 无事可做，绝不影响装盘结论
+  if (knownEntries) {
+    entries = knownEntries
+  } else {
+    try {
+      entries = readdirSync(dirname(finalPath))
+    } catch {
+      return notes // 列不出目录（云盘抖动等）→ 无事可做，绝不影响装盘结论
+    }
   }
+
+  // 🔴 先用**文件名**筛出候选，再决定要不要读文件内容。
+  //
+  // 原实现在这里先 `readFileSync(finalPath)` 把整个字幕读进来当基准，然后才去比对名字——
+  // 于是**没有重复品时也要白读一遍字幕**。装盘路径上只读一个文件无所谓，但扫描侧
+  // 是对全库每个已覆盖文件跑一遍的（生产实测 219 个 covered），2MB × 219 = 每轮几百 MB
+  // 走 FUSE——那正是本仓在 sidecar 列举上专门论证过要避免的代价。
+  // 现在：名字不匹配 → 零读取直接返回。有候选 → 才读内容（此时读是必要的，因为判据是逐字节）。
+  const re = new RegExp(`^${escapeRegExp(base.slice(base.lastIndexOf('/') + 1))}\\((\\d+)\\)${escapeRegExp(ext)}$`)
+  const candidates = entries.filter((name) => re.test(name))
+  if (candidates.length === 0) return notes
+
   let finalSize: number
   let finalData: Buffer
   try {
@@ -308,9 +332,7 @@ export function cleanupNumberedDuplicates(finalPath: string): InstallCleanupNote
   } catch {
     return notes // 读不到刚落盘的文件 → 无从比对，不做任何删除
   }
-  const re = new RegExp(`^${escapeRegExp(base.slice(base.lastIndexOf('/') + 1))}\\((\\d+)\\)${escapeRegExp(ext)}$`)
-  for (const name of entries) {
-    if (!re.test(name)) continue
+  for (const name of candidates) {
     const dup = join(dirname(finalPath), name)
     try {
       const dupData = readFileSync(dup)

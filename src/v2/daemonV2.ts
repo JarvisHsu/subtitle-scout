@@ -20,11 +20,14 @@ import { targetKey, targetLabel, itemIdToKey } from './subtitleTargets.js'
 import type { RunsRepo } from './runsRepo.js'
 import { judgePendingFiles } from './judgePending.js'
 import { tagsForLanguage } from '../agent/languages.js'
-import { findExternalSidecar, listSidecarLanguages } from '../files/sidecar.js'
+import { findExternalSidecar, listSidecarLanguages, listTargetSidecarNames } from '../files/sidecar.js'
 // R-F15：目标语言 → sidecar_langs 记账值域的换算（zh → {zh-Hans, zh-Hant}）。与换语言重判
 // 共用**同一份**换算，不另写第二份——两份必然漂移（C30 的原案就是两处标签集各漏一半）。
 import { coverageValuesFor } from './retarget.js'
 import { existsSync, readdirSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+// #1：编号重复字幕的清理**复用装盘路径同一个函数**，不新写第二份判据（C30 那类漂移是本仓旧病）。
+import { cleanupNumberedDuplicates, type InstallCleanupNote } from '../files/stagingSandbox.js'
 import { isDirWritable } from '../core/mediaContext.js'
 import { SettingsRepo } from './settingsRepo.js'
 import type { EmbeddedSubtitleTrack } from '../files/streamProbe.js'
@@ -264,6 +267,21 @@ export interface DaemonV2Deps {
    *  「同目录多个视频只 readdir 一次」——忘了做 per-scan 目录缓存的话，一个 24 集的季目录
    *  就是 24 次 readdir，在 115 FUSE 上比原来的逐个 stat 还慢。 */
   readdir?: (dir: string) => string[]
+
+  /** #1 修复（2026-09-18）：清理网盘后端制造的编号重复字幕（`<base>(n)<ext>`）。
+   *
+   *  🔴 为什么放在**扫描观察侧**，而不是只在 `install()` 落盘后清一次：
+   *  `install()` 那条路**结构上清不到**。rclone 是 `--vfs-cache-mode writes`——写先落本地缓存、
+   *  **异步上传**；install() 返回时后端还没上传完，`(1)` 这个兄弟文件**根本还不存在**
+   *  （#1 的 rclone 日志实测：上传失败后 20 秒才 try #3 成功，而 `(1)` 的 mtime 比原件晚
+   *  12–44 秒）。清扫动作在那个时刻扫了个空。
+   *  扫描观察是**唯一**能看见真实磁盘事实的时刻（与 R24「covered 只有扫描能写」同源），
+   *  所以清理落在这里。代价是重复文件可能存活到下一次扫描（≤24h），换来的是**能真正清掉**。
+   *
+   *  默认实现是 `files/stagingSandbox.cleanupNumberedDuplicates`（与装盘路径**同一个函数**，
+   *  不新写第二份判据）。测试注入点：判据本身在 stagingSandbox.test.ts 里用真实临时文件测，
+   *  这里注入是为了守住"**没有重复品时不读文件内容**"这条成本红线。 */
+  cleanupDuplicates?: (finalPath: string, knownEntries?: string[]) => unknown
 
   /** 翻译总开关的**双门控**（TRANSLATE_* 凭证 ∧ settings.ai_translate_enabled==='true'），
    *  阶段 2.6 复查闸的取件范围靠它分流（D14 / C41）。接线点在 cli/watchWiring.ts。
@@ -2251,8 +2269,11 @@ export class ScoutDaemonV2 {
     // 与当前目标语言无关的磁盘事实）与"当前目标语言的字幕在不在"（sub_status 的判据）。
     // 三态：null = 目录读不了（下面降级到逐个 stat）；[] = 读了、确认零条外挂字幕。
     let sidecarLangs: string[] | null = null
+    // #1：顺手接住这一次 readdir 的**原始条目**，供下方清理编号重复品复用。
+    // 再 readdir 一次会把 sidecar.ts 论证过的"一趟 readdir 产出多个结论"的收益抵消掉。
+    let listing: string[] | null = null
     try {
-      sidecarLangs = listSidecarLanguages(videoPath, readdir)
+      sidecarLangs = listSidecarLanguages(videoPath, readdir, (names) => { listing = names })
     } catch { sidecarLangs = null }
 
     let found = false
@@ -2280,6 +2301,27 @@ export class ScoutDaemonV2 {
     }
 
     if (found) {
+      // #1：清掉网盘后端制造的编号重复字幕。放在**写 covered 之前**、且整体 try 住——
+      // 清理是增益，绝不许它挡住 R24 的本体（那才是这一列的唯一写入者）。
+      // 只在"确实有目标语言字幕"时做，且只在清单里真出现 `(n)` 候选时才读文件内容
+      // （见 cleanupNumberedDuplicates 的早退论证）。
+      if (listing !== null) {
+        try {
+          const cleanup = this.deps.cleanupDuplicates ?? cleanupNumberedDuplicates
+          for (const name of listTargetSidecarNames(videoPath, listing, targetValues)) {
+            const notes = cleanup(join(dirname(videoPath), name), listing)
+            if (Array.isArray(notes)) {
+              for (const n of notes as InstallCleanupNote[]) {
+                this.deps.log(n.warning
+                  ? `scan: ${n.warning}`
+                  : `scan: 清理了编号重复字幕 ${n.removed}`)
+              }
+            }
+          }
+        } catch (e) {
+          this.deps.log(`scan: 编号重复字幕清理失败（隔离，不影响状态判定）: ${videoPath}: ${String(e)}`)
+        }
+      }
       // 无条件写 covered：不论原状态是 NULL 还是停牌态。停牌的解除凭据就是这个（R23）。
       db.prepare(`UPDATE files SET sub_status = 'covered', sub_recheck_at = ?, updated_at = ?
                   WHERE path = ?`).run(now + SUB_RECHECK_INTERVAL_MS, now, videoPath)

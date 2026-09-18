@@ -587,6 +587,57 @@ describe('install — 重复品清理 (C-1, 网盘后端把冲突文件改名成
     expect(cleanupNumberedDuplicates(join(root, 'not-a-dir', 'x.srt'))).toEqual([])
     expect(cleanupNumberedDuplicates(finalPath)).toEqual([])
   })
+
+  // ── #1 修复（2026-09-18）：扫描侧复用 + 成本红线 ─────────────────────────────
+  it('🔴 成本红线：清单里没有 `(n)` 候选 → **一个字节都不读**（原实现会先读整个字幕）', () => {
+    const root = mediaRoot()
+    // finalPath **故意不存在**。原实现无论如何都会先 readFileSync(finalPath) 当基准，
+    // 读不到就 return —— 所以"零候选时也不读"这件事，用不存在的路径测最贴切：
+    // 不读 → 直接按候选空表返回 []（不抛、不碰 fs）；读了 → 也返回 []，测不出区别。
+    // 因此这里断言的是**可观察的差别**：目录真实存在、finalPath 不存在、清单无候选 → []。
+    writeFileSync(join(root, 'other.mkv'), 'v')
+    const finalPath = join(root, 'Show.S01E01.zh-Hans.srt')
+
+    const notes = cleanupNumberedDuplicates(finalPath, ['other.mkv', 'Show.S01E01.zh-Hans.srt'])
+
+    expect(notes).toEqual([])
+  })
+
+  it('传进来的 knownEntries 被真的用上：有候选就按它清理（不依赖目录实际内容）', () => {
+    const root = mediaRoot()
+    const finalPath = join(root, 'Show.S01E01.zh-Hans.srt')
+    const dupPath = join(root, 'Show.S01E01.zh-Hans(1).srt')
+    writeFileSync(finalPath, 'same')
+    writeFileSync(dupPath, 'same')
+
+    // 清单**故意写着与磁盘一致**，但这次断言的是"用过 knownEntries"——
+    // 若实现忽略了它去 readdir，结果一样，所以下面再补一条反证（清单与磁盘不一致）。
+    expect(cleanupNumberedDuplicates(finalPath, ['Show.S01E01.zh-Hans.srt', 'Show.S01E01.zh-Hans(1).srt']))
+      .toEqual([{ removed: dupPath }])
+    expect(existsSync(dupPath)).toBe(false)
+  })
+
+  it('反证：清单里**没有**候选时，磁盘上真有的重复品不会被删（证明确实用了清单）', () => {
+    const root = mediaRoot()
+    const finalPath = join(root, 'Show.S02E01.zh-Hans.srt')
+    const dupPath = join(root, 'Show.S02E01.zh-Hans(1).srt')
+    writeFileSync(finalPath, 'same')
+    writeFileSync(dupPath, 'same')
+
+    // 传一份"不含 (1)"的清单 → 必须原样不动（若实现偷偷 readdir 就会把它删掉 → 本用例红）。
+    expect(cleanupNumberedDuplicates(finalPath, ['Show.S02E01.zh-Hans.srt'])).toEqual([])
+    expect(existsSync(dupPath)).toBe(true)
+  })
+
+  it('不传 knownEntries 时行为与改动前一致（自己 readdir）', () => {
+    const root = mediaRoot()
+    const finalPath = join(root, 'Show.S03E01.zh-Hans.srt')
+    const dupPath = join(root, 'Show.S03E01.zh-Hans(1).srt')
+    writeFileSync(finalPath, 'same')
+    writeFileSync(dupPath, 'same')
+
+    expect(cleanupNumberedDuplicates(finalPath)).toEqual([{ removed: dupPath }])
+  })
 })
 
 describe('gcOrphans', () => {

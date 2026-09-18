@@ -136,9 +136,31 @@ export const UNDETERMINED_LANGUAGE = 'und'
  *  漂移实现"栽过（C30 两处标签集各漏一半）。特别注意不能改用 agent/languages.ts 的 langOf——
  *  它**只折叠中文别名 chi/zho/cmn/cn**，对 `chs`/`cht` 返回自身（实测），漏判简繁两种最常见
  *  的中文 sidecar 形态。 */
+/** 一个目录条目是否是**本视频**的外挂字幕，是则返回它的语言标记。
+ *  抽成函数是因为它现在有**两个**消费者（`listSidecarLanguages` 与
+ *  `listTargetSidecarPaths`），而 C30 那类"同一判据两份实现然后漂移"是本仓反复栽过的坑。 */
+function sidecarLanguageOf(videoBase: string, name: string): SubtitleLanguage | null {
+  const ext = SUBTITLE_EXTS.find((e) => name.toLowerCase().endsWith(e))
+  if (!ext) return null
+  const stem = name.slice(0, name.length - ext.length)
+  if (stem === videoBase) return UNDETERMINED_LANGUAGE
+  if (!stem.startsWith(`${videoBase}.`)) return null
+  const tag = stem.slice(videoBase.length + 1)
+  // 单段 tag（不含点）——多段的是别的视频的字幕或带修饰的文件名，不归本视频（C30）。
+  if (tag === '' || tag.includes('.')) return null
+  return languageForTag(tag)
+}
+
 export function listSidecarLanguages(
   videoPath: string,
   readdir: (dir: string) => string[],
+  /** 可选 sink：把这一次 readdir 的**原始条目**交回调用方。
+   *
+   *  存在的理由（性能契约，不是便利）：`daemonV2.observeSubtitle` 需要在**同一份目录清单**上
+   *  再判一次"有没有后端制造的编号重复兄弟字幕"。让它自己再 `readdir` 一次，
+   *  就把本函数下一段论证的"一趟 readdir 产出多个结论"的收益抵消掉了
+   *  ——rclone 的 readdir 不便宜，而扫描是对全库每个文件跑一遍的。 */
+  onListing?: (names: string[]) => void,
 ): SubtitleLanguage[] | null {
   const dir = dirname(videoPath)
   const videoBase = basename(videoPath).replace(/\.[^.]+$/, '')
@@ -152,20 +174,33 @@ export function listSidecarLanguages(
     // 与 embedded_langs / streamProbe 的 null-vs-[] 三态契约同源。
     return null
   }
+  onListing?.(names)
 
   const langs = new Set<SubtitleLanguage>()
   for (const name of names) {
-    const ext = SUBTITLE_EXTS.find((e) => name.toLowerCase().endsWith(e))
-    if (!ext) continue
-    const stem = name.slice(0, name.length - ext.length)
-    if (stem === videoBase) { langs.add(UNDETERMINED_LANGUAGE); continue }
-    if (!stem.startsWith(`${videoBase}.`)) continue
-    const tag = stem.slice(videoBase.length + 1)
-    // 单段 tag（不含点）——多段的是别的视频的字幕或带修饰的文件名，不归本视频（C30）。
-    if (tag === '' || tag.includes('.')) continue
-    langs.add(languageForTag(tag))
+    const lang = sidecarLanguageOf(videoBase, name)
+    if (lang !== null) langs.add(lang)
   }
   // 排序让这一列的值**稳定**：同一组字幕不该因为 readdir 的返回顺序（不同 FS 不同）而写出
   // 不同的 JSON 串，否则每轮观察都在改写同一行、updated_at 无谓翻新，且测试无从断言。
   return [...langs].sort()
+}
+
+/** 从一份**已经在手上**的目录清单里挑出当前目标语言的外挂字幕**文件名**（不碰文件系统）。
+ *
+ *  为什么需要它：清理编号重复品时必须知道"原件叫什么"。`listSidecarLanguages` 只返回语言集合、
+ *  把文件名丢了；再由调用方自己 readdir 一次就违反了上面那条性能契约。
+ *  让 `listSidecarLanguages` 通过 `onListing` 把清单交出来、在这里于内存中挑，是零额外 syscall 的路。 */
+export function listTargetSidecarNames(
+  videoPath: string,
+  names: string[],
+  tags: ReadonlySet<string>,
+): string[] {
+  const videoBase = basename(videoPath).replace(/\.[^.]+$/, '')
+  const out: string[] = []
+  for (const name of names) {
+    const lang = sidecarLanguageOf(videoBase, name)
+    if (lang !== null && tags.has(lang)) out.push(name)
+  }
+  return out
 }

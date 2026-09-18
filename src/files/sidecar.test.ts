@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { findExternalSidecar, languageForTag, KNOWN_LANGUAGE_TAGS, listSidecarLanguages } from './sidecar.js'
+import { findExternalSidecar, languageForTag, KNOWN_LANGUAGE_TAGS, listSidecarLanguages, listTargetSidecarNames } from './sidecar.js'
 import { tagsForLanguage } from '../agent/languages.js'
 
 // P0(zimuku 单源大考前置,2026-07-19):BCP-47 地区变体 tag 的语言换算与探测接线。
@@ -121,5 +121,76 @@ describe('🔴 listSidecarLanguages（R-F15 缺口② · 记录全部外挂字�
 
   it('🔴 目录里确实一条字幕都没有 → []（观察过、确认为空，与 null 严格区分）', () => {
     expect(listSidecarLanguages('/media/T/ep1.mkv', readdirOf(['ep1.mkv']))).toEqual([])
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #1 修复（2026-09-18）：onListing sink 与 listTargetSidecarNames。
+//
+// 存在理由是一条**性能契约**：清理编号重复字幕需要知道"原件叫什么文件名"，
+// 而 listSidecarLanguages 只返回语言集合、把文件名丢了。让调用方自己再 readdir 一次，
+// 就把"一趟 readdir 产出多个结论"的收益抵消掉了（本文件上方用 26 倍实测论证过这条）。
+// 所以用 sink 把同一份清单交出来、在内存里挑。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('onListing sink 与 listTargetSidecarNames', () => {
+  const listingOf = (names: string[]) => () => names
+
+  it('sink 拿到与语言判定**同一份**清单（不是再读一次目录）', () => {
+    const names = ['ep1.mkv', 'ep1.zh-Hans.ass', 'ep1.en.srt']
+    let calls = 0
+    let captured: string[] | null = null
+
+    const langs = listSidecarLanguages('/media/T/ep1.mkv', () => { calls++; return names }, (n) => { captured = n })
+
+    expect(calls).toBe(1)                       // 🔴 只 readdir 一次
+    expect(captured).toEqual(names)
+    expect(langs).toEqual(['en', 'zh-Hans'])
+  })
+
+  it('目录读不了时不调 sink（没观察到就没有清单可交）', () => {
+    let called = false
+    const langs = listSidecarLanguages('/media/T/ep1.mkv', () => { throw new Error('EIO') }, () => { called = true })
+    expect(langs).toBeNull()
+    expect(called).toBe(false)
+  })
+
+  it('sink 是可选的（既有调用点一字不改）', () => {
+    expect(listSidecarLanguages('/media/T/ep1.mkv', listingOf(['ep1.zh-Hans.ass']))).toEqual(['zh-Hans'])
+  })
+
+  it('listTargetSidecarNames 只挑**规范件**：编号重复品不算目标字幕（它是兄弟，由清理负责）', () => {
+    const names = [
+      'ep1.mkv',
+      'ep1.zh-Hans.ass',      // ✅ 目标
+      'ep1.zh-Hant.srt',      // ✅ 繁体也算 zh（coverageValuesFor 的既有值域）
+      'ep1.en.srt',           // ✗ 别的语言
+      'ep2.zh-Hans.ass',      // ✗ 别的视频
+      'ep1.zh-Hans(1).ass',   // ✗ 它的 tag 是 `zh-Hans(1)`——不是语言标记
+    ]
+    const got = listTargetSidecarNames('/media/T/ep1.mkv', names, new Set(['zh-Hans', 'zh-Hant']))
+    expect(got).toEqual(['ep1.zh-Hans.ass', 'ep1.zh-Hant.srt'])
+
+    // 🔴 这里要看清两层关系，否则会误以为漏了重复品（我第一版期望就写错了）：
+    //   · 本函数回答"**有哪些**目标语言字幕" → 只出规范件（`ep1.zh-Hans.ass`）
+    //   · 重复品 `ep1.zh-Hans(1).ass` 是**那个规范件的兄弟**，由 cleanupNumberedDuplicates
+    //     拿着同一份清单、按 `<规范件名>(n)<ext>` 正则找到并逐字节比对后清除
+    //   · 所以"重复品不在本函数的返回值里"是**正确行为**，不是遗漏：把它当成一条独立的
+    //     目标字幕，清理逻辑就会去给它找一个并不存在的"原件"。
+    expect(got).not.toContain('ep1.zh-Hans(1).ass')
+  })
+
+  it('tag 含点（多段）的条目仍不归本视频（C30 口径在抽取函数里只留一份）', () => {
+    const names = ['ep1.zh-Hans.ass', 'ep1.zh-Hans.forced.ass']
+    expect(listTargetSidecarNames('/media/T/ep1.mkv', names, new Set(['zh-Hans'])))
+      .toEqual(['ep1.zh-Hans.ass'])
+  })
+
+  it('无后缀标记（`ep1.ass`，语言未定）在目标集含 und 时被挑中', () => {
+    expect(listTargetSidecarNames('/media/T/ep1.mkv', ['ep1.ass'], new Set(['und']))).toEqual(['ep1.ass'])
+    expect(listTargetSidecarNames('/media/T/ep1.mkv', ['ep1.ass'], new Set(['zh-Hans']))).toEqual([])
+  })
+
+  it('空清单 → 空结果（不抛）', () => {
+    expect(listTargetSidecarNames('/media/T/ep1.mkv', [], new Set(['zh-Hans']))).toEqual([])
   })
 })
