@@ -1167,9 +1167,12 @@ export class ScoutDaemonV2 {
     }
     const changed: string[] = []
     // 只比**本深度**的键：另一种深度的键不归这一趟管（它的值与基线由它自己维护）。
-    for (const [k, s] of sig) if (prev!.get(k) !== s) changed.push(k.slice(k.indexOf(':') + 1))
+    // ⚠️ 用 `prefix.length` 切，**不要**用 `k.indexOf(':')`：键是 `d2:/hostroot/...`，按首个冒号切在
+    //    生产（Linux）上恰好等价，但 Windows 媒体根（`E:\media`）会被切成 `\media\…` —— 一个只在
+    //    别的平台上才现形的错。深度前缀的长度是**结构上**确定的，就用它。
+    for (const [k, s] of sig) if (prev!.get(k) !== s) changed.push(k.slice(prefix.length))
     // 本次深度内被删掉的目录也算变化（只比本深度的键，别把另一种深度的键当"被删"）
-    for (const k of prev!.keys()) if (k.startsWith(prefix) && !sig.has(k)) changed.push(k.slice(k.indexOf(':') + 1))
+    for (const k of prev!.keys()) if (k.startsWith(prefix) && !sig.has(k)) changed.push(k.slice(prefix.length))
     if (dur0 > 10_000) {
       this.deps.log(
         `⚠️ 库变更探测用时 ${Math.round(dur0 / 1000)}s（深度 ${maxDepth}，${sig.size} 个目录，预算 10s）` +

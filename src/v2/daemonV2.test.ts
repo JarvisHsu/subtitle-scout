@@ -7169,6 +7169,55 @@ describe('ScoutDaemonV2.requestInspect · 手动点火', () => {
     db.close()
   })
 
+  it('🔴 变更探测的基线必须按深度分别建：深档首次运行不许把整张表的键当成"变化"', () => {
+    // 第 47 轮验收的生产读数：浅档（深度 0）先建了基线，深档（深度 2）**第一次**运行时表里
+    // 一个 `d2:` 键都没有 ⇒ 127 个键全被判"变化"，打出 **126 处变化** 的假告警并白踢一次扫描。
+    // 判据必须是"**本深度**有没有基线"，不是"整张表有没有基线"。
+    const db = openDb(':memory:')
+    const logs: string[] = []
+    // 虚拟盘：readdir 只报**名字**。阶段 1（基线）还没有 s02；阶段 2 给它加一集。
+    let disk: Record<string, string[]> = {
+      '/media': ['Show'],
+      '/media/Show': ['E01.mkv'],
+      '/media/Show/E01.mkv': [],
+    }
+    const daemon = new ScoutDaemonV2(mkDeps(db, {
+      roots: ['/media'],
+      // 探测只走**可写根**（`writableRoots()` 过 `writableCache` 这层），不注入的话它一个根都不看，
+      // 用例会"绿得很便宜"——那也正是它第一次跑成 [] 的原因。
+      writableRoots: new Map([['/media', true]]),
+      // 关键：探测用 `node:path` 的 `join` 拼路径，在 Windows 上 `/media/Show` 会变成 `\media\Show`。
+      // 这个文件里别的用例不在此列（它们不让探测真的走），所以这里必须把分隔符归一化，
+      // 否则本用例在 Linux 上绿、在 Windows 上假红——而它要守的恰恰是**平台无关**的那条判据。
+      readdir: (d: string) => disk[d.replace(/\\/g, '/')] ?? [],
+      log: (m: string) => logs.push(m),
+    }))
+
+    // ① 浅档先建基线（真实启动顺序就是这样：浅档每拍都跑，深档要等 30 分钟才第一次跑）
+    expect((daemon as any).probeRootsChanged(0)).toEqual([])
+
+    // ② 深档第一次运行——只建基线，必须**报零处变化**
+    const deepFirst = (daemon as any).probeRootsChanged(2) as string[]
+    expect(deepFirst, '深档首次运行只建基线，不许报变化（第 47 轮的 126 处假告警就是这里）').toEqual([])
+
+    // ③ 给深档基线加一集：d2 会**走进**这个新条目（这正是"深度 2"的含义），所以它也得能列出来。
+    //    报出来的应当是**这一级和它里面变的那一级**（`/media/Show/E02.mkv` 在前 —— 它才是日志
+    //    取样 `如 …` 会显示的那一条，第 48 轮生产日志里显示的却是媒体根，所以这条断言有真实价值）；
+    //    路径由 `node:path.join` 拼出 ⇒ 断言时归一化分隔符（判据与平台无关）。
+    disk = {
+      '/media': ['Show'],
+      '/media/Show': ['E01.mkv', 'E02.mkv'],
+      '/media/Show/E02.mkv': [],
+    }
+    const changed = ((daemon as any).probeRootsChanged(2) as string[]).map((p) => p.replace(/\\/g, '/'))
+    expect([...changed].sort()).toEqual(['/media/Show', '/media/Show/E02.mkv'])
+
+    // ④ 同一状态再探一次 ⇒ 基线已消化，必须静默（否则就是每拍刷一条假告警的死循环）
+    expect((daemon as any).probeRootsChanged(2)).toEqual([])
+
+    db.close()
+  })
+
   it('🔴 workPermitted=false 时 requestInspect 不得吞掉待处理的 requestScan', async () => {
     // requestScan 故意不看 workPermitted（wizard 加根也要立刻看见文件）。
     // 点火被闸住时只该丢掉 inspect 标志，scan 标志必须留给下一圈。
