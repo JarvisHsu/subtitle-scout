@@ -2647,10 +2647,16 @@ export class ScoutDaemonV2 {
     //   · 其中 **14 个与规范件逐字节相同**（清理的判据成立），mtime 是 4~5 天前；
     //   · 它们所在行的 `sub_recheck_at` 还有 **2~3 天**才到点 ⇒ 正是那扇 7 天窗。
     //
-    // ── 为什么只碰**已缓存**的目录 ──────────────────────────────────────────────
-    // `dirCache` 是本次扫描这一趟的真源。只对已经在缓存里的目录跑，就一笔新 readdir 都不发
-    // （`cleanupNumberedDuplicates` 本身也是先按文件名筛、命中 `(n)` 候选才读内容）。
-    // 没被读到的目录留给 `observeSubtitle` 那条既有通路，**不新增探测**。
+    // ── 为什么**不**用 `dirCache` 当门（这一条是实测推翻的）─────────────────────
+    // 我最初只对"本次扫描已缓存的目录"清扫，想做到零新 IO。生产实测证明那是**自废武功**：
+    //   `covered=204`，`B 档（到点）=0`、A 档也为 0 ⇒ `dirCache` 大小 = **0**，
+    //   `covered 行中 dir 已在缓存的 = 0 / 204`。
+    // 而 dirCache 只在"有文件被观察"时才填——恰恰就是那扇 7 天窗。用它当门 ⇒ 清扫只在
+    // 7 天窗打开时才跑，等于什么都没修。
+    //
+    // 真实代价（远小于提案担心的那个）：每个 covered **目录**多一次 readdir（生产约几十个
+    // 目录，不是 204 次）。真正贵的是**读字幕内容**，而那一步仍在
+    // `cleanupNumberedDuplicates` 里按文件名早退把关：没有 `(n)` 候选就零读取。
     //
     // ⚠️ 判据仍归 `cleanupNumberedDuplicates`（逐字节相同才删）——这里**不**重写一份
     // "看起来像重复就删"的逻辑：生产里就有 1 个 `(n)` 文件与规范件**内容不同**
@@ -2662,7 +2668,6 @@ export class ScoutDaemonV2 {
       ).all() as Array<{ path: string; dir: string }>
       const coveredByDir = new Map<string, string[]>()
       for (const r of covered) {
-        if (!dirCache.has(r.dir)) continue          // ← 零新 IO 的那道门
         const list = coveredByDir.get(r.dir)
         if (list === undefined) coveredByDir.set(r.dir, [r.path])
         else list.push(r.path)
@@ -2670,8 +2675,12 @@ export class ScoutDaemonV2 {
       const cleanup = this.deps.cleanupDuplicates ?? cleanupNumberedDuplicates
       const targetValues = new Set(tagsForLanguage(this.deps.targetLanguage))
       for (const [dir, videoPaths] of coveredByDir) {
-        const listing = dirCache.get(dir) ?? null
-        if (listing === null) continue               // 缓存里是"读不出来"（FUSE 抖动）→ 跳过
+        let listing: string[]
+        try {
+          listing = cachedReaddir(dir)
+        } catch {
+          continue            // 目录读不出来（FUSE 抖动）→ 本轮跳过，下轮重试
+        }
         for (const videoPath of videoPaths) {
           for (const name of listTargetSidecarNames(videoPath, listing, targetValues)) {
             try {

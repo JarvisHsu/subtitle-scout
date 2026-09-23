@@ -2102,35 +2102,12 @@ describe('ScoutDaemonV2.scanOnce · P4 编号重复字幕的独立清扫（摆�
     db.close()
   })
 
-  it('🔴 零新 IO：清扫不给这个目录增加 readdir 次数', async () => {
-    // 建立基线：**同一形态但无重复候选**时这个目录被读几次
-    const base = openDb(':memory:')
-    seedRow(base, V, { sub_status: 'covered', sub_recheck_at: NOW + 5 * DAY })
-    const d0 = diskDeps(['E01.mkv', 'E02.mkv'])
-    await scan(new ScoutDaemonV2(mkDeps(base, {
-      roots: ['/media'], ...d0.deps, fileExists: () => true, cleanupDuplicates: vi.fn(() => []),
-    })))
-    const baseline = d0.readdirCalls.filter((d) => d === '/media/Show').length
-    base.close()
-
+  it('🔴 零**内容**读取：没有 (n) 候选时清扫一次都不调（cleanup 自己按文件名早退）', async () => {
+    // 目录清单（readdir）便宜且必要；贵的是把字幕**内容**读进来做逐字节比对。
+    // 没有 `(n)` 候选时，连 cleanup 都不该被叫到（listTargetSidecarNames 只返回规范的 sidecar）。
     const db = openDb(':memory:')
     seedRow(db, V, { sub_status: 'covered', sub_recheck_at: NOW + 5 * DAY })
-    const { deps, readdirCalls } = diskDeps(ENTRIES)   // 这一份**有** (n) 候选
-    await scan(new ScoutDaemonV2(mkDeps(db, {
-      roots: ['/media'], ...deps, fileExists: () => true, cleanupDuplicates: vi.fn(() => []),
-    })))
-    const withSweep = readdirCalls.filter((d) => d === '/media/Show').length
-
-    expect(withSweep, `清扫给目录增加了 readdir（${baseline} → ${withSweep}）`).toBe(baseline)
-    db.close()
-  })
-
-  it('🔴 目录本轮没被读到（不在缓存里）⇒ 不清扫，把成本留给既有通路', async () => {
-    const db = openDb(':memory:')
-    seedRow(db, V, { sub_status: 'covered', sub_recheck_at: NOW + 5 * DAY })
-    // V2 已在库 ⇒ 无 A 档新增 ⇒ 这个目录本轮不会被读（只有 V 一条路会，但它未到点）
-    seedRow(db, V2, { sub_status: 'covered', sub_recheck_at: NOW + 5 * DAY })
-    const { deps, readdirCalls } = diskDeps(ENTRIES)
+    const { deps } = diskDeps(['E01.mkv', 'E01.zh-Hans.srt', 'E02.mkv'])   // 规范件在，但没有 (n)
     const cleanup = vi.fn(() => [])
     const daemon = new ScoutDaemonV2(mkDeps(db, {
       roots: ['/media'], ...deps, fileExists: () => true, cleanupDuplicates: cleanup,
@@ -2138,8 +2115,29 @@ describe('ScoutDaemonV2.scanOnce · P4 编号重复字幕的独立清扫（摆�
 
     await scan(daemon)
 
-    expect(readdirCalls.filter((d) => d === '/media/Show')).toHaveLength(0)
-    expect(cleanup, '目录不在缓存里就不该清扫').not.toHaveBeenCalled()
+    // 清扫这一趟**跑到了**（下面那条用例证明），但它拿到的清单里没有 (n) 候选
+    for (const call of cleanup.mock.calls) {
+      const entries = call[1] as string[]
+      expect(entries.some((x) => /\(\d+\)/.test(x)), `清单里出现了 (n)：${entries.join(',')}`).toBe(false)
+    }
+    db.close()
+  })
+
+  it('🔴 不依赖目录缓存：A/B 档都为空（本轮没人被观察）时清扫照样跑', async () => {
+    // 这一条是**实测推翻我自己第一版实现**留下的回归锁：第一版拿 `dirCache` 当门，
+    // 而生产实测 `covered=204 / B档=0 / dirCache=0` ⇒ 清扫永远不跑，等于没修。
+    const db = openDb(':memory:')
+    seedRow(db, V, { sub_status: 'covered', sub_recheck_at: NOW + 5 * DAY })
+    seedRow(db, V2, { sub_status: 'covered', sub_recheck_at: NOW + 5 * DAY })   // V2 也已在库
+    const { deps } = diskDeps(ENTRIES)
+    const cleanup = vi.fn(() => [])
+    const daemon = new ScoutDaemonV2(mkDeps(db, {
+      roots: ['/media'], ...deps, fileExists: () => true, cleanupDuplicates: cleanup,
+    }))
+
+    await scan(daemon)
+
+    expect(cleanup, 'A/B 档都为空也必须有清扫（否则只在 7 天窗打开时才清）').toHaveBeenCalled()
     db.close()
   })
 
