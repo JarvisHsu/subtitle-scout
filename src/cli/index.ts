@@ -407,6 +407,10 @@ async function cmdWatch() {
       ? {
           db,
           runIdentify,
+          // #21b 接线：识别失败的**完整**原因落 runs（唯一有界的持久通道）。
+          // 不接的话，`files.last_error` 只有 100 字短摘要、console 日志 7 天就轮掉——
+          // 生产里那 4 个目录就是这样变成"考古现场"的（实测：日志已查无此据）。
+          runs,
           worker: {
             model: reasoningModel,
             tmdb: {

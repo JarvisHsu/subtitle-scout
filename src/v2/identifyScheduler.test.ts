@@ -15,6 +15,92 @@ function mkDeps(db: ReturnType<typeof openDb>, runIdentifyImpl: () => Promise<Id
   }
 }
 
+/** #21b：接上 runs 的 deps（生产在 cli/index.ts 里就是这么接的）。 */
+function mkDepsWithRuns(db: ReturnType<typeof openDb>, runIdentifyImpl: () => Promise<IdentifyReport>): IdentifySchedulerDeps {
+  return {
+    ...mkDeps(db, runIdentifyImpl),
+    runs: {
+      insert: (p) => {
+        db.prepare(
+          `INSERT INTO runs (job_id, started_at, finished_at, decision, detail, journal_path)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).run(p.jobId, p.startedAt, p.finishedAt, p.decision, p.detail, p.journalPath)
+      },
+    },
+  }
+}
+
+describe('#21b：识别失败的**完整**原因必须留痕（不能被 100 字截断）', () => {
+  const LONG = 'reasoning agent DID call the finalize tool, but its arguments failed schema validation — '
+    + 'execute() never ran, so no structured decision was captured. '
+    + 'Schema issues (first 2 of 3): [tmdbId] Expected number, received string; [mediaType] Invalid enum value. '
+    + 'Raw finalize args: {"tmdbId":"121860","mediaType":"tv-series","title":"狂赌之渊"}'
+
+  it('🔴 完整原因（含 zod 字段路径）落进 runs.detail —— 这正是生产里查不到的那一段', async () => {
+    const db = openDb(':memory:')
+    const workDir = '/media/TV/G【給@清｜梳】2026'
+    db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, updated_at)
+                VALUES (?,?,?,?,?,?,?)`)
+      .run(`${workDir}/1080p.mkv`, workDir, '1080p.mkv', 100, 1000, workDir, 1000)
+
+    const deps = mkDepsWithRuns(db, () => { throw new Error(LONG) })
+    await runIdentifyWorkDir(deps, {
+      workDir, dirName: 'G【給@清｜梳】2026', fileCount: 1, seasons: [], hasSeasonDirs: false,
+    })
+
+    const run = db.prepare('SELECT decision, detail FROM runs ORDER BY id DESC LIMIT 1').get() as
+      { decision: string; detail: string } | undefined
+    expect(run, '必须留下一条 runs 行').toBeDefined()
+    expect(run!.decision).toBe('identify-error')
+    // 关键断言：**字段路径**必须在（100 字截断下它永远看不到——生产就是栽在这里）
+    expect(run!.detail).toContain('[tmdbId]')
+    expect(run!.detail).toContain('[mediaType]')
+    expect(run!.detail).toContain('Invalid enum value')
+    // 而 files.last_error 仍是**短**摘要（它是判据列，不许被长文本污染）
+    const row = db.prepare('SELECT last_error FROM files WHERE work_dir = ?').get(workDir) as { last_error: string }
+    expect(row.last_error.length).toBeLessThanOrEqual(100)
+    expect(row.last_error).not.toContain('[tmdbId]')
+    db.close()
+  })
+
+  it('🔴 没接 runs 的构造点行为不变（可选 deps，不记也不抛）', async () => {
+    const db = openDb(':memory:')
+    const workDir = '/media/TV/Show'
+    db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, updated_at)
+                VALUES (?,?,?,?,?,?,?)`)
+      .run(`${workDir}/E01.mkv`, workDir, 'E01.mkv', 100, 1000, workDir, 1000)
+
+    const deps = mkDeps(db, () => { throw new Error(LONG) })
+    const report = await runIdentifyWorkDir(deps, {
+      workDir, dirName: 'Show', fileCount: 1, seasons: [], hasSeasonDirs: false,
+    })
+    expect(report.tmdbId).toBeNull()
+    expect((db.prepare('SELECT COUNT(*) AS n FROM runs').get() as { n: number }).n).toBe(0)
+    db.close()
+  })
+
+  it('🔴 runs.insert 抛错不许反噬识别轨（留痕是增益）', async () => {
+    const db = openDb(':memory:')
+    const workDir = '/media/TV/Show'
+    db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, updated_at)
+                VALUES (?,?,?,?,?,?,?)`)
+      .run(`${workDir}/E01.mkv`, workDir, 'E01.mkv', 100, 1000, workDir, 1000)
+
+    const deps: IdentifySchedulerDeps = {
+      ...mkDeps(db, () => { throw new Error('LLM timeout') }),
+      runs: { insert: () => { throw new Error('runs table is on fire') } },
+    }
+    const report = await runIdentifyWorkDir(deps, {
+      workDir, dirName: 'Show', fileCount: 1, seasons: [], hasSeasonDirs: false,
+    })
+    // 退避轨照旧推进（这才是识别轨的本职）
+    const row = db.prepare('SELECT attempt FROM files WHERE work_dir = ?').get(workDir) as { attempt: number }
+    expect(row.attempt).toBe(1)
+    expect(report.tmdbId).toBeNull()
+    db.close()
+  })
+})
+
 
 describe('runIdentifyWorkDir（识别轨 catch-all）', () => {
   it('🔴 识别抛错 → next_retry_at 推进（不 30s 死循环）', async () => {

@@ -7,6 +7,8 @@ import type { ScoutDb } from './db.js'
 import { verifyEvidence, titleFromDir, hasSeasonToken, IDENTIFY_GATE_VERSION, type TmdbEvidence } from './identify.js'
 import { parseFilename } from '../recognition/parseFilename.js'
 import type { IdentifyWorkerDeps, IdentifyReport, WorkDirFacts } from '../agent/identifyWorker.js'
+// #21b：完整留痕进 runs 时复用**同一个** capDetail（不手抄一份截断口径，同 C30 的既有教训）。
+import { capDetail } from './findSubtitleWorkerTask.js'
 
 /** D-3：从本簇文件里取**高置信**解析出的标题，作为一级标题证据交给 verifyEvidence。
  *
@@ -40,6 +42,29 @@ export interface IdentifySchedulerDeps {
   runIdentify: (deps: IdentifyWorkerDeps, facts: WorkDirFacts, runKey: string) => Promise<IdentifyReport>
   now?: () => number
   runKey?: (workDir: string) => string
+  /**
+   * #21b（2026-09-23）：识别失败的**完整**留痕去处。
+   *
+   * ── 为什么必须加这个（一次真实的排障失败）──────────────────────────────────
+   * 生产里 4 个目录长期挂在"认不出来"，而它们的 `files.last_error` 全是
+   * `reasoning agent DID call the finalize tool, but its arguments failed schema validation — execute() n`
+   * —— **正好断在"哪个字段错了"之前**。查下去发现：完整原因（`reasoningAgent` 那边其实已经
+   * 拼好了 zod issues（字段路径 + 消息，前 5 条））在**任何**持久位置都不存在：
+   *   · `files.last_error` 是 `e.message.slice(0, 100)` 截断的；
+   *   · `console.error` 只在 docker 日志里，7 天后已经被轮掉（实测 `--since 168h` 命中 0 条）。
+   * ⇒ 排障成了考古。而本仓**早就有**完整留痕的正规去处：`runs` 表（每条别的执行器
+   *   — subtitleScheduler / findSubtitleWorkerTask / realignWorkerTask — 都在往里写 detail），
+   *   identifyScheduler 是**唯一一个从没接过它**的路径。
+   *
+   * 可选：测试与未接线的构造点行为不变（不传就不记）。生产在 cli/index.ts 里接上。
+   */
+  runs?: {
+    insert: (p: {
+      jobId: number | null; startedAt: number; finishedAt: number; decision: string
+      detail: string; journalPath: string | null; llmCalls?: number; assrtCalls?: number
+      traceJson?: string | null
+    }) => void
+  }
 }
 
 export interface IdentifyQueueItem {
@@ -362,11 +387,27 @@ export async function runIdentifyWorkDir(
     // 🔴 B2（对抗审计）：识别抛错（超时/步数耗尽/LLM 5xx）必须回写退避——
     // 否则 next_retry_at 不动 → 每 30s 重选 → 烧钱死循环。
     const attempt = (deps.db.prepare('SELECT MAX(attempt) a FROM files WHERE work_dir = ?').get(facts.workDir) as { a: number }).a
+    // 短摘要进 files.last_error（它是**判据列**：队列谓词读 `last_error != 'tmdb-404'`，
+    // 且 dashboard 的未识别面按它分档）——保持 100 字上限不变，不拿长文本污染判据列。
     const err = e instanceof Error ? e.message.slice(0, 100) : String(e)
     deps.db.prepare(`
       UPDATE files SET attempt = ?, next_retry_at = ?, last_error = ?, updated_at = ?
       WHERE work_dir = ?
     `).run(attempt + 1, now + retryDelayMs(attempt), err, now, facts.workDir)
+    // #21b：**完整**原因进 runs（唯一有界的持久通道）。上限给 2000 而不是 capDetail 的默认
+    // 200：这条 detail 的用途就是"一眼定位哪个字段错了"，而 zod issues 列表本身就常超 200；
+    // runs 行按周清理，这个长度不会长期堆积。
+    const full = e instanceof Error ? e.message : String(e)
+    try {
+      deps.runs?.insert({
+        jobId: null, startedAt: now, finishedAt: now,
+        decision: 'identify-error', detail: capDetail(full, 2000),
+        journalPath: null,
+      })
+    } catch (logErr) {
+      // 留痕是增益，绝不许反噬识别轨（同本仓各运维器官的既有口径）。
+      console.error(`[identify-scheduler] 写 runs 留痕失败（隔离）: ${String(logErr)}`)
+    }
     console.error(`[identify-scheduler] ${facts.workDir} 抛错: ${err}（已推进退避轨）`)
     return { tmdbId: null, title: null, reason: `error: ${err}` }
   }
