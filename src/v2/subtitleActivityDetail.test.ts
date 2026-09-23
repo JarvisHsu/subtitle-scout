@@ -83,6 +83,41 @@ describe('REQ-1a 派生：谁能指向"某个文件"', () => {
     expect(detailFromEvent(ev('download_candidate', 'not json at all', {}), FILES[0]!)).toBeNull()
     expect(detailFromEvent(ev('search_source', '', ''), FILES[0]!)).toBeNull()
   })
+
+  // ── 🔴 第 61 轮：note 里混进**读不出来的字节**时，不许把乱码印给用户 ────────────
+  // 生产实证（HTTP 响应的原始字节里 `EF BF BD` 出现 6 次）：
+  //   下载失败：selected file not found in zip: ��ـ֮�Y���p.S01E07.chs.srt
+  // 坏字节只存在于 `runs.trace_json`（30/154 行），形态是 `锟斤拷` —— provider zip 条目名
+  // 经历 GBK↔UTF-8 双向误解码的产物；而 files/runs.detail/works 全都干净。
+  // 原始字节已丢（不是我们这边 decode 错），故选择"说清读不出来"而不是伪造一个名字。
+  it('🔴 下载失败的 note 含坏字节（U+FFFD）→ 换成"无法解码"，不印乱码', () => {
+    const bad = 'subhd prepare-download failed: selected file not found in zip: \uFFFD\uFFFD\uFFFD.S01E07.chs.srt'
+    const v = detailFromEvent(
+      ev('download_candidate', { candidateId: 'subhd:x', videoFilename: FILES[0]!.filename }, { error: bad }),
+      FILES[0]!,
+    )
+    expect(v!.note, '乱码没有信息量，还给用户"软件坏了"的观感').not.toContain('\uFFFD')
+    expect(v!.note).toBe('下载失败：（源站返回的文件名无法解码）')
+  })
+
+  it('provider 的 message 里含坏字节 → 同样不印乱码', () => {
+    const v = detailFromEvent(
+      ev('download_candidate', { candidateId: 'subhd:x', videoFilename: FILES[0]!.filename },
+        { error: 'subhd prepare-download failed: {"message":"文件 \uFFFD\uFFFD 不存在"}' }),
+      FILES[0]!,
+    )
+    expect(v!.note).not.toContain('\uFFFD')
+    expect(v!.note).toContain('无法解码')
+  })
+
+  it('正常 note 原样保留（判据是 U+FFFD 的确证，不是"看起来像乱码就吞掉"）', () => {
+    const v = detailFromEvent(
+      ev('download_candidate', { candidateId: 'subhd:x', videoFilename: FILES[0]!.filename },
+        { error: 'subhd prepare-download failed: {"message":"服务器内部错误"}' }),
+      FILES[0]!,
+    )
+    expect(v!.note).toBe('下载失败：服务器内部错误')
+  })
 })
 
 function expectDetail(m: Map<string, any>, key: string) {

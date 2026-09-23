@@ -68,6 +68,34 @@ function trim(s: string): string {
   return s.length > NOTE_CAP ? `${s.slice(0, NOTE_CAP - 1)}…` : s
 }
 
+/** 🔴 第 61 轮：这行 note 里若混进了**读不出来的字节**，就别把它印给用户看。
+ *
+ *  ── 修的是什么（生产实测，`GET /api/v2/workbench/runs/last-subtitle` 的原始字节）──
+ * 界面那行 detail 出现了 `下载失败：selected file not found in zip: ��ـ֮�Y���p.S01E07.chs.srt`。
+ * 逐层查下来，坏字节只存在于**一个**地方：`runs.trace_json`（30/154 行含 U+FFFD），
+ * 形态是 `锟斤拷锟斤拷&英锟斤拷` —— 那是 provider zip 条目名经历了 **GBK↔UTF-8 双向误解码**
+ * 的典型产物（`archiveEntries` 字段）。而 `files.last_error`(0/224)、`runs.detail`(0/158)、
+ * `files.filename`(0/816)、`works.title`(0/77) **全都干净**，`/cache/result-sets` 的
+ * 687 个文件也 **0** 个坏字节 ⇒ 坏字节是**源端 zip 元数据**带来的，不是我们写库写坏的。
+ *
+ * ── 为什么是"不显示"而不是"修好它"──────────────────────────────────────────
+ * 原始字节在双向误解码里**已经丢了**，无法还原（这不是我们这边 decode 错了，去修 decode
+ * 也无从下手）。而那段文字现在**没有任何信息量**，还给用户一种"这软件坏了"的观感
+ * （本仓的 Carbon 双通道：文字自己要把话说全——而乱码说的是"你读不出我"）。
+ * 故：**说清"读不出来"，并保留真正有信息量的那半句**。
+ *
+ * 判据用 U+FFFD（UTF-8 替换字符）而不是"看起来像乱码"：
+ * 它是解码失败在字节层的**确证**，不是审美判断（不能因为"像乱码"就吞掉合法内容）。 */
+function hasUndecodable(s: string): boolean {
+  return s.includes('\uFFFD')
+}
+
+/** 把可能含坏字节的一段收拾成可读的：坏就换成一句人话，好就原样。 */
+function readable(s: string | null): string | null {
+  if (s === null) return null
+  return hasUndecodable(s) ? '（源站返回的文件名无法解码）' : s
+}
+
 /** 取文件身份：`videoFilename`（download_candidate）与 `filename`（check_episode_code_safety） */
 function eventFilename(args: Record<string, unknown> | null): string | null {
   if (args === null) return null
@@ -90,7 +118,7 @@ function downloadNote(result: Record<string, unknown> | null): string | null {
   // 或 `Command failed: curl …`。前者能取出中文人话；后者只留前 72 字——原始错误必须留痕，
   // 但界面不该被一整条 curl 命令行淹没。
   const msg = /"message"\s*:\s*"([^"]+)"/.exec(err)
-  return msg !== null ? trim(`下载失败：${msg[1]}`) : trim(`下载失败：${err}`)
+  return msg !== null ? trim(`下载失败：${readable(msg[1])}`) : trim(`下载失败：${readable(err)}`)
 }
 
 /** 把一条 trace 事件翻译成 detail 片段；事件与文件无关（识别类工具）时返回 null。 */
@@ -137,7 +165,7 @@ export function detailFromEvent(e: TraceEvent, file: DetailPlanFile): DetailEven
     const expected = str(result?.expectedCode)
     let note: string | null = null
     if (safe === false) {
-      note = expected === null ? '季集号不安全' : `季集号不安全（应为 ${expected}）`
+      note = expected === null ? '季集号不安全' : `季集号不安全（应为 ${readable(expected)}）`
     }
     return { step: e.tool, source: null, note, ms }
   }
