@@ -229,6 +229,83 @@ describe('verifyEvidence 的文件名腿（D-3：高置信文件名升为一级�
     expect(verifyEvidence(ev, base, 'Pulp Fiction')).toEqual({ ok: true })
     expect(verifyEvidence(ev, { ...base, fileTitles: [] }, 'Pulp Fiction')).toEqual({ ok: true })
   })
+
+  // ── 🔴 #21a（第 54 轮，2026-09-23）：目录名被污染时，**干净文件名**要能救场 ──────────
+  // 生产读数：`AUDIO LIST ENG LATINO SPANISH FRENCH (CA)` 目录里唯一文件是干净的
+  // `Moana.2026.2160p.DSNP.WEB-DL.DV.HDR.MULTi…mp4`，agent 已核对 TMDB 1108427，
+  // 却在写库门被拒两次（`title mismatch: candidate="Moana" vs dir="AUDIO LIST …"`）。
+  // 根因：`highConfidenceFileTitles` 要求 `confidence === 'high'`（有季集结构），
+  // 而**电影文件名永远没有季集结构** ⇒ 电影这一档的文件名证据**结构性**用不上。
+  describe('#21a：目录名腿没过时，宽档（任意解析出的标题）才允许救场', () => {
+    const moana = {
+      id: 'tmdb:1108427', title: 'Moana', originalTitle: 'Moana',
+      year: 2026, mediaType: 'movie' as const,
+    }
+    // 生产实测：parseFilename 对这个文件给出 `Moana 2026 2160p DSNP`（低置信，无季集）
+    const audioList = {
+      dirName: 'AUDIO LIST ENG LATINO SPANISH FRENCH (CA)',
+      fileCount: 1, seasons: [] as number[], hasSeasonDirs: false,
+      fileTitles: [] as string[],            // 高置信档：空（电影没有季集结构）
+      looseFileTitles: ['Moana 2026 2160p DSNP'],
+    }
+
+    it('🔴 生产实案：目录名不是作品名，但干净文件名里有标题 → 通过', () => {
+      expect(verifyEvidence(moana, audioList, 'AUDIO LIST ENG LATINO SPANISH FRENCH (CA)'))
+        .toEqual({ ok: true })
+    })
+
+    it('🔴 宽档救不了**无关**候选（文件名里有 Moana，候选是别的片子 → 照拒）', () => {
+      expect(verifyEvidence(
+        { ...moana, title: 'Completely Different Movie', originalTitle: 'Completely Different Movie' },
+        audioList,
+        'AUDIO LIST ENG LATINO SPANISH FRENCH (CA)',
+      )).toEqual({ ok: false, reason: expect.stringContaining('title mismatch') })
+    })
+
+    it('🔴 目录名腿没过、宽档也与候选不匹配 → 照拒（宽档不是万能放行条）', () => {
+      expect(verifyEvidence(
+        { id: 'tmdb:999', title: 'Completely Different Show', originalTitle: null, year: 2020, mediaType: 'tv' },
+        {
+          dirName: 'G 爱G公寓5 (2020)', fileCount: 36, seasons: [5], hasSeasonDirs: true,
+          fileTitles: ['Ipartment'], looseFileTitles: ['Ipartment'],
+        },
+        'G 爱G公寓5 (2020)',
+        ['爱情公寓'],
+      )).toEqual({ ok: false, reason: expect.stringContaining('title mismatch') })
+    })
+
+    it('🔴 宽档命中 ≠ 双证据条被放松：标题过了但结构证据不足，仍拒', () => {
+      // 目录名腿没过 ⇒ 宽档参与、标题腿过；但本作品无年份/无季目录/非 movie ≤10 ⇒ 第二条腿空
+      expect(verifyEvidence(
+        { id: 'tmdb:84947', title: 'iPartment', originalTitle: null, year: null, mediaType: 'tv' },
+        {
+          dirName: 'G 爱G公寓5 (2020)', fileCount: 50, seasons: [], hasSeasonDirs: false,
+          fileTitles: [], looseFileTitles: ['Ipartment'],
+        },
+        'G 爱G公寓5 (2020)',
+      )).toEqual({ ok: false, reason: expect.stringContaining('no independent') })
+    })
+
+    it('🔴 目录名腿**已过**时宽档不参与（原行为一字不改：结构证据不足仍拒）', () => {
+      // 目录名直接匹配 ⇒ 走原来那条路，宽档不许把双证据条放松
+      expect(verifyEvidence(
+        { id: 'tmdb:84947', title: 'iPartment', originalTitle: null, year: null, mediaType: 'movie' },
+        {
+          dirName: 'iPartment', fileCount: 50, seasons: [], hasSeasonDirs: false,
+          fileTitles: [], looseFileTitles: ['Ipartment'],
+        },
+        'iPartment',
+      )).toEqual({ ok: false, reason: expect.stringContaining('no independent') })
+    })
+
+    it('looseFileTitles 缺席 → 行为与之前逐字一致（旧调用点不受影响）', () => {
+      const ev = { id: 'tmdb:999', title: 'Wrong Show', originalTitle: 'Wrong Show', year: 2008, mediaType: 'tv' as const }
+      const facts = { dirName: '绝命毒师 (2008)', fileCount: 62, seasons: [1], hasSeasonDirs: true }
+      // 宽档缺席 ⇒ 与上面 `名字不匹配 → 拒绝` 那条完全相同
+      expect(verifyEvidence(ev, facts, '绝命毒师'))
+        .toEqual({ ok: false, reason: expect.stringContaining('title mismatch') })
+    })
+  })
 })
 
 // D-4（2026-09-18）：目录名里的季/集标记 = "这是剧集"的独立结构证据，也参与类型推断。

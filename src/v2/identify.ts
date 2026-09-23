@@ -97,6 +97,12 @@ export interface DirFacts {
    *  当标题，里面还混着分辨率/编码/发布组（`2160p`/`x265`/`DreamHD`），拿它当标题证据等于给
    *  幻觉开门。收紧到这里，"文件名证据"才是**比目录名更精确**而不是更松的东西。 */
   fileTitles?: string[]
+  /** #21a（2026-09-23）：**低置信**文件名标题——只有**目录名腿没过**时才会被拿来救场。
+   *  与 `fileTitles` 分开成两个字段是为了让"什么时候允许放宽"这件事**落在调用方**
+   *  （它知道哪些标题是高置信的），而不是在判据里重算一遍 confidence。
+   *  沿用 D-3 的立意：目录名被污染时，干净文件名是**唯一**能自证身份的材料。
+   *  缺席 = 与以前逐字一致。 */
+  looseFileTitles?: string[]
   /** D-4（2026-09-18）：目录名里带季/集标记（`全1-5季`、`Season 3`、`S01`…）——这是
    *  「该作品是剧集」的**独立结构证据**，见 `hasSeasonToken` 的完整论证。
    *  缺席 = 视为无该证据（旧调用点行为不变）。 */
@@ -150,15 +156,40 @@ export function verifyEvidence(
 
   // 标题证据的两条**并列**腿（D-3）：
   //   ① 目录名腿——候选与 `targetTitle`（已由 titleFromDir 清洗的目录名）互为包含
-  //   ② 文件名腿——候选与某个**高置信文件名标题**互为包含
+  //   ② 文件名腿——候选与某个文件名标题互为包含
   // 为什么不合并成一组候选去比 targetTitle：那是最弱的形态，**救不了它要救的场景**。
   // 生产实案 `G 爱G公寓5 (2020)`：目录名被注入了 `G`，`Ipartment`（文件名干净解析出的标题）
   // **不可能**是 `g爱g公寓5` 的子串，而 TMDB 的 zh 译名是 `爱情公寓`（不是目录名里的片段）——
   // 于是"并入候选再比目录名"照样 FAIL。文件名证据的价值恰恰在于它**能独立支撑**，不依赖目录名。
   // 判据仍是同一份 `matches()`（防漂移），只是把"被测串"换成文件名标题。
   const fileTitles = (dirFacts.fileTitles ?? []).map(normalize).filter((t) => t !== '')
-  const titleOk = matches(titleCandidates, normTarget)
-    || fileTitles.some((ft) => matches(titleCandidates, ft))
+  const dirLegOk = matches(titleCandidates, normTarget)
+
+  // 🔴 #21a（第 54 轮，2026-09-23）：文件名腿分**两档**，由"目录名腿过没过"决定用哪一档。
+  //
+  // ── 修的是什么（生产读数）────────────────────────────────────────────────
+  // `AUDIO LIST ENG LATINO SPANISH FRENCH (CA)` 目录，唯一文件是干净的
+  // `Moana.2026.2160p.DSNP.WEB-DL.DV.HDR.MULTi…mp4`。agent 已经核对了 TMDB 1108427
+  // （标题+年份都对上），却在写库门被拒两次：
+  //   `evidence-fail: title mismatch: candidate="Moana" vs dir="AUDIO LIST …"`
+  // 根因是上面那个 `highConfidenceFileTitles` 的**高置信**门槛：它要求 `parse_confidence ===
+  // 'high'`（有季集结构），而**电影文件名永远没有季集结构** ⇒ 电影这一档的文件名证据
+  // **结构性地**用不上。生产实测该文件解析出来是 `Moana 2026 2160p DSNP`——里面明明有标题，
+  // 却因为"不是 high"被整条丢掉。D-3 的立意（"目录名被污染时用干净文件名判"）在电影上从未生效。
+  //
+  // ── 为什么必须按"目录名腿过没过"分档（而不是一律放宽）──────────────────────
+  // 宽档不能替代目录名腿：`G 爱G公寓5 (2020)` 目录下放一个别作品的 `Completely Different
+  // Show`，宽档会拿文件名去放行——那是**误放**（既有用例 `误放防线` 正锁着这条）。
+  // 而"目录名压根不匹配、靠文件名救"是另一回事：此时文件名是**唯一**的自证材料，
+  // 放行它不会让"本来靠目录名匹配"的路径变松。故：
+  //   · 目录名腿已过 ⇒ 只认**高置信**文件名（原行为，一字不改）
+  //   · 目录名腿没过 ⇒ 才把宽档（任意解析出的标题）拿出来救
+  // 这一条同时解释了本文件既有的两种拒绝文案：宽档命中不了 ⇒ `title mismatch`；
+  // 标题过了但结构证据不足 ⇒ `no independent`。
+  const fileTitlesWide = dirLegOk
+    ? fileTitles
+    : [...new Set([...fileTitles, ...(dirFacts.looseFileTitles ?? []).map(normalize).filter((t) => t !== '')])]
+  const titleOk = dirLegOk || fileTitlesWide.some((ft) => matches(titleCandidates, ft))
   if (!titleOk) {
     return { ok: false, reason: `title mismatch: candidate="${candidate.title}" vs dir="${targetTitle}"` }
   }

@@ -35,6 +35,25 @@ function highConfidenceFileTitles(
   return [...out]
 }
 
+/** #21a（2026-09-23）：**任意**能解析出标题的文件名——供 verifyEvidence 在"目录名腿没过"时救场。
+ *
+ *  为什么与 `highConfidenceFileTitles` 分开：那个门槛要求 `confidence === 'high'`（有季集结构），
+ *  而**电影文件名永远没有季集结构** ⇒ 电影这一档的文件名证据**结构性地**用不上
+ *  （生产实案 `Moana.2026.2160p.DSNP.WEB-DL.DV.HDR.MULTi…mp4` 解析出 `Moana 2026 2160p DSNP`，
+ *  标题明明在里面，却因为"不是 high"被整条丢掉）。低置信标题里混着分辨率/编码片段，
+ *  所以**只在目录名腿已经失败时才允许它参与**——那个决定权在 verifyEvidence（见其注释）。 */
+function anyFileTitles(
+  files: Array<{ filename: string; confidence: string }>,
+): string[] {
+  const out = new Set<string>()
+  for (const f of files) {
+    if (f.confidence === 'high') continue   // 高置信的由上面那个函数负责，不重复进宽档
+    const t = parseFilename(f.filename).title
+    if (t != null && t !== '') out.add(t)
+  }
+  return [...out]
+}
+
 export interface IdentifySchedulerDeps {
   db: ScoutDb
   worker: IdentifyWorkerDeps
@@ -248,6 +267,8 @@ export async function runIdentifyWorkDir(
       //   文件名  = 「The.Expanse.S01E01.2015.2160p.AMZN.WEB-DL.DDP5.1.H265.HDR.DV.2Audio-年糕.mkv」
       // 目录名里**没有** "theexpanse"（D-2 的 CJK 门也救不了它），只有文件名能证明身份。
       fileTitles: highConfidenceFileTitles(facts.files),
+      // #21a：低置信标题只在"目录名腿没过"时才会被 verifyEvidence 采用（见该字段的论证）。
+      looseFileTitles: anyFileTitles(facts.files),
       // D-4：目录名里的季/集标记（`全1-5季` 等）= "这是剧集"的独立结构证据。
       dirHasSeasonToken: hasSeasonToken(facts.dirName),
       // 🔴 2026-08-08 实测：必须用 titleFromDir 清洗后的标题（去掉年份/花括号），
