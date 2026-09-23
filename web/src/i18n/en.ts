@@ -691,6 +691,19 @@ export const en = {
   wb_detail_check_episode_code_safety: 'checking episode code',
   wb_detail_install_subtitle: 'installing',
   wb_detail_searched: 'searched',
+  // ── wb_last_* (REQ-1c, 2026-09-23): the post-hoc "last subtitle run" card.
+  // Error state and empty state are ALWAYS two different sentences (§4.4): wb_last_error is
+  // "I could not ask", wb_last_none is "the backend answered: never ran".
+  wb_last_head: 'Last subtitle run',
+  wb_last_none: 'No subtitle run yet',
+  wb_last_error: 'Could not load the last run',
+  wb_last_nofiles: 'The run happened, but the files it mentions no longer match this library (deleted or renamed)',
+  wb_last_noaction: 'No action recorded for this run',
+  wb_last_decision_unknown: 'finished',
+  wb_last_decision_installed: 'installed',
+  wb_last_decision_error: 'errored',
+  wb_last_decision_identity: 'identify only',
+  wb_last_decision_no_outcome: 'no usable subtitle',
   // ── wb_node_*：**步骤条节点名**（短名词）。日志行要一句话，节点只有巴掌大一格，
   // 且 .wb-stage-label 是 nowrap + ellipsis → 节点文案必须短且不共用开头。
   // zh 侧同族词条附有 2026-08-26 的截图实测记录。

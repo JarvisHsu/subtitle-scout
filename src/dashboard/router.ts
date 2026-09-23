@@ -1,7 +1,7 @@
 // src/dashboard/router.ts
 import type {
   RunHistoryDTO, SettingsDTO, DeploySettingsDTO, FsListResult,
-  WorkflowPendingDTO, WorkflowPassDTO, RunTraceDTO,
+  WorkflowPendingDTO, WorkflowPassDTO, RunTraceDTO, LastSubtitleRunDTO,
   DormantTaskDTO,
 } from './apiV2.js'
 import type { MediaLibraryItemDTO, MediaLibraryDetailDTO } from './mediaLibraryApi.js'
@@ -37,6 +37,10 @@ export interface RouterDeps {
    *   2026-08-13 删除，见 apiV2.ts 的墓碑注释；本端点只读收官后落库的完整快照。）
    *  id 已在本文件里做纯数字校验+转 number 后再传入。 */
   runTrace: (id: number) => RunTraceDTO | null
+  /** REQ-1c（2026-09-23）：GET /api/v2/workflow/runs/last-subtitle——**最近一次字幕任务的
+   *  逐文件明细**，供刷新页面/第二天回来仍能回看。纯读 `runs.trace_json` + `files`，
+   *  派生复用 REQ-1a 的同一个函数（live 与 post-hoc 同一份翻译，不可能漂移）。 */
+  lastSubtitleRun: () => LastSubtitleRunDTO
   /** Plan C（spec §4.1）：GET /api/v2/subtitle/shifted——Triage 第三区 + Library 详情偏移行。
    *  纯读。备份文件存在性探测（hasPriorCorrection）关在 server.ts 的注入闭包里，这一层
    *  和 fsList 一样不碰文件系统。 */
@@ -154,6 +158,13 @@ export function handleApiRoute(
   if (trm) {
     const trace = deps.runTrace(Number(trm[1]))
     return trace ? { status: 200, json: trace } : { status: 404, json: { error: 'not found' } }
+  }
+
+  // REQ-1c：GET /api/v2/workflow/runs/last-subtitle——最近一次字幕任务的逐文件明细。
+  // 字面量路径，与上面那条的正则**不会**互相遮挡（`\d+` 匹配不上 `last-subtitle`），
+  // 但仍然放在它旁边：同族读的是同一张表、同一个语义（"回看某一次 run"）。
+  if (pathname === '/api/v2/workflow/runs/last-subtitle') {
+    return { status: 200, json: deps.lastSubtitleRun() }
   }
 
   // GET /api/v2/triage 已删除（2026-08-13，同 /api/parked——它的 body 就是 { pending:

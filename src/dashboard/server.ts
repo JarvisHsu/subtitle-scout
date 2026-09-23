@@ -16,7 +16,7 @@ import {
   buildRuns,
   buildSettings, buildDeploySettings, listMediaSubdirs, updateSettings, addMediaRoot,
   buildWorkflowPending, buildWorkflowPasses,
-  redispatch, buildRunTrace, buildDormantTasks,
+  redispatch, buildRunTrace, buildDormantTasks, buildLastSubtitleRun,
 } from './apiV2.js'
 // R-F2 / R-F5：媒体库页数据层（新架构 files/works/tmdb_seasons）。刻意与 apiV2.js 分开
 // import —— 两套 builder 读的是完全不同的表，混在一行会让"哪个长在旧表上"不可见。
@@ -537,6 +537,8 @@ export function startDashboard(opts: DashboardOpts): Promise<Server> {
     workflowPending: () => buildWorkflowPending(db, settingsRepo, Date.now()),
     workflowPasses: (limit) => buildWorkflowPasses(db, limit),
     runTrace: (id) => buildRunTrace(db, id),
+    // REQ-1c：最近一次字幕任务的逐文件明细（事后可回看）。
+    lastSubtitleRun: () => buildLastSubtitleRun(db),
     // Plan C：两个只读 GET。shifted 复用 subDeps 的 repo + exists（同一份 existsSync 实现，
     // 见上方 subDeps 的 wiring），backupSuffix 用与两个写扳手同一个常量——三处必须同源，
     // 否则 UI 上"可撤销"与后端"撤销会成功"会错位。

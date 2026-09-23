@@ -84,6 +84,8 @@ import { stepActionKey, stageOf } from './stepPhrase.js'
 // 函数本体保留在 workbenchRouting.ts（有测试、语义正确、导出可用），只是本页不 import 它。
 import { inspectFreshness, liveFreshness, relAgoLabel, relUntilLabel, msUntilNextInspect, workPermission, type LiveFreshness } from './inspectFreshness.js'
 import { RunCard, QueueCard, type WorkbenchCardFace } from './WorkbenchCards.js'
+// REQ-1c（2026-09-23）：事后可回看——最近一次字幕任务读 DB 出来的逐文件明细。
+import { LastRunCard } from './LastRunCard.js'
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 当前态：SSE 增量 + health 快照纠正（per-workbench 三槽，2026-08-30）
@@ -335,12 +337,15 @@ function useStepLog(workId: string | null | undefined): string[] {
  * 两者可以任意组合出现（实时通道好好的、而挂载掉了，是最常见的那一种）。
  */
 function StatusBar({
-  health, currents, status, reloadHealth,
+  health, currents, status, reloadHealth, onInspectSettled,
 }: {
   health: HealthDTO | null
   currents: Currents
   status: EventsStatus
   reloadHealth: () => void
+  /** REQ-1c：一轮巡检收尾时通知父层（父层据此让「最近一次运行」回看卡重拉）。
+   *  状态**不能**留在这里——它要喂给 TabPanel，而两者是兄弟组件。 */
+  onInspectSettled: () => void
 }) {
   const { t, lang } = useT()
   const activity = useActivityEvent()
@@ -393,8 +398,11 @@ function StatusBar({
     setRoundLive(false)
     setPending(false)
     inFlightRef.current = false
+    // REQ-1c：这一轮跑完了 ⇒ 「最近一次运行」的内容才真的变了，通知父层重拉回看卡。
+    // 不用轮询：静默时段里它是不会变的，轮询纯属浪费。
+    onInspectSettled()
     reloadHealth()
-  }, [reloadHealth])
+  }, [reloadHealth, onInspectSettled])
 
   useEffect(() => { applyRound(activity) }, [activity, applyRound])
   useEffect(() => { applyRound(healthEvent) }, [healthEvent, applyRound])
@@ -585,7 +593,7 @@ function faceOf(item: ActivityQueueItemDTO, t: ReturnType<typeof useT>['t'], lan
 }
 
 function TabPanel({
-  tab, current, queue, queueByWorkId, live, logLines,
+  tab, current, queue, queueByWorkId, live, logLines, lastRunNonce,
 }: {
   tab: ActivityTab
   current: Current | null
@@ -593,6 +601,8 @@ function TabPanel({
   queueByWorkId: Map<string, ActivityQueueItemDTO>
   live: LiveFreshness
   logLines: string[]
+  /** REQ-1c：转给事后回看卡的刷新 nonce（与 `reloadToken` 无关，见调用处的论证）。 */
+  lastRunNonce?: number
 }) {
   const { t, lang } = useT()
   const queued = current && current.kind === tab
@@ -675,6 +685,14 @@ function TabPanel({
           </ul>
         </>
       )}
+
+      {/* REQ-1c（2026-09-23）：**事后可回看**——最近一次字幕任务读 DB 出来的逐文件明细。
+          刻意挂在「没有在跑」的分支里：跑着的时候上面那张直播卡已经把"正在发生的事"说全了，
+          再挂一张列表只会让同一件事出现两遍。字幕专属（后端只认字幕路径的 run），
+          故两个 tab 都显示，标题里点明是字幕台的。
+          刷新用**独立**的 nonce，不复用 `reloadToken`（那是队列/通知的键，跟它绑在一起会在
+          无关变化时白拉一次）。 */}
+      {current === null && <LastRunCard reloadNonce={lastRunNonce} />}
     </div>
   )
 }
@@ -685,6 +703,15 @@ function TabPanel({
 
 export function ActivityPage() {
   const { t, lang } = useT()
+  /** REQ-1c：事后回看卡（`LastRunCard`）的刷新 nonce。**必须是这一层的状态**——
+   *  触发它的是一轮巡检收尾（`StatusBar` 里判的），而消费它的是 `TabPanel`，两者是兄弟。
+   *  递增而不是让卡轮询：那一刻"最近一次运行"才真的变了，静默时段它不会变。 */
+  const [lastRunNonce, setLastRunNonce] = useState(0)
+  /** ⚠️ **必须 useCallback**：这个回调经 `StatusBar` 传进 `applyRound`，而 `applyRound` 是
+   *  两个 `useEffect` 的依赖。给一个每次渲染都新建的箭头函数，会让那两个 effect **每次渲染
+   *  都重跑**——实测后果是「SSE 重连后 inspectRound 游标归零」那条既有用例当场变红
+   *  （小 id 的 end 事件被反复重放、时序错位）。在**这里**，回调身份的稳定性是语义要求。 */
+  const onInspectSettled = useCallback(() => setLastRunNonce((n) => n + 1), [])
   const { data: health, reload: reloadHealth } = useHealth()
   const { data: activityData, loading, error, reload: reloadActivity } = useActivity()
   const status = useEventsStatus()
@@ -732,7 +759,13 @@ export function ActivityPage() {
   return (
     <Section className="mx-auto w-full max-w-page">
       <div className="flex flex-col gap-3">
-        <StatusBar health={health} currents={currents} status={status} reloadHealth={reloadHealth} />
+        <StatusBar
+          health={health}
+          currents={currents}
+          status={status}
+          reloadHealth={reloadHealth}
+          onInspectSettled={onInspectSettled}
+        />
 
         <div className="wb-tabs" role="tablist" aria-label={t('wb_tablist_label')}>
           {ACTIVITY_TABS.map((id) => (
@@ -767,6 +800,7 @@ export function ActivityPage() {
             queueByWorkId={queueByWorkId}
             live={liveFreshness(status)}
             logLines={logLines}
+            lastRunNonce={lastRunNonce}
           />
         )}
       </div>

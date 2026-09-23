@@ -7,32 +7,9 @@
 // 计数与形态判定全在 targetState.ts 的纯函数里，这里只负责渲染。四档文案走 wb_grid_*，
 // pendingSource 为 0 时不追加那一段（多数剧集所有集都有源，恒挂「0 暂缺」是噪声）。
 import { useT, type TKey } from '../i18n/useT.js'
-import { en } from '../i18n/en.js'
 import { countStates, isSingleFileGrid, type Target } from './targetState.js'
-
-/**
- * 工具名 → 人话。**查不到就照实回显工具名本身**，绝不落回一个泛泛的"处理中"：
- * 工具集合是后端的事（`findSubtitleWorker.tools.ts` 加一个工具，前端不会自动知道），
- * 显示 `some_new_tool` 让人看得见"有个动作我没见过"，比显示"正在处理"这种抹平一切的空话
- * 有用得多（本仓对"把不知道的说成知道"有红线）。
- *
- * 用 `en` 表探键而不是 `t(key)` 后判空：`t` 的键类型是 `keyof typeof en`（静态字面量联合），
- * 传运行期字符串既过不了类型检查、返回 undefined 时也没有兜底。
- */
-function stepLabel(t: (k: TKey) => string, step: string): string {
-  const key = `wb_detail_${step}`
-  if (!(key in en)) return step
-  return t(key as TKey)
-}
-
-/** 毫秒 → 人读的短时（`12s` / `1m20s` / `1h02m`）。**不做四舍五入到好看**：秒级就是秒级。 */
-function humanMs(ms: number): string {
-  const s = Math.round(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m}m${String(s % 60).padStart(2, '0')}s`
-  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
-}
+// 行内文案的格式化与 REQ-1c 的事后回看卡**共用**（同一个后端派生 → 同一套显示）。
+import { formatDetailLine } from './detailLine.js'
 
 /**
  * REQ-1a（2026-09-23）：覆盖格下方那行「**正在做什么**」。
@@ -49,16 +26,12 @@ function humanMs(ms: number): string {
 function DetailLine({ t, target }: { t: (k: TKey) => string; target: Target }) {
   const d = target.detail
   if (!d || (d.step === null && d.ms === 0 && d.searched === 0)) return null
-  // tool 名 → 人话；未知工具**照实显示工具名**（比编一个"处理中"更有用），只有确实没有工具名才用兜底。
-  const what = d.step === null ? t('wb_detail_unknown') : stepLabel(t, d.step)
-  const bits = [d.step === null ? '' : target.label, what].filter((x) => x !== '')
-  if (d.source !== null) bits.push(d.source)
-  if (d.note !== null) bits.push(d.note)
-  if (d.ms > 0) bits.push(humanMs(d.ms))
-  if (d.searched > 1) bits.push(`${t('wb_detail_searched')} ${d.searched}`)
+  // 集号只在这一格**有具体动作**时才拼（否则会打出「 · 正在处理」这种以分隔符开头的怪行）。
+  const prefix = d.step === null ? '' : target.label
+  const body = formatDetailLine(t, d)
   return (
     <div className="wb-grid-detail" data-testid="wb-grid-detail">
-      {bits.join(' · ')}
+      {prefix === '' ? body : `${prefix} · ${body}`}
     </div>
   )
 }

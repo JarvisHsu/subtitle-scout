@@ -3,7 +3,7 @@ import { describe, it, expect } from 'vitest'
 import { handleApiRoute, type RouterDeps } from './router.js'
 import type {
   RunHistoryDTO, SettingsDTO, DeploySettingsDTO, FsListResult,
-  WorkflowPendingDTO, WorkflowPassDTO, RunTraceDTO,
+  WorkflowPendingDTO, WorkflowPassDTO, RunTraceDTO, LastSubtitleRunDTO,
   DormantTaskDTO,
 } from './apiV2.js'
 import type { ShiftedItemDTO } from './subtitleVerifyApi.js'
@@ -53,6 +53,17 @@ const workflowPassDTO: WorkflowPassDTO = {
 }
 const runTraceDTO: RunTraceDTO = {
   events: [{ runKey: 'job-1', seq: 0, tool: 'search_source', argsSummary: '"x"', resultSummary: '41 candidates', tookMs: 1200, at: 1 }],
+}
+// REQ-1c：最近一次字幕任务的逐文件明细（事后可回看）
+const lastSubtitleRunDTO: LastSubtitleRunDTO = {
+  run: {
+    id: 274, startedAt: 1000, finishedAt: 2000, decision: 'error',
+    detail: 'The Mummy 超时: timeout', traceEvents: 20,
+    files: [{
+      key: 'movie', label: '', filename: 'The Mummy.2026.Remux.1080p.W.mkv',
+      detail: { step: 'download_candidate', source: 'subhd', note: null, ms: 467792, steps: ['download_candidate'], sources: ['subhd', 'zimuku'], searched: 0 },
+    }],
+  },
 }
 const setupStatusDTO = {
   bootstrapComplete: false,
@@ -137,6 +148,7 @@ const deps: RouterDeps = {
   workflowPending: () => workflowPendingDTO,
   workflowPasses: (limit) => { lastPassesLimit = limit; return [workflowPassDTO] },
   runTrace: (id) => { lastRunTraceId = id; return id === 1 ? runTraceDTO : null },
+  lastSubtitleRun: () => lastSubtitleRunDTO,
   shiftedSubtitles: () => [shiftedRow],
   dormantTasks: () => [dormantRow],
   setupStatus: () => setupStatusDTO,
@@ -267,6 +279,34 @@ describe('handleApiRoute (v2)', () => {
 
     it('非数字 id → 404（路由本身不匹配，不是 400）', () => {
       expect(call('/api/v2/workflow/runs/abc/trace').status).toBe(404)
+    })
+  })
+
+  describe('GET /api/v2/workflow/runs/last-subtitle（REQ-1c：事后回看）', () => {
+    it('字面量路径 → 200 + DTO 直出', () => {
+      const r = call('/api/v2/workflow/runs/last-subtitle')
+      expect(r.status).toBe(200)
+      expect(r.json).toEqual(lastSubtitleRunDTO)
+    })
+
+    it('🔴 不被那条 `\\d+` 正则吃掉（两条路由必须各走各的）', () => {
+      // `last-subtitle` 不是数字，所以 :id/trace 那条永远不会匹配它——但反过来也要确认：
+      // 加了这个字面量之后，真正的数字路径仍然走 runTrace。
+      expect(call('/api/v2/workflow/runs/1/trace').json).toEqual(runTraceDTO)
+      expect(lastRunTraceId).toBe(1)
+    })
+
+    it('没有可回看的 run（run: null）→ 仍是 200，不是 404', () => {
+      // 语义区别很重要：「还没有跑过」是**有答案**的（答案是"没有"），而 404 是"这个端点没有"。
+      const saved = deps.lastSubtitleRun
+      deps.lastSubtitleRun = () => ({ run: null })
+      try {
+        const r = call('/api/v2/workflow/runs/last-subtitle')
+        expect(r.status).toBe(200)
+        expect(r.json).toEqual({ run: null })
+      } finally {
+        deps.lastSubtitleRun = saved
+      }
     })
   })
 

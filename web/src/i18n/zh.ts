@@ -623,6 +623,20 @@ export const zh = {
   wb_detail_check_episode_code_safety: '正在核对季集',
   wb_detail_install_subtitle: '正在装盘',
   wb_detail_searched: '已搜',
+  // ── wb_last_*（REQ-1c，2026-09-23）：事后回看卡（最近一次字幕任务）。
+  // **错误态与空态是两句不同的话**（本仓 §4.4）：wb_last_error 是"没问到"，
+  // wb_last_none 是"后端明确回答还没跑过"，绝不许混用。
+  wb_last_head: '最近一次找字幕',
+  wb_last_none: '还没有跑过一次找字幕',
+  wb_last_error: '没能问到最近一次运行',
+  wb_last_nofiles: '这一轮跑了，但它提到的文件在当前库里对不上（可能已被删除或改名）',
+  wb_last_noaction: '这一轮没有可回看的动作',
+  wb_last_decision_unknown: '已结束',
+  // decision 是**后端的事实**，这里只把它翻成人话；不认识的取值前端原样回显。
+  wb_last_decision_installed: '装上了',
+  wb_last_decision_error: '出错了',
+  wb_last_decision_identity: '只做了识别',
+  wb_last_decision_no_outcome: '没找到可用字幕',
   // ── wb_node_*：**步骤条节点名**（短名词）。两族分开是因为两个界面的需求相反：
   // 日志行是一句话，节点是巴掌大的一格。.wb-stage-label 是 nowrap + ellipsis，
   // 节点文案**不许共用首字**——2026-08-26 截图实测四个节点全被截成

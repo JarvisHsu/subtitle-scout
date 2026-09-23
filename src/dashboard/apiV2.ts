@@ -18,6 +18,9 @@ import { parseTargetLanguages } from '../cli/targetLanguages.js'
 // 实现放在 v2/ 而不是这里：它是库层语义（且要能被 daemon 侧测试直接调），dashboard 只是触发者。
 import { retargetForLanguageChange } from '../v2/retarget.js'
 import { judgePendingFiles } from '../v2/judgePending.js'
+// REQ-1c：事后回看复用 REQ-1a 的**同一个**派生（live 与 post-hoc 共用一份翻译，不可能漂移）。
+import { deriveSubtitleActivityDetail } from '../v2/subtitleActivityDetail.js'
+import { targetKey, targetLabel } from '../v2/subtitleTargets.js'
 
 // ---- 2026-08-13 死代码清理：本文件删掉的 6 个未消费 import ----
 //
@@ -908,6 +911,129 @@ export function buildRunTrace(db: ScoutDb, runId: number): RunTraceDTO | null {
     return { events: JSON.parse(row.trace_json) as TraceEvent[] }
   } catch {
     return { events: [] }
+  }
+}
+
+// ---- REQ-1c（2026-09-23）：最近一次字幕任务**事后可回看** ----
+//
+// ── 为什么必须有这条（用户原话的缺口）────────────────────────────────────────
+// REQ-1a 把"正在发生的事"放上了活动卡，但那是**内存快照**：刷新页面、或者任务跑完之后
+// 再打开，就只剩聚合数字了。用户要的是「**刷新后仍能看到最近一次运行的逐文件明细**」。
+//
+// ── 口径：只读、纯解析，不新增任何判断（与本文件既有的"北极星④"一致）─────────
+// 数据全部来自已有两处：`runs.trace_json`（收官快照，G3 起就在落）与 `files` 表。
+// 派生复用 **REQ-1a 的同一个 `deriveSubtitleActivityDetail`**——实时与事后共用一份翻译，
+// 于是界面上那两处**不可能漂移**（本仓 D7/C30：「留两份实现必漂移」）。
+//
+// ── 怎么认出"这一行是字幕 run"（校准过，不是猜的）────────────────────────────
+// `runs.job_id` 对新架构**恒为 NULL**（runsRepo.insert 的注释 + 生产实测 152 行全 NULL），
+// 所以**不能**按 job_id 认。可用的是 `decision`：字幕路径的实际取值来自生产读数
+// （`installed` / `error` / `identity` / `no_outcome`），识别路径另有值。
+// ⚠️ 这是一条**判据**，多认一个值就会把非字幕的 run 显示成字幕明细——故宁可少认。
+
+/** 什么 decision 算"字幕路径产生的一行"。生产实测取值：installed（装上了）、error（超时等）、
+ *  identity（只做了识别没找到）、no_outcome。 */
+const SUBTITLE_RUN_DECISIONS = ['installed', 'error', 'identity', 'no_outcome'] as const
+
+export interface LastRunFileDTO {
+  key: string
+  label: string
+  filename: string
+  /** 复用 REQ-1a 的 detail 形状（同一份语义，前端同一套渲染）。 */
+  detail: {
+    step: string | null
+    source: string | null
+    note: string | null
+    ms: number
+    steps: string[]
+    sources: string[]
+    searched: number
+  } | null
+}
+
+export interface LastSubtitleRunDTO {
+  /** 没有可回看的 run 时：null（前端据此画"还没有跑过"，**不编一行假的**）。 */
+  run: {
+    id: number
+    startedAt: number
+    finishedAt: number | null
+    decision: string | null
+    /** runs.detail 原样——它是那一轮的一句话结语（如 `The Mummy 超时: timeout`）。 */
+    detail: string | null
+    traceEvents: number
+    files: LastRunFileDTO[]
+  } | null
+}
+
+interface LastRunRow {
+  id: number
+  started_at: number
+  finished_at: number | null
+  decision: string | null
+  detail: string | null
+  trace_json: string | null
+}
+
+export function buildLastSubtitleRun(db: ScoutDb): LastSubtitleRunDTO {
+  const placeholders = SUBTITLE_RUN_DECISIONS.map(() => '?').join(',')
+  const row = db.prepare(
+    `SELECT id, started_at, finished_at, decision, detail, trace_json FROM runs
+      WHERE decision IN (${placeholders}) AND trace_json IS NOT NULL
+      ORDER BY id DESC LIMIT 1`
+  ).get(...SUBTITLE_RUN_DECISIONS) as LastRunRow | undefined
+  if (!row) return { run: null }
+
+  let events: TraceEvent[] = []
+  try { events = JSON.parse(row.trace_json ?? '[]') as TraceEvent[] } catch { events = [] }
+
+  // 文件身份从 trace 自己的 args 里拿（`videoFilename`），再用 files 表补季集。
+  // `itemId`（形如 `tmdb:121860/s1e7`）是 film 侧的权威身份，但它**只在部分调用里出现**
+  // （生产实测：download_candidate 有时 null）——故两条都试，取得到的那个为准。
+  const names = new Set<string>()
+  for (const e of events) {
+    try {
+      const a = JSON.parse(e.argsSummary) as Record<string, unknown> | null
+      if (a === null) continue
+      if (typeof a.videoFilename === 'string' && a.videoFilename !== '') names.add(a.videoFilename)
+      if (typeof a.filename === 'string' && a.filename !== '') names.add(a.filename)
+    } catch { /* 非 JSON 的事件跳过：它是别的工具发的，与文件身份无关 */ }
+  }
+
+  const plan: Array<{ workId: string; filename: string; season: number | null; episode: number | null }> = []
+  for (const n of names) {
+    const f = db.prepare(
+      `SELECT work_id, season, episode FROM files WHERE filename = ? AND work_id IS NOT NULL LIMIT 1`
+    ).get(n) as { work_id: string; season: number | null; episode: number | null } | undefined
+    if (f) plan.push({ workId: f.work_id, filename: n, season: f.season, episode: f.episode })
+  }
+
+  // 一个文件都认不出来（文件已被删/改名）⇒ 仍返回 run 本身，只是 files 为空：
+  // "这一轮跑了、但明细对不回当前库"是**真话**，比返回 null（假装没跑过）更准确。
+  const workId = plan[0]?.workId ?? ''
+  const derived = plan.length === 0
+    ? new Map<string, never>()
+    : deriveSubtitleActivityDetail(events, plan, workId)
+
+  const files: LastRunFileDTO[] = plan.map((p) => {
+    const key = targetKey(p.workId, p.season, p.episode)
+    return {
+      key,
+      label: targetLabel(p.season, p.episode),
+      filename: p.filename,
+      detail: derived.get(key) ?? null,
+    }
+  })
+
+  return {
+    run: {
+      id: row.id,
+      startedAt: row.started_at,
+      finishedAt: row.finished_at,
+      decision: row.decision,
+      detail: row.detail,
+      traceEvents: events.length,
+      files,
+    },
   }
 }
 

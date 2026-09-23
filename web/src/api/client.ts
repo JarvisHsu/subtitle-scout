@@ -14,6 +14,7 @@ import type {
   HealthDTO,
   MediaLibraryItemDTO, MediaLibraryDetailDTO,
   ActivityDTO,
+  LastSubtitleRunDTO,
   FoundGroupDTO,
 } from './types.js'
 import { checkShape, ContractViolationError, arr, type Shape } from './contract.js'
@@ -265,6 +266,12 @@ export const api = {
   // 那一套（同 router.ts 该端点自己的纯数字校验口径，不是 tmdb:<n> 那种自有 id 空间）。
   runTrace: (runId: number, signal?: AbortSignal) =>
     get<RunTraceDTO>(`/api/v2/workflow/runs/${runId}/trace`, signal),
+  // REQ-1c（2026-09-23）：最近一次字幕任务的逐文件明细——**事后可回看**（刷新页面/第二天回来）。
+  // 刻意**不接契约**：按 contracts.ts 头注释的既有判据，`/api/v2/workflow/*` 一族不占①②③
+  // 任何一条（违约表现是"少显示一列"，不是崩页）；而且这个端点有一个**合法的空答案**
+  // （`run: null` = 还没跑过），拿严格形状去卡会把"没有"误判成"接口坏了"。
+  lastSubtitleRun: (signal?: AbortSignal) =>
+    get<LastSubtitleRunDTO>('/api/v2/workflow/runs/last-subtitle', signal),
   // dashboard-F4：人类扳手①——手动重派。四态回执（created/revived/coalesced/blocked_dormant）
   // 都是 200，post() 的既有错误分支只在 zod 校验失败（400）/未配置（503）时触发。
   redispatch: (input: RedispatchInput) => post<RedispatchOutcomeDTO>('/api/v2/workflow/redispatch', input),

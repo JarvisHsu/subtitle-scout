@@ -392,16 +392,53 @@ export interface ScoutCurrentDTO {
     key: string
     label: string
     state: 'pending' | 'active' | 'installed' | 'pending-source'
-    detail?: {
-      step: string | null
-      source: string | null
-      note: string | null
-      ms: number
-      steps: string[]
-      sources: string[]
-      searched: number
-    }
+    detail?: TargetDetailDTO
   }>
+}
+
+/** 一个文件的"正在做什么"细节（REQ-1a，对齐后端 `SubtitleTargetDetail`）。
+ *
+ *  **实时与事后用同一个形状**：REQ-1a 的覆盖格（内存快照）与 REQ-1c 的"最近一次运行"
+ *  （读 DB）在界面上共用同一套渲染，所以后端两边也共用一个派生函数——形状分叉就必然漂移。
+ *
+ *  每个字段都可能为 null：拿不到就说拿不到（本仓对"看起来像进度的假数据"有红线）。 */
+export interface TargetDetailDTO {
+  step: string | null
+  source: string | null
+  note: string | null
+  ms: number
+  steps: string[]
+  sources: string[]
+  searched: number
+}
+
+/** REQ-1c（2026-09-23）：`/api/v2/workflow/runs/last-subtitle` —— 最近一次字幕任务的
+ *  **逐文件明细**，供刷新页面/第二天回来仍能回看。
+ *
+ *  ── 为什么 `run` 可以是 null（而不是空数组之类）────────────────────────────────
+ *  "还没有跑过一次字幕任务"是**有答案的**（答案是"没有"），与"接口坏了/页面没加载出来"
+ *  是两件事——本仓 §4.4 明令错误态绝不显示空态文案，反之亦然。故空态用一个显式的 null
+ *  表达，页面据此画"还没有跑过"，而不是画一个空列表。
+ *
+ *  ── `decision` 是后端的事实，不是译名 ────────────────────────────────────────
+ *  取值来自字幕路径（installed / error / identity / no_outcome），前端按它选一句人话，
+ *  **不认识的取值照实显示**（同 CoverageGrid 里"未知工具名照实回显"的既有口径）。 */
+export interface LastSubtitleRunDTO {
+  run: {
+    id: number
+    startedAt: number
+    finishedAt: number | null
+    decision: string | null
+    detail: string | null
+    traceEvents: number
+    files: Array<{
+      key: string
+      label: string
+      filename: string
+      /** 与覆盖格同一形状（同一个后端派生函数产出）。 */
+      detail: TargetDetailDTO | null
+    }>
+  } | null
 }
 
 /** 三个工作台各自的当前态快照（对齐后端 ScoutCurrents，2026-08-30 起 per-workbench 三槽）。

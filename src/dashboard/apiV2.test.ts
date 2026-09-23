@@ -10,7 +10,7 @@ import {
   buildRuns,
   buildSettings, buildDeploySettings, listMediaSubdirs, SETTINGS_KEYS, updateSettings, addMediaRoot,
   buildWorkflowPending, buildWorkflowPasses,
-  redispatch, buildRunTrace, buildDormantTasks, dormantTargetLabel,
+  redispatch, buildRunTrace, buildDormantTasks, dormantTargetLabel, buildLastSubtitleRun,
 } from './apiV2.js'
 // 2026-08-13 清理：`import { INGEST_ORCHESTRATE_SERIES_ID }` 已删（零引用）。它当初是
 // 清算波 R-6（F9b）为"用真实常量而不是陈旧字符串 'self-scan-trigger' 造 ingest 触发器的
@@ -691,6 +691,102 @@ describe('buildRunTrace（GET /api/v2/workflow/runs/:id/trace：单 run 痕迹�
 
   it('行不存在 → null（router.ts 映射 404）', () => {
     expect(buildRunTrace(db, 999_999)).toBeNull()
+  })
+})
+
+describe('buildLastSubtitleRun（REQ-1c：最近一次字幕任务的事后回看）', () => {
+  /** 造一条字幕 run；decision 决定它算不算"字幕路径"。 */
+  function insertSubtitleRun(decision: string, events: unknown[], detail = 'The Mummy 超时: timeout'): number {
+    return Number(
+      db.prepare(
+        `INSERT INTO runs (job_id, started_at, finished_at, decision, detail, journal_path, trace_json)
+         VALUES (NULL, ?, ?, ?, ?, NULL, ?)`
+      ).run(NOW - 1000, NOW, decision, detail, JSON.stringify(events)).lastInsertRowid
+    )
+  }
+
+  function seedMovieFile(filename: string): void {
+    if (!db.prepare('SELECT id FROM works WHERE id = ?').get('tmdb:1662599')) {
+      db.prepare('INSERT INTO works (id, title, media_type, origin_lang, created_at, updated_at) VALUES (?,?,?,?,?,?)')
+        .run('tmdb:1662599', 'The Mummy', 'movie', 'en', NOW, NOW)
+    }
+    db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, work_id,
+                                   season, episode, needs_subtitle, updated_at)
+                VALUES (?,?,?,?,?,?,?,NULL,NULL,1,?)`)
+      .run(`/media/The Mummy/${filename}`, '/media/The Mummy', filename, 100, 1000, '/media/The Mummy', 'tmdb:1662599', NOW)
+  }
+
+  it('🔴 从真实 trace 重建逐文件明细（不靠内存快照——刷新后仍可回看）', () => {
+    const filename = 'The.Mummy.2026.mkv'
+    seedMovieFile(filename)
+    // 形状照抄生产：download_candidate 带 videoFilename + candidateId
+    const events = [
+      { runKey: 'job-subtitle:tmdb:1662599', seq: 0, tool: 'search_source', argsSummary: JSON.stringify({ queries: ['The Mummy'] }), resultSummary: JSON.stringify({ count: 44 }), tookMs: 5077, at: NOW },
+      { runKey: 'job-subtitle:tmdb:1662599', seq: 1, tool: 'download_candidate', argsSummary: JSON.stringify({ candidateId: 'subhd:58pnuQ', videoFilename: filename }), resultSummary: JSON.stringify({ error: 'subhd prepare-download failed: {"message":"服务器内部错误"}' }), tookMs: 24242, at: NOW + 1 },
+    ]
+    insertSubtitleRun('error', events)
+
+    const dto = buildLastSubtitleRun(db)
+    expect(dto.run).not.toBeNull()
+    expect(dto.run!.decision).toBe('error')
+    expect(dto.run!.detail).toBe('The Mummy 超时: timeout')
+    expect(dto.run!.traceEvents).toBe(2)
+    expect(dto.run!.files).toHaveLength(1)
+    const f = dto.run!.files[0]!
+    expect(f.key).toBe('movie')
+    expect(f.filename).toBe(filename)
+    expect(f.detail!.step).toBe('download_candidate')
+    expect(f.detail!.source).toBe('subhd')
+    expect(f.detail!.note).toBe('下载失败：服务器内部错误')
+    expect(f.detail!.ms).toBe(24242)
+  })
+
+  it('🔴 没有可回看的 run → run: null（**不编一行假的**）', () => {
+    expect(buildLastSubtitleRun(db)).toEqual({ run: null })
+  })
+
+  it('🔴 取的是**最近**那一条（按 id 倒序，不是按 started_at 猜）', () => {
+    seedMovieFile('A.mkv')
+    seedMovieFile('B.mkv')
+    insertSubtitleRun('error', [
+      { runKey: 'k', seq: 0, tool: 'download_candidate', argsSummary: JSON.stringify({ candidateId: 'subhd:old', videoFilename: 'A.mkv' }), resultSummary: '{}', tookMs: 1, at: NOW },
+    ], '旧的那次')
+    insertSubtitleRun('installed', [
+      { runKey: 'k', seq: 0, tool: 'download_candidate', argsSummary: JSON.stringify({ candidateId: 'zimuku:new', videoFilename: 'B.mkv' }), resultSummary: '{}', tookMs: 2, at: NOW + 10 },
+    ], '新的那次')
+
+    const dto = buildLastSubtitleRun(db)
+    expect(dto.run!.detail).toBe('新的那次')
+    expect(dto.run!.files[0]!.filename).toBe('B.mkv')
+    expect(dto.run!.files[0]!.detail!.source).toBe('zimuku')
+  })
+
+  it('非字幕 decision 的行**不许**被当成字幕 run（判据宁可少认）', () => {
+    insertSubtitleRun('download', [
+      { runKey: 'k', seq: 0, tool: 'download_candidate', argsSummary: JSON.stringify({ videoFilename: 'X.mkv' }), resultSummary: '{}', tookMs: 1, at: NOW },
+    ])
+    expect(buildLastSubtitleRun(db)).toEqual({ run: null })
+  })
+
+  it('trace 里的文件名在 files 表里查不到（文件已删/改名）→ run 仍返回，files 为空', () => {
+    insertSubtitleRun('error', [
+      { runKey: 'k', seq: 0, tool: 'download_candidate', argsSummary: JSON.stringify({ candidateId: 'subhd:x', videoFilename: '已经不存在了.mkv' }), resultSummary: '{}', tookMs: 1, at: NOW },
+    ])
+    const dto = buildLastSubtitleRun(db)
+    expect(dto.run, '"跑了但对不回当前库"是真话，比假装没跑过准确').not.toBeNull()
+    expect(dto.run!.files).toEqual([])
+    expect(dto.run!.traceEvents).toBe(1)
+  })
+
+  it('trace_json 脏数据 → 不炸，返回 run 本身 + traceEvents 0', () => {
+    db.prepare(
+      `INSERT INTO runs (job_id, started_at, finished_at, decision, detail, journal_path, trace_json)
+       VALUES (NULL, ?, ?, 'error', 'x', NULL, '{not json')`
+    ).run(NOW - 1000, NOW)
+    const dto = buildLastSubtitleRun(db)
+    expect(dto.run).not.toBeNull()
+    expect(dto.run!.traceEvents).toBe(0)
+    expect(dto.run!.files).toEqual([])
   })
 })
 
