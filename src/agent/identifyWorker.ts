@@ -13,6 +13,7 @@
 import { tool, stepCountIs, type LanguageModel } from 'ai'
 import { z } from 'zod'
 import { makeReasoningAgent } from './reasoningAgent.js'
+import { IdentifyFinalizeSchema } from './identifyWorker.schemas.js'
 import { makeRunTracer } from '../core/traceBus.js'
 import { searchCandidates } from '../v2/identify.js'
 import { withLibrarySandboxPreamble } from './librarySandbox.js'
@@ -212,13 +213,11 @@ export async function runIdentify(
   const { agent, readFinalized } = makeReasoningAgent({
     model: deps.model,
     tools: { search_tmdb: searchTool, get_tmdb_details: detailsTool, write_identified_media: writeTool },
-    schema: z.object({
-      identity: z.object({
-        tmdbId: z.string().regex(/^\d+$/),
-        title: z.string(),
-        reason: z.string(),
-      }),
-    }),
+    // 🔴 2026-09-23：schema 抽到 identifyWorker.schemas.ts 并**允许 tmdbId 为 null**。
+    // 原来内联在这里的 `tmdbId: z.string().regex(/^\d+$/)` 与下面 prompt 第 156 行
+    // （"call finalize with tmdbId=null"）**直接矛盾** ⇒ 每一条"诚实地承认认不出"的目录
+    // 都必然被校验拒收、结论整段作废。生产读数与完整论证见该文件的头注释。
+    schema: IdentifyFinalizeSchema,
     instructions: identifySystemPrompt(deps.librarySandbox ?? false),
     // 用户裁决：不设步数上限（stepCap=100000 等效无限——实际先撞 context 上限）。
     stopWhen: stepCountIs(deps.stepCap ?? 100000),

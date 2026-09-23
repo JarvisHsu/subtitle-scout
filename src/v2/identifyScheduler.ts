@@ -454,6 +454,26 @@ export async function runIdentifyWorkDir(
       UPDATE files SET attempt = ?, next_retry_at = ?, last_error = ?, updated_at = ?
       WHERE work_dir = ?
     `).run(attempt + 1, now + retryDelayMs(attempt + 1), 'identify-failed', now, facts.workDir)
+
+    // 🔴 2026-09-23（与 schema 放宽配套，缺了这一步前一步就白修）：
+    // agent **诚实地认不出**时给的那段 `reason` 是"为什么认不出"唯一的解释面——它此前
+    // **被整个丢掉**：`files.last_error` 只写一个固定标签 `'identify-failed'`（那是队列与
+    // dashboard 读的**判据标记**，不许塞长文本），而 `console.error` 7 天就被轮掉。
+    // 于是 schema 放宽之前是一句话都看不到（结论被拒），放宽之后仍然是看不到（被覆盖）。
+    // 落到 `runs`（#21b 刚接上的那条有界通道），与抛错路径同一个决策名族。
+    const why = report.reason.trim()
+    if (why !== '') {
+      try {
+        deps.runs?.insert({
+          jobId: null, startedAt: now, finishedAt: now,
+          decision: 'identify-no-match', detail: capDetail(`${facts.workDir}: ${why}`, 2000),
+          journalPath: null,
+        })
+      } catch (logErr) {
+        console.error(`[identify-scheduler] 写认不出留痕失败（隔离）: ${String(logErr)}`)
+      }
+      console.error(`[identify-scheduler] ${facts.workDir} 认不出（agent 已给理由）: ${capDetail(why, 300)}`)
+    }
   }
   return report
 }

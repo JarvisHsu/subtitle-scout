@@ -101,6 +101,52 @@ describe('#21b：识别失败的**完整**原因必须留痕（不能被 100 字
   })
 })
 
+describe('🔴 agent 诚实地「认不出」→ 理由必须留痕（不许被固定标签盖掉）', () => {
+  it('tmdbId=null + reason → files 留固定判据标签、runs 留完整理由', async () => {
+    const db = openDb(':memory:')
+    const workDir = '/media/quark/影视/AUDIO LIST ENG LATINO SPANISH FRENCH (CA)'
+    db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, updated_at)
+                VALUES (?,?,?,?,?,?,?)`)
+      .run(`${workDir}/Moana.2026.2160p.mkv`, workDir, 'Moana.2026.2160p.mkv', 100, 1000, workDir, 1000)
+
+    const why = 'Directory name is an audio-language listing descriptor, not a work title. '
+      + 'The only file suggests TMDB 1108427 (Moana, 2026) but write_identified_media rejected it '
+      + "with 'evidence-fail: title mismatch'."
+    const deps = mkDepsWithRuns(db, async () => ({ tmdbId: null, title: null, reason: why }))
+    const report = await runIdentifyWorkDir(deps, {
+      workDir, dirName: 'AUDIO LIST ENG LATINO SPANISH FRENCH (CA)',
+      fileCount: 1, seasons: [], hasSeasonDirs: false,
+    })
+
+    // files.last_error 仍是**固定判据标签**（队列与 dashboard 读它，不许塞长文本）
+    const row = db.prepare('SELECT last_error, next_retry_at FROM files WHERE work_dir = ?').get(workDir) as
+      { last_error: string; next_retry_at: number }
+    expect(row.last_error).toBe('identify-failed')
+    expect(row.next_retry_at).toBeGreaterThan(Date.now())
+
+    // 而 agent 的理由进了 runs——这是"为什么认不出"唯一的持久解释面
+    const run = db.prepare(`SELECT decision, detail FROM runs WHERE decision = 'identify-no-match' ORDER BY id DESC LIMIT 1`).get() as
+      { decision: string; detail: string } | undefined
+    expect(run, '理由必须留痕——否则 schema 放宽了也还是看不到').toBeDefined()
+    expect(run!.detail).toContain('1108427')
+    expect(run!.detail).toContain(workDir)
+    expect(report.reason).toBe(why)
+    db.close()
+  })
+
+  it('reason 为空 → 不写空的 runs 行（不制造噪音）', async () => {
+    const db = openDb(':memory:')
+    const workDir = '/media/TV/Show'
+    db.prepare(`INSERT INTO files (path, dir, filename, size, mtime, work_dir, updated_at)
+                VALUES (?,?,?,?,?,?,?)`)
+      .run(`${workDir}/E01.mkv`, workDir, 'E01.mkv', 100, 1000, workDir, 1000)
+    const deps = mkDepsWithRuns(db, async () => ({ tmdbId: null, title: null, reason: '' }))
+    await runIdentifyWorkDir(deps, { workDir, dirName: 'Show', fileCount: 1, seasons: [], hasSeasonDirs: false })
+    expect((db.prepare('SELECT COUNT(*) AS n FROM runs').get() as { n: number }).n).toBe(0)
+    db.close()
+  })
+})
+
 
 describe('runIdentifyWorkDir（识别轨 catch-all）', () => {
   it('🔴 识别抛错 → next_retry_at 推进（不 30s 死循环）', async () => {
