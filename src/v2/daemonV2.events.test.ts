@@ -457,6 +457,82 @@ describe('ScoutDaemonV2 · R-F10 事件发布（端到端走 run()）', () => {
     db.close()
   })
 
+  it('🔴 REQ-1a：真实 trace 事件 → 覆盖格带出「这个文件正在做什么」（源站/耗时/人话理由）', async () => {
+    // 端到端：worker 发真事件 → daemon 桥接派生 → 过真 ScoutEventBus → 快照里能读出来。
+    // 形状照抄生产（evidence/req1a-trace-shape.mjs）：下载失败时 resultSummary 是
+    // `{"error":"subhd prepare-download failed: {…\"message\":\"服务器内部错误…\"}"}`。
+    const db = openDb(':memory:')
+    seedSubtitleWork(db, '/media/Show/E01.mkv', 1)   // season=1 episode=1 filename=E01.mkv
+    const workId = (db.prepare('SELECT work_id FROM files WHERE path = ?')
+      .get('/media/Show/E01.mkv') as { work_id: string }).work_id
+    const bus = new ScoutEventBus()
+    const { emit, got } = mkEmit()
+    // 两道都接：`got` 证明帧里带了什么（既有 bridge 用例的既有手法），
+    // `bus` 证明它过真总线之后**快照**里也读得出来（REQ-1a 的读法是 /health 的 currents）。
+    const emitBoth = (e: ScoutEventInput) => { emit(e); bus.publish(e) }
+    const daemon = new ScoutDaemonV2(mkDeps(db, {
+      emit: emitBoth,
+      roots: ['/media'],
+      listVideoFiles: () => ['/media/Show/E01.mkv'],
+      statFile: () => ({ mtimeMs: 1000, size: BIG }), fileExists: () => true,
+      subtitleWorker: async () => {
+        const runKey = `job-${subtitleJobId(workId)}`
+        traceBus.publish({
+          runKey, seq: 1, tool: 'search_source',
+          argsSummary: JSON.stringify({ queries: ['Show'], season: 1, episode: 1 }),
+          resultSummary: JSON.stringify({ count: 44 }), tookMs: 5000, at: Date.now(),
+        })
+        traceBus.publish({
+          runKey, seq: 2, tool: 'download_candidate',
+          argsSummary: JSON.stringify({
+            candidateId: 'subhd:kA7BFK', videoFilename: 'E01.mkv', itemId: `${workId}/s1e1`,
+          }),
+          resultSummary: JSON.stringify({
+            error: 'subhd prepare-download failed: {"success":false,"message":"服务器内部错误，请稍后再试。"}',
+          }),
+          tookMs: 24000, at: Date.now(),
+        })
+        return { installed: [], no_safe_match: [], retry_later: [], hardsub_assumed: [] }
+      },
+    }))
+    await runOneInspection(daemon)
+
+    const frameTarget = got
+      .filter((e) => e.type === 'progress' && Array.isArray(e.data?.targets))
+      .at(-1)!
+      .data!.targets![0] as { key: string; state: string; detail?: any }
+
+    expect(frameTarget, '覆盖格必须有一格').toBeDefined()
+    expect(frameTarget.key).toBe('s1e1')
+    expect(frameTarget.detail, 'REQ-1a：这一格必须带出"正在做什么"').toBeDefined()
+    // 最近一次动作 = 下载；源站取自 candidateId 前缀；人话理由取自 provider 的 message
+    expect(frameTarget.detail.step).toBe('download_candidate')
+    expect(frameTarget.detail.source).toBe('subhd')
+    expect(frameTarget.detail.note).toBe('下载失败：服务器内部错误，请稍后再试。')
+    // 累计耗时 = 两次工具调用的 tookMs 之和（干活时间）
+    expect(frameTarget.detail.ms).toBe(29000)
+    expect(frameTarget.detail.steps).toEqual(['search_source', 'download_candidate'])
+    expect(frameTarget.detail.searched).toBe(1)
+
+    // 🔴 **每一帧**桥接帧都必须带 detail（不限最后那一帧）：实时那一路靠的就是"帧走到哪儿、
+    // 细节就更新到哪儿"；只有里程碑帧带 detail 的话，两帧之间界面就是一片空白。
+    const stepFrames = got.filter((e) => e.type === 'progress' && e.workbench === 'subtitle' && e.data?.step)
+    expect(stepFrames.length, '至少要有 search_source 与 download_candidate 两条桥接帧').toBeGreaterThanOrEqual(2)
+    for (const f of stepFrames) {
+      const tg = f.data!.targets![0] as { detail?: any }
+      expect(tg.detail, `帧 ${String(f.data!.step)} 必须带 detail`).toBeDefined()
+      expect(tg.detail.step).toBe(f.data!.step)
+    }
+    // 最后一条是下载帧 ⇒ 源头与人话理由都能在这一帧上读到（与上面 frameTarget 的断言互证）
+    expect(stepFrames.at(-1)!.data!.step).toBe('download_candidate')
+
+    // ⚠️ 快照读法的一个**既有事实**（不是本改动的缺陷，但必须钉住免得下一个人误判）：
+    // `巡检完成` 是无 workbench 事件，按总线的既有裁决会清空三槽，所以**跑完之后**读 currents
+    // 必然是 null。实时细节靠的是帧，不是"跑完还能查快照"——后者是 REQ-1c（读 DB）的活。
+    expect(bus.getCurrents().subtitle, '跑完后三槽被清空是既有裁决').toBeNull()
+    db.close()
+  })
+
   it('🔴 翻译：飞行中 trace.tool 出现在 progress.data.step；finally 后退订', async () => {
     const db = openDb(':memory:')
     db.prepare('INSERT INTO works (id, title, media_type, origin_lang, created_at, updated_at) VALUES (?,?,?,?,?,?)')

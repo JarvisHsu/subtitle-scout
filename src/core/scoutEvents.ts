@@ -70,6 +70,39 @@ export interface ScoutEventInput {
 }
 
 /**
+ * REQ-1a（2026-09-23）：**某个具体文件现在正在做什么**。
+ *
+ * ── 为什么挂在 targets 条目上，而不是新增事件类型 ──────────────────────────
+ * R-F10 的四类事件是**封闭**的（见 ScoutEventType 的注释），而"逐文件当前动作"是既有
+ * `progress` 帧的**同一份快照**里多出来的细节——它不改变"该不该推给用户"这条判据，
+ * 只让已经要推的那条帧说得更清楚。故它是 `targets[i].detail`，不是第五类事件。
+ *
+ * ── 每个字段都是"能证明才写" ────────────────────────────────────────────────
+ * `step`/`source`/`ms`/`steps` 全部来自 trace 事件本身（工具名、`candidateId` 的源站前缀、
+ * `tookMs`），没有一个是猜的；拿不到的写 null。**没有"剩余时间"这类字段**——本仓对
+ * "看起来像成功的假数字"有明确红线，样本不足时宁可不显示（REQ-1b 另行论证）。
+ *
+ * 字段一律 `| null` 而不是可选：这条 detail 会被 JSON.stringify 送给前端，
+ * undefined 会让字段整个消失，前端就分不清"这文件还没动"与"这版后端没这个字段"。
+ */
+export interface SubtitleTargetDetail {
+  /** 最近一次动作的工具名（`search_source` / `download_candidate` / …）。没动过 → null。 */
+  step: string | null
+  /** 最近一次动作的源站（`zimuku` / `subhd` / `assrt`…），取自 `candidateId` 前缀。取不到 null。 */
+  source: string | null
+  /** 最近一次动作的**人话摘要**（如"找到 44 个候选"/"下载失败：服务器内部错误"）。没有就不写。 */
+  note: string | null
+  /** 本文件累计消耗（各次工具调用 `tookMs` 之和）。**不是**墙上时间，是干活时间。 */
+  ms: number
+  /** 本文件经历过的动作名（去重、按首次出现排序）。长度天然有界（工具集合封闭）。 */
+  steps: string[]
+  /** 本文件涉及过的源站（去重、按首次出现排序）。 */
+  sources: string[]
+  /** 本作品本轮 `search_source` 的调用次数——"搜了几个源"的可证明读数。 */
+  searched: number
+}
+
+/**
  * 「某个工作台当前在处理什么」的**快照**（不是变化）——ScoutCurrents 的一个槽。
  *
  * ── 为什么需要它（设计文档审计 F-6）──
@@ -114,8 +147,16 @@ export interface ScoutCurrent {
   cueTotal: number | null
   /** 活动卡覆盖格 per-target 状态（2026-08-30）。字幕流才有；识别/翻译恒 undefined。
    *  全量数组——**每条** progress 帧都带完整快照（含高频 trace 桥接帧，2026-08-30 起），
-   *  重连/中途打开时 replay 缓冲里任意一条即完整真相，免增量对账。 */
-  targets?: Array<{ key: string; label: string; state: 'pending' | 'active' | 'installed' | 'pending-source' }>
+   *  重连/中途打开时 replay 缓冲里任意一条即完整真相，免增量对账。
+   *
+   *  `detail`（REQ-1a，2026-09-23）让每一格从"待/active/完成"升级成"**正在对这个文件做什么**"。
+   *  与 state 同为全量快照语义；老后端不带它时前端照旧只画状态（字段缺席 = 这一版没有细节）。 */
+  targets?: Array<{
+    key: string
+    label: string
+    state: 'pending' | 'active' | 'installed' | 'pending-source'
+    detail?: SubtitleTargetDetail
+  }>
 }
 
 /**

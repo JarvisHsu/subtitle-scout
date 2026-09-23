@@ -17,6 +17,9 @@ import type { ScoutDb } from './db.js'
 import { listIdentifyQueue, runIdentifyWorkDir, type IdentifySchedulerDeps } from './identifyScheduler.js'
 import { listSubtitleQueue, runSubtitleWorkDir, subtitleJobId, planSubtitleFetch, pullRecheckForFetch, type SubtitleQueueItem, type SubtitleFetchPlan, type SubtitleFetchReceipt, type SubtitleFetchTarget } from './subtitleScheduler.js'
 import { targetKey, targetLabel, itemIdToKey } from './subtitleTargets.js'
+// REQ-1a（2026-09-23）：逐文件"正在做什么"的纯派生（实时桥接与事后回看共用同一份）。
+import { accumulateDetail, detailViewFor } from './subtitleActivityDetail.js'
+import type { SubtitleTargetDetail } from '../core/scoutEvents.js'
 import type { RunsRepo } from './runsRepo.js'
 import { judgePendingFiles } from './judgePending.js'
 import { tagsForLanguage } from '../agent/languages.js'
@@ -1372,7 +1375,12 @@ export class ScoutDaemonV2 {
       // 首帧就把分母（文件数）钉死。声明在 try 之前：trace 桥接、装盘回调、收尾段都要读它。
       // 全量数组语义（每条 progress 帧都带完整快照——含 trace 桥接帧）见 scoutEvents.ts
       // ScoutCurrent.targets 注释；里程碑帧靠 data.milestone 旁路节流必达。
-      const targetsState = new Map<string, { key: string; label: string; state: string }>()
+      const targetsState = new Map<string, {
+        key: string; label: string; state: string
+        /** REQ-1a（2026-09-23）：这一格"正在对这个文件做什么"。由 trace 事件**纯派生**
+         *  （`subtitleActivityDetail.ts`），每条桥接帧更新一格。老前端忽略它照旧只画状态。 */
+        detail?: SubtitleTargetDetail
+      }>()
       for (const f of item.files) {
         const k = targetKey(item.workId, f.season, f.episode)
         targetsState.set(k, { key: k, label: targetLabel(f.season, f.episode), state: 'pending' })
@@ -1412,6 +1420,18 @@ export class ScoutDaemonV2 {
         // targets 的都没有 → 覆盖格建不起来。让每条桥接帧都捎上当前快照，replay 里任意一条即可重建。
         // **不打 milestone**：它是高频源，仍归 1s 节流管辖（否则 trace 帧洪流刷屏）；快照在
         // 总线的节流门之前落进 subtitle 槽，故即便这一条被折叠不推送，它的 targets 也已进快照。
+        // ── REQ-1a（2026-09-23）：这一帧同时**推进"哪个文件正在被做什么"** ──────────
+        // 只在**匹配到某个文件**时改动那一格（作品级动作不指向文件，返回 null ⇒ 一格不碰）。
+        // 做成"按事件增量更新一格"而不是"每帧全量重算"：trace 帧本就高频，全量重算是
+        // O(事件数 × 文件数)，而这里只需 O(1)。输出形状与全量函数逐字一致（同一个
+        // detailFromEvent），故"实时"与"事后回看"不会漂移成两份实现。
+        const view = detailViewFor(e, item.files, item.workId)
+        if (view !== null) {
+          const cur = targetsState.get(view.key)
+          if (cur !== undefined) {
+            targetsState.set(view.key, { ...cur, detail: accumulateDetail(cur.detail, view.event, view.tool) })
+          }
+        }
         this.emit({
           type: 'progress',
           message: e.tool,
