@@ -706,6 +706,12 @@ export const en = {
   wb_last_decision_unknown: 'finished',
   wb_last_decision_installed: 'installed',
   wb_last_decision_error: 'errored',
+  // Round 61: the subtitle track's REAL decision values (source: subtitleScheduler's recordRun
+  // call sites). retry_later / no_safe_match were missing — and "not found" and "will retry"
+  // are the two most common outcomes, so they used to render as raw English ids.
+  wb_last_decision_retry_later: 'not found, will retry',
+  wb_last_decision_no_safe_match: 'no usable subtitle found',
+  wb_last_decision_identity_unidentified: 'could not tell which work',
   wb_last_decision_identity: 'identify only',
   wb_last_decision_no_outcome: 'no usable subtitle',
   // ── wb_node_*：**步骤条节点名**（短名词）。日志行要一句话，节点只有巴掌大一格，

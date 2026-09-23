@@ -638,8 +638,16 @@ export const zh = {
   wb_last_noaction: '这一轮没有可回看的动作',
   wb_last_decision_unknown: '已结束',
   // decision 是**后端的事实**，这里只把它翻成人话；不认识的取值前端原样回显。
+  // 🔴 第 61 轮更正：补齐字幕轨**真实**的全部取值（来源是 subtitleScheduler 的
+  // `recordRun` 调用点，不是我猜的）。原先漏了 retry_later / no_safe_match /
+  // identity_unidentified —— 而"找不到"与"待重试"恰恰是最常见的两种结局，
+  // 漏掉它们等于这两个结局在界面上只显示英文 id。`identity` 已不是字幕结论（后端也不再取它），
+  // 但标签留着：老后端的行可能仍带这个值。
   wb_last_decision_installed: '装上了',
   wb_last_decision_error: '出错了',
+  wb_last_decision_retry_later: '没找到，待重试',
+  wb_last_decision_no_safe_match: '没找到可用的字幕',
+  wb_last_decision_identity_unidentified: '没认出是哪部作品',
   wb_last_decision_identity: '只做了识别',
   wb_last_decision_no_outcome: '没找到可用字幕',
   // ── wb_node_*：**步骤条节点名**（短名词）。两族分开是因为两个界面的需求相反：

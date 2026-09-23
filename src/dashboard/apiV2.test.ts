@@ -768,6 +768,45 @@ describe('buildLastSubtitleRun（REQ-1c：最近一次字幕任务的事后回�
     expect(buildLastSubtitleRun(db)).toEqual({ run: null })
   })
 
+  // ── 🔴 第 61 轮更正：这份清单原先错在三处，而且**生产上就是照错的那份跑的**──────
+  // 判据来源是 `subtitleScheduler` 里 `recordRun` 的**全部**调用点，不是我猜的。
+  describe('decision 清单按 subtitleScheduler 的真实取值更正', () => {
+    const EV = [{ runKey: 'k', seq: 0, tool: 'download_candidate', argsSummary: JSON.stringify({ candidateId: 'subhd:x', videoFilename: 'X.mkv' }), resultSummary: '{}', tookMs: 1, at: NOW }]
+
+    it('🔴 retry_later 必须被算作字幕 run（生产 33 行，**原先看不见**）', () => {
+      insertSubtitleRun('retry_later', EV, '2 集待重试: s1e7, s1e8')
+      const dto = buildLastSubtitleRun(db)
+      expect(dto.run, 'retry_later 是最常见的结局之一，漏掉它等于用户看不到"待重试"').not.toBeNull()
+      expect(dto.run!.decision).toBe('retry_later')
+    })
+
+    it('🔴 no_safe_match 必须被算作字幕 run（原先看不见）', () => {
+      insertSubtitleRun('no_safe_match', EV, '3 集判无: s1e1; s1e2; s1e3')
+      expect(buildLastSubtitleRun(db).run!.decision).toBe('no_safe_match')
+    })
+
+    it('🔴 identity_unidentified 必须被算作字幕 run（原先看不见）', () => {
+      insertSubtitleRun('identity_unidentified', EV, 'agent 未能识别：噪声目录名')
+      expect(buildLastSubtitleRun(db).run!.decision).toBe('identity_unidentified')
+    })
+
+    it('🔴 `identity` **不是**字幕结论——识别阶段那一行不许冒充"最近一次找字幕"', () => {
+      // 生产实况：同一次执行里 `installed`(id=280) 与 `identity`(id=281) 先后落地、
+      // `started_at` 完全相同、trace 字节相同。若把 identity 算进来，`ORDER BY id DESC`
+      // 必然选中它 ⇒ 卡片显示成一句**识别**结论，而用户问的是"找字幕"。
+      insertSubtitleRun('installed', EV, '1 集入账: Moana.mkv')
+      insertSubtitleRun('identity', EV, 'agent 识别结论：tmdb:1108427')
+      const dto = buildLastSubtitleRun(db)
+      expect(dto.run!.decision, 'identity 的 id 更大，但它不是字幕结论').toBe('installed')
+    })
+
+    it('识别阶段的另两个取值也不许算进来（identify-no-match / identify-error）', () => {
+      insertSubtitleRun('identify-no-match', EV, 'x')
+      insertSubtitleRun('identify-error', EV, 'y')
+      expect(buildLastSubtitleRun(db)).toEqual({ run: null })
+    })
+  })
+
   it('trace 里的文件名在 files 表里查不到（文件已删/改名）→ run 仍返回，files 为空', () => {
     insertSubtitleRun('error', [
       { runKey: 'k', seq: 0, tool: 'download_candidate', argsSummary: JSON.stringify({ candidateId: 'subhd:x', videoFilename: '已经不存在了.mkv' }), resultSummary: '{}', tookMs: 1, at: NOW },

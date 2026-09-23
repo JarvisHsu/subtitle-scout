@@ -931,9 +931,27 @@ export function buildRunTrace(db: ScoutDb, runId: number): RunTraceDTO | null {
 // （`installed` / `error` / `identity` / `no_outcome`），识别路径另有值。
 // ⚠️ 这是一条**判据**，多认一个值就会把非字幕的 run 显示成字幕明细——故宁可少认。
 
-/** 什么 decision 算"字幕路径产生的一行"。生产实测取值：installed（装上了）、error（超时等）、
- *  identity（只做了识别没找到）、no_outcome。 */
-const SUBTITLE_RUN_DECISIONS = ['installed', 'error', 'identity', 'no_outcome'] as const
+/** 什么 decision 算"**字幕轨**产生的一行"。
+ *
+ *  ── 判据来源（不是我猜的）：`subtitleScheduler.ts` 里 `recordRun(...)` 的**全部**调用点 ──
+ *   · `installed`             装上了（第 912 行）
+ *   · `no_safe_match`         判无可用字幕（918）
+ *   · `retry_later`           待重试（921）
+ *   · `identity_unidentified` 识别阶段直接判认不出（933）
+ *   · `error`                 超时/抛错（714）
+ *
+ *  ── 🔴 第 61 轮更正（这份清单原先错在三处）────────────────────────────────
+ *  ① **`identity` 不是字幕结论**，它是**识别阶段**那一行（`findSubtitleWorkerTask` 写的
+ *     "agent 识别结论…"），只是恰好与 `installed` 在同一次执行里先后发生
+ *     （生产实测：两行 `started_at` 完全相同、`trace_json` 字节相同、id 相差 1）。
+ *     把它算进来会让"最近一次找字幕"显示成一句**识别**结论——用户问的却是"找字幕"。
+ *  ② **`retry_later`（生产 33 行）与 `no_safe_match` 原先被漏掉** ⇒ 最常见的两种结局
+ *     在界面上**完全看不到**，而"找不到字幕"与"待重试"正是用户最需要看见的两种。
+ *  ③ `identity_unidentified` 同样漏了。
+ *  另：原先清单里的 `no_outcome` **在生产与代码里都不存在**，是我想当然写上的。 */
+const SUBTITLE_RUN_DECISIONS = [
+  'installed', 'no_safe_match', 'retry_later', 'identity_unidentified', 'error',
+] as const
 
 export interface LastRunFileDTO {
   key: string
