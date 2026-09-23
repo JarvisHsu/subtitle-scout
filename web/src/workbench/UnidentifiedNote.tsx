@@ -80,6 +80,14 @@ export function UnidentifiedNote({
   // 后端把上限改成 20 时这里自动正确。
   const hiddenCount = dirCount - dirs.length
 
+  // P6（2026-09-23）：按**实际处境**选一句话，不再用一句通用话误导两种人。
+  // 判据来自后端的 `reason`；老后端没有这个字段 ⇒ 一律按 `transient`（最不吓人、也最不需要
+  // 用户动手的那一档），**不**退回旧那句"去改名"——那句正是本次要修掉的那个误导。
+  const reasons = new Set(dirs.map((d) => d.reason ?? 'transient'))
+  const reasonKey = reasons.has('exhausted') && reasons.has('transient')
+    ? 'unidentified_reason_mixed'
+    : reasons.has('exhausted') ? 'unidentified_reason_exhausted' : 'unidentified_reason_transient'
+
   return (
     <>
       {/* role="status" + aria-live="polite"：这是一条**背景事实**，不是对用户操作的回应，
@@ -137,6 +145,10 @@ export function UnidentifiedNote({
             {t('unidentified_more').replace('{n}', String(hiddenCount))}
           </span>
         )}
+        {' '}
+        {/* P6：处境那句。放在目录名**之后**——先给"是哪些"，再给"该怎么办"。
+            Carbon 双通道：文字自己把话说全（去掉这一句，用户就不知道该不该动手）。 */}
+        <span data-testid="wb-unidentified-reason">{t(reasonKey)}</span>
       </span>
 
       {/* 弹窗渲染在 `<span role="status">` **外面**：live region 里放可交互的模态是错的

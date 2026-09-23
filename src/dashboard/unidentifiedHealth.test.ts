@@ -57,7 +57,11 @@ describe('buildUnidentifiedHealth', () => {
     expect(out.dirCount).toBe(1)
     // `handle` 是 D-5 加进来的机器指针（不是给人看的读数）；它为什么不算"排障噪音泄漏"，
     // 论证写在下方那条字段全集断言处，不在这里重复。
-    expect(out.dirs).toEqual([{ dirName: 'Unknown Show', fileCount: 24, handle: encodeWorkDirHandle('/m/Unknown Show') }])
+    expect(out.dirs).toEqual([{
+      dirName: 'Unknown Show', fileCount: 24, handle: encodeWorkDirHandle('/m/Unknown Show'),
+      // P6：没有 identify-no-match 留痕 ⇒ 归 transient（"这一轮没成"，不是"搜遍了没找到"）
+      reason: 'transient',
+    }])
   })
 
   // 🔴 本文件最重要的一条：404 终态那批**永不再进识别队列**（identifyScheduler.ts:37
@@ -102,7 +106,12 @@ describe('buildUnidentifiedHealth', () => {
     //     src/core/workDirHandle.ts 头注释的完整论证。
     //   · 若将来有人想把绝对路径**直接**塞进 DTO 而不编码，下面三条 JSON 断言会当场红——那才是
     //     这条裁决真正要拦的东西，句柄没有绕过它。
-    expect(Object.keys(out.dirs[0]!).sort()).toEqual(['dirName', 'fileCount', 'handle'])
+    //   · P6（2026-09-23）加了 `reason`（`'exhausted' | 'transient'`）。**它不破例**：
+    //     它不是一个排障读数，而是一个**归类**——决定界面上说"改名帮不上忙"还是"会自动重试"。
+    //     它与 `last_error` 原文的区别正在这里：`last_error` 是给排障的人看的字符串（
+    //     `evidence-fail: …` / LLM 异常串），而 `reason` 是把它折成**用户能据以行动的两档**。
+    //     下面那三条"不许出现"的 JSON 断言仍然独立地守着原文不外泄。
+    expect(Object.keys(out.dirs[0]!).sort()).toEqual(['dirName', 'fileCount', 'handle', 'reason'])
     // 目录名是最后一段，挂载点前缀不出去（对用户零信息量，且是容器内路径）。
     expect(out.dirs[0]!.dirName).toBe('Mystery')
     const json = JSON.stringify(out)
@@ -142,6 +151,52 @@ describe('buildUnidentifiedHealth', () => {
     const out = buildUnidentifiedHealth(db)
     expect(out.dirCount).toBe(total)
     expect(out.dirs).toHaveLength(MAX_LISTED_DIRS)
+  })
+
+  // ── 🔴 P6（第 57 轮，2026-09-23）：按"我们到底试到什么程度"分档 ──────────────────
+  // 修的是什么：界面上原来只有一句通用话（"目录名清晰可辨最有帮助；改名后下轮会重试"），
+  // 它对两种完全不同的处境说同一件事，而两种都是误导：
+  //   · agent 已经搜遍了（改名白费力气，该走"指定作品"）
+  //   · 这一轮没成（用户什么都不用做，会自动重试）
+  describe('P6 · reason 两档', () => {
+    /** 造一条 agent「搜遍了」的留痕（第 53 轮接上的那条 runs 通道）。 */
+    function addNoMatchRun(workDir: string): void {
+      db.prepare(
+        `INSERT INTO runs (job_id, started_at, finished_at, decision, detail, journal_path)
+         VALUES (NULL, ?, ?, 'identify-no-match', ?, NULL)`,
+      ).run(NOW, NOW, `${workDir}: 目录名是噪声串，全名与去噪变体在 movie/tv 均返回 0 条`)
+    }
+
+    it('🔴 有 identify-no-match 留痕 → exhausted（agent 说搜遍了）', () => {
+      addFile({ path: '/m/Searched/e1.mkv', workDir: '/m/Searched', lastError: 'identify-failed' })
+      addNoMatchRun('/m/Searched')
+      expect(buildUnidentifiedHealth(db).dirs[0]!.reason).toBe('exhausted')
+    })
+
+    it('🔴 没有留痕（瞬时失败/超时）→ transient（**不**敢说"我们搜遍了"）', () => {
+      addFile({ path: '/m/Flaky/e1.mkv', workDir: '/m/Flaky', lastError: 'identify-failed' })
+      expect(buildUnidentifiedHealth(db).dirs[0]!.reason).toBe('transient')
+    })
+
+    it('🔴 留痕是**别的目录**的 → 不串味（按 work_dir 前缀精确匹配）', () => {
+      addFile({ path: '/m/Mine/e1.mkv', workDir: '/m/Mine', lastError: 'identify-failed' })
+      addNoMatchRun('/m/Somebody Else')   // 另一个目录搜遍了
+      expect(buildUnidentifiedHealth(db).dirs[0]!.reason, '别人的结论不许贴到我头上').toBe('transient')
+    })
+
+    it('前缀匹配精确到 `: `（兄弟目录 /m/Show2 的留痕不许命中 /m/Show）', () => {
+      addFile({ path: '/m/Show/e1.mkv', workDir: '/m/Show', lastError: 'identify-failed' })
+      addNoMatchRun('/m/Show2')
+      // `/m/Show:%` 不匹配 `/m/Show2: …` ⇒ 不会被兄弟目录的结论污染
+      expect(buildUnidentifiedHealth(db).dirs[0]!.reason).toBe('transient')
+    })
+
+    it('tmdb-404 终态（TMDB 上确实没有）也算 exhausted 吗——**不算**，留痕才是唯一凭据', () => {
+      // 404 只说明"两种类型都查过、TMDB 没这部作品"，而我们**没有** agent 那份"全名+变体都搜过"
+      // 的结论。宁可少说，也不要把"没搜到"说成"搜遍了"。
+      addFile({ path: '/m/Dead/e1.mkv', workDir: '/m/Dead', lastError: 'tmdb-404', nextRetryAt: null })
+      expect(buildUnidentifiedHealth(db).dirs[0]!.reason).toBe('transient')
+    })
   })
 
   it('work_dir 末尾带分隔符 → 取最后一个非空段，不返回空串', () => {

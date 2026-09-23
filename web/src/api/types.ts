@@ -473,6 +473,15 @@ export interface UnidentifiedDirDTO {
    *
    *  ⚠️ 它不是权限凭据：能不能绑由服务端另行判定（目录必须真的未识别）。 */
   handle?: string
+  /** P6（2026-09-23）：**为什么还没认出来**——决定界面上说哪句话、要不要用户动手。
+   *
+   *  · `exhausted`：agent 跑完并给了结论（搜遍全名与去噪变体，TMDB 上没有）。
+   *    **改名帮不上忙**，该走的是"指定作品"。
+   *  · `transient`：这一轮没成（超时/抖动），**没有**"搜遍了"的证据；会自动重试，用户无需动作。
+   *
+   *  可选（老后端没有）→ 前端按 `transient` 渲染：宁可少说"我们搜遍了"，
+   *  也不要在没证据时告诉用户"这东西 TMDB 上没有"。 */
+  reason?: 'exhausted' | 'transient'
 }
 
 /** `GET /api/v2/tmdb/search` 的一个结果项。

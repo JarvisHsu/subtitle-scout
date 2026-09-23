@@ -393,7 +393,13 @@ describe('GET /api/v2/health（Task ⑤）', () => {
     // `handle` 是 D-5（人工绑定通道）加到 DTO 上的机器指针。它必须**解回库里那个 work_dir**——
     // 这是"端点接线正确"的唯一证据：句柄只是一串合法字符串，接错了 HTTP 层不会有任何报错，
     // 只会让前端拿到一个绑不到任何东西的指针（表现为用户点了"就是它"之后得到 404）。
-    expect(dir).toEqual({ dirName: 'Unknown Show', fileCount: 1, handle: encodeWorkDirHandle('/media/Unknown Show') })
+    // P6：这一行只有 `tmdb-404`，**没有** `identify-no-match` 留痕 ⇒ 归 `transient`。
+    // 这是刻意的：404 只说明"两种类型都查过、TMDB 没这部作品"，而我们**没有** agent 那份
+    // "全名与去噪变体都搜过"的结论。宁可少说，也不要把"没搜到"说成"搜遍了"。
+    expect(dir).toEqual({
+      dirName: 'Unknown Show', fileCount: 1,
+      handle: encodeWorkDirHandle('/media/Unknown Show'), reason: 'transient',
+    })
     expect(resolveWorkDirHandle(dir!.handle, ['/media/Unknown Show'])).toBe('/media/Unknown Show')
   })
 

@@ -46,24 +46,56 @@ describe('UnidentifiedNote · 说什么（信息量边界：R-F9/R-F10 排障不
     expect(line.textContent).toContain('Unknown Show')
   })
 
-  // 🔴 R-F1 的下半句「底线是按 title (year) 命名」必须真的出现在用户眼前——
-  // 界面上没有任何按钮，不说清格式这条提示就只是在报忧。
-  it('🔴 文案里带着 `title (year)` 这个可执行的格式', () => {
+  // 🔴 P6（2026-09-23）**推翻了这条**：原断言要求文案里带 `title (year)` 那个可执行格式。
+  // 但它对"agent 已经搜遍了"的目录是**误导**——实测那个目录的 agent 理由写明它搜过全名
+  // 与 4 个去噪变体（movie/tv）全为 0 条，用户去改名是白费力气。现在按处境分两档说，
+  // 且**不再**出现一句通用的"改名就会好"。
+  it('🔴 缺 reason（老后端）→ 按 transient 说"会自动重试"，**不说**"去改名"', () => {
     renderNote({ dirCount: 1, dirs: [{ dirName: 'x', fileCount: 1 }] })
-    expect(screen.getByTestId('wb-unidentified-line').textContent).toMatch(/title.*year/i)
+    const line = screen.getByTestId('wb-unidentified-line').textContent ?? ''
+    expect(line).toContain(en.unidentified_reason_transient)
+    expect(line, '不再劝用户改名（那对"搜遍了"的目录是误导）').not.toMatch(/renaming/i)
+  })
+
+  it('🔴 reason=exhausted → 说清"改名帮不上忙"，并指向"指定作品"', () => {
+    renderNote({ dirCount: 1, dirs: [{ dirName: '噪声目录', fileCount: 3, reason: 'exhausted' }] })
+    const line = screen.getByTestId('wb-unidentified-line').textContent ?? ''
+    expect(line).toContain(en.unidentified_reason_exhausted)
+    expect(line, 'exhausted 那档必须说清改名没用').toContain('renaming will not help')
+  })
+
+  it('🔴 reason=transient → 说"不用管，会自动重试"（不催用户动手）', () => {
+    renderNote({ dirCount: 1, dirs: [{ dirName: 'x', fileCount: 1, reason: 'transient' }] })
+    expect(screen.getByTestId('wb-unidentified-line').textContent)
+      .toContain(en.unidentified_reason_transient)
+  })
+
+  it('🔴 两档混在一起 → 说混合那句（各给各的下一步）', () => {
+    renderNote({
+      dirCount: 2,
+      dirs: [
+        { dirName: 'a', fileCount: 3, reason: 'exhausted' },
+        { dirName: 'b', fileCount: 1, reason: 'transient' },
+      ],
+    })
+    expect(screen.getByTestId('wb-unidentified-line').textContent)
+      .toContain(en.unidentified_reason_mixed)
   })
 
   // 2026-08-27 实测（用户第一次真人跑 setup）：旧文案「rename them to "title (year)" and
   // they'll be picked up」在两处撒谎——① 识别是 agent 做的，title (year) 不是必需格式
-  // （裸 title 也能认），说"改成这个格式就能处理"对着一个本来就是 title (year) 只是括号
-  // 全角的目录，用户无从照办；② "就能处理"是没有的承诺。诚实版：格式只是"最有帮助"，
-  // 且说清改名之后发生什么（下轮自动检查会重试）。
-  it('🔴 文案说真话：格式是建议不是必需（helps，不承诺 picked up），且交代改名后下轮会重试', () => {
+  // （裸 title 也能认）；② "就能处理"是没有的承诺。
+  //
+  // 🔴 2026-09-23（P6）**再往前一步**：连"改名最有帮助"这句也不该无条件说——对 agent
+  // 已经搜遍的目录，改名白费力气（实测那份理由写明搜过全名 + 4 个去噪变体，movie/tv 全 0）。
+  // 现在按处境分档；这里守的是"**既不许承诺 picked up，也不许无条件劝改名**"。
+  it('🔴 文案说真话：不承诺"改了就会被处理"，也不再无条件劝改名', () => {
     renderNote({ dirCount: 1, dirs: [{ dirName: 'x', fileCount: 1 }] })
     const text = screen.getByTestId('wb-unidentified-line').textContent ?? ''
     expect(text).not.toMatch(/rename them to .+ and they'll be picked up/i)
-    expect(text).toMatch(/helps/i)
+    // transient（缺 reason 的默认档）：说清会自动重试，用户不用动手
     expect(text).toMatch(/retr/i) // retry / retried
+    expect(text, 'transient 那档不该出现"改名"这个动作').not.toMatch(/renaming/i)
   })
 
   it('多个目录逗号分隔，同前缀的两个也能区分', () => {

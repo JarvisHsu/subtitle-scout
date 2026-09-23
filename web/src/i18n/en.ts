@@ -761,7 +761,15 @@ export const en = {
   //     本来就是 title (year) 只是括号全角，照旧提示改无从改起。诚实版说 helps 不说包好，
   //     并交代改名后下轮自动检查会重试。
   //  ③ 不出现 park / parked / work_id / TMDB / agent / 404 / 退避 这类实现词。
-  unidentified_note: "Still can't recognise these folders. A clearly recognisable name (like “title (year)”) helps most; after renaming, the next automatic check will retry them",
+  unidentified_note: "Tried but still can't recognise these folders",
+  // ── P6 (2026-09-23): say WHICH of two situations this is, instead of one generic line.
+  // The old line ("a clearly recognisable name helps most; renaming retries next check") misleads:
+  //   · exhausted — the agent already searched the folder name and its denoised variants; TMDB
+  //     genuinely has no match. Renaming is wasted effort; use "assign a work" instead.
+  //   · transient — this round failed (timeout/jitter) with NO evidence we searched exhaustively.
+  unidentified_reason_exhausted: 'Searched the folder name and its denoised variants — TMDB has no match, so renaming will not help; if you know which work it is, click the folder name to assign it',
+  unidentified_reason_transient: 'This round did not complete (timeout or jitter); it will retry automatically, nothing to do for now',
+  unidentified_reason_mixed: 'Some were searched exhaustively with no match, others just did not complete this round — click a name to assign it, or wait for the automatic retry',
   /** 截断时的尾巴。`dirs` 只给前 8 个，总数一律读 dirCount（绝不用 dirs.length）。 */
   unidentified_more: 'and {n} more',
   // ── Proposal group 8: point a folder at a TMDB work by hand (visible form of the D-5 endpoint).

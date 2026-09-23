@@ -49,6 +49,26 @@
 import type { ScoutDb } from '../v2/db.js'
 import { encodeWorkDirHandle } from '../core/workDirHandle.js'
 
+/** 为什么这个目录还没被认出来——**三档，各对应一句不同的话与不同的下一步**。
+ *
+ *  ── P6（第 57 轮，2026-09-23）加这一档的理由 ─────────────────────────────
+ * 界面上原来只有一句通用话：「目录名清晰可辨（如「片名 (年份)」）最有帮助；改名后下轮巡检会重试」。
+ * 那句话对**三种完全不同的处境**说了同一件事，其中两种是**误导**：
+ *  · 对"我们已经跑过 agent 并且它明确说搜遍了"的目录，用户去改名是白费力气——
+ *    实测那个目录的 agent 理由已经写明它搜过**全名 + 4 个去噪变体**（movie 与 tv 两种）全为 0 条；
+ *  · 对"一次瞬时失败（LLM 5xx / 超时）"的目录，用户什么都不用做——下一轮自己会重试，
+ *    而我们却在催他改名。
+ *
+ * ── 判据（只用库里已经有的、且**不新增排障读数**）──────────────────────────
+ * `exhausted`：该目录在 `runs` 里有 `decision='identify-no-match'` 的留痕（第 53 轮接上的那条
+ * 有界通道），说明 agent **真的跑完并给了结论**——它说了"TMDB 上没有"。
+ * 其余（`identify-failed` / `tmdb-404` / LLM 异常串）统一归 `transient`：这一轮没成，
+ * 但**没有**任何"我搜遍了"的证据。**不把不知道的算成知道**。
+ *
+ * ⚠️ 这是**从已有留痕推导**，不是新开一条读出面：`last_error` 原文与 `runs.detail` 都照旧
+ * 不上界面（见文件头的"信息量边界"）。 */
+export type UnidentifiedReason = 'exhausted' | 'transient'
+
 /** 一个认不出来的作品目录。
  *
  *  🔴 原注释是「**刻意只有两个字段**——多一个就是往界面上搬排障读数」。D-5（2026-09-18）
@@ -71,6 +91,8 @@ export interface UnidentifiedDirDTO {
   /** 不透明句柄（base64url(work_dir)），供 `POST /api/v2/identify/bind` / `unbind` 回指。
    *  前端原样回传即可，不要解析、不要展示。 */
   handle: string
+  /** P6：这一档决定界面上说哪句话（见 `UnidentifiedReason` 的论证）。 */
+  reason: UnidentifiedReason
 }
 
 /** `/api/v2/health` 的 `unidentified` 段。 */
@@ -134,7 +156,28 @@ export function buildUnidentifiedHealth(db: ScoutDb): UnidentifiedHealthDTO {
       fileCount: r.n,
       // D-5：机器可用指针，供 POST /api/v2/identify/bind|unbind 回指。前端原样回传即可。
       handle: encodeWorkDirHandle(r.work_dir),
+      reason: reasonFor(db, r.work_dir),
     })),
+  }
+}
+
+/** P6：这个目录属于哪一档。判据见 `UnidentifiedReason` 的注释。
+ *
+ *  `runs.detail` 里带的是**完整 work_dir 前缀**（`<work_dir>: <agent 理由>`），故按
+ *  `work_dir` 精确匹配前缀即可——不用模糊匹配，也不会把别的目录算进来。
+ *  表不存在（旧库）/查询失败一律回 `transient`：**宁可少说"我们搜遍了"**，
+ *  也不要凭一次读失败就说"这东西 TMDB 上没有"。 */
+function reasonFor(db: ScoutDb, workDir: string): UnidentifiedReason {
+  try {
+    const hit = db
+      .prepare(
+        `SELECT 1 AS ok FROM runs
+          WHERE decision = 'identify-no-match' AND detail LIKE ? LIMIT 1`,
+      )
+      .get(`${workDir}:%`) as { ok: number } | undefined
+    return hit ? 'exhausted' : 'transient'
+  } catch {
+    return 'transient'
   }
 }
 
