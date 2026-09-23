@@ -481,6 +481,10 @@ export class ScoutDaemonV2 {
    *  requestInspect 靠它返回 already_running，而不是再排队第二轮。 */
   private inspecting = false
 
+  /** P1（2026-09-20）：上一次**媒体根变更探测**的名字级指纹（`目录 → 排序后名字串`）。
+   *  `null` = 还没建基线（启动后第一次探测只建基线、不当成"变化"，否则一启动就白踢一脚扫描）。 */
+  private rootProbeSig: Map<string, string> | null = null
+
   /** 按需取字幕的待办（openspec 第 12 组）。**只有主循环取件**：HTTP 线程在
    *  `requestSubtitleFetch` 里只 push + 叫醒 idle，绝不 await 跑流水线
    *  （同 `scanRequested` 的论证：那会让"用户点一下"变成 HTTP 请求挂着两个小时的付费调用，
@@ -916,6 +920,21 @@ export class ScoutDaemonV2 {
       await this.runMaintenance()
       this.deps.log(`维护拍: 结束（用时 ${Math.round((Date.now() - maintT) / 1000)}s）`)
 
+      // 🔴 P1（2026-09-20，用户报「新加的视频不会立即开始搜索字幕」）：
+      // **媒体根变更探测**。此前扫描的触发点只有"每 6 小时的巡检"与 `requestScan`，
+      // **没有任何"库变了"的检测** ⇒ 用户拷完片子最长等 6 小时。
+      // 这里每拍（维护循环 = 5 分钟）比对一次**名字级指纹**（只 readdir、不 stat 文件），
+      // 有变化就踢一脚扫描；之后既有链条自动接手：
+      //   扫描 → `newlyAdded` → **抢跑一轮巡检**（第 24 轮）→ 识别 → 字幕。
+      // 巡检正在跑时跳过（那时扫描本来就要发生）。
+      if (!this.inspecting && !this.stopping) {
+        const changed = this.probeRootsChanged()
+        if (changed.length > 0) {
+          this.deps.log(`库变更探测: ${changed.length} 处变化（如 ${changed.slice(0, 3).join('、')}）→ 踢一脚扫描`)
+          this.requestScan()
+        }
+      }
+
       const now = this.deps.now?.() ?? Date.now()
       const lastInspectAt = this.readLastInspectAt()
       const everyMs = this.deps.inspectEveryMs?.() ?? INSPECT_INTERVAL_MS
@@ -1066,6 +1085,63 @@ export class ScoutDaemonV2 {
    *  每个器官各自 try/catch：口径与旧 daemon 一致（"失败只记日志，运维是增益，绝不拖垮主
    *  循环"），但**必须逐个包**而不是整体包一层——整体包的话第一个器官抛错就短路掉后面三个，
    *  一次磁盘满会同时静默掉 checkpoint、备份、探针清扫和 trace 修剪。 */
+  /** P1（2026-09-20）：**媒体根变更探测**——回答"库变了吗"，好让新片不必等 6 小时。
+   *
+   *  ── 判据为什么是"名字级指纹（≤3 层）"而不是 mtime ────────────────────────────
+   *  只 stat 顶层目录**不够**：往 `<show>/<Season 01>/` 里加一集，只有 `Season 01` 的 mtime
+   *  会变，`<show>` 与根都不变——而"给老剧加一集"恰恰是最常见的场景。
+   *  只 readdir **不 stat 文件**：本仓记着"FUSE 上 stat/probe 代价放大约 46 倍"，
+   *  而"多了一个名字"这件事在 readdir 的结果里就看得见。3 层够覆盖 `根/剧/季/文件`。
+   *
+   *  ── 代价与它的账 ──────────────────────────────────────────────────────────
+   *  每拍约 = 每个目录一次 readdir（生产：2 个根 + 74/3 个一级 + 若干二级）。
+   *  实测口径写在返回值的日志里（只在**有变化**或**耗时超预算**时打），
+   *  预算取 20s：超了就说明这一拍太重，该降深度或降频（先量再调，不猜）。
+   *
+   *  返回**变化了的路径**（供日志说清"哪里变了"）。首次运行只建基线、不算变化。 */
+  private probeRootsChanged(): string[] {
+    const startedAt = Date.now()
+    const sig = new Map<string, string>()
+    const listNames = (d: string): string[] => {
+      const names = this.deps.readdir ? this.deps.readdir(d) : readdirSync(d)
+      return [...names].sort()
+    }
+    const walk = (dir: string, depth: number): void => {
+      let names: string[]
+      try {
+        names = listNames(dir)
+      } catch {
+        return // 读不出来（权限/抖动）→ 这一支跳过，不让一个坏目录中断探测
+      }
+      sig.set(dir, names.join('|'))
+      if (depth <= 0) return
+      for (const name of names) {
+        if (name.startsWith('.')) continue // 点前缀：沙盒/工具目录，不进
+        walk(join(dir, name), depth - 1)
+      }
+    }
+    for (const root of this.writableRoots()) walk(root, 2)
+
+    const prev = this.rootProbeSig
+    this.rootProbeSig = sig
+    if (prev === null) {
+      this.deps.log(`库变更探测: 建立基线（${sig.size} 个目录；用时 ${Math.round((Date.now() - startedAt) / 1000)}s）`)
+      return []
+    }
+    const changed: string[] = []
+    for (const [dir, s] of sig) if (prev.get(dir) !== s) changed.push(dir)
+    for (const dir of prev.keys()) if (!sig.has(dir)) changed.push(dir) // 目录被删了也算变化
+    const dur = Date.now() - startedAt
+    // 预算 20s：超过就说明这一拍太重（该降深度或降频）。**先量再调**，不猜。
+    if (dur > 20_000) {
+      this.deps.log(
+        `⚠️ 库变更探测用时 ${Math.round(dur / 1000)}s（预算 20s，${sig.size} 个目录）` +
+        `——抽样降深度或降频的时机到了`,
+      )
+    }
+    return changed
+  }
+
   private async runMaintenance(): Promise<void> {
     // 🔴 #19（第 40 轮）：维护拍原来**没有任何日志**（`db backup` 只是它的其中一步）。
     // 实测："进主循环"之后 **2 分 20 秒**仍无 `巡检开始`/`扫描开始`，而 boot 段已只需 31 毫秒
