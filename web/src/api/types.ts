@@ -384,8 +384,24 @@ export interface ScoutCurrentDTO {
   cueDone: number | null
   cueTotal: number | null
   /** 活动卡覆盖格 per-target 状态（2026-08-30，对齐后端 ScoutCurrent.targets）。字幕流才有；
-   *  识别/翻译恒 undefined。全量数组——每条里程碑帧带完整快照，重连后下一帧即完整真相。 */
-  targets?: Array<{ key: string; label: string; state: 'pending' | 'active' | 'installed' | 'pending-source' }>
+   *  识别/翻译恒 undefined。全量数组——每条里程碑帧带完整快照，重连后下一帧即完整真相。
+   *
+   *  `detail`（REQ-1a，2026-09-23）：这一格**正在对这个文件做什么**。对齐后端
+   *  `SubtitleTargetDetail`。老后端不带 ⇒ undefined ⇒ 前端退化成只画状态（不编内容）。 */
+  targets?: Array<{
+    key: string
+    label: string
+    state: 'pending' | 'active' | 'installed' | 'pending-source'
+    detail?: {
+      step: string | null
+      source: string | null
+      note: string | null
+      ms: number
+      steps: string[]
+      sources: string[]
+      searched: number
+    }
+  }>
 }
 
 /** 三个工作台各自的当前态快照（对齐后端 ScoutCurrents，2026-08-30 起 per-workbench 三槽）。

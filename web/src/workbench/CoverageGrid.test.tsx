@@ -70,6 +70,76 @@ describe('CoverageGrid · 电影流退化：单枚状态丸', () => {
   })
 })
 
+describe('CoverageGrid · REQ-1a「这个文件现在在做什么」', () => {
+  const withDetail = (over: Partial<NonNullable<Target['detail']>> = {}): NonNullable<Target['detail']> => ({
+    step: 'download_candidate', source: 'subhd', note: '下载失败：服务器内部错误，请稍后再试。',
+    ms: 24242, steps: ['search_source', 'download_candidate'], sources: ['subhd'], searched: 1,
+    ...over,
+  })
+
+  it('🔴 有 detail → 画出当前动作行（集号 · 动作 · 源站 · 人话 · 耗时）', () => {
+    renderGrid([
+      { key: 's1e7', label: 'S01E07', state: 'active', detail: withDetail() },
+      { key: 's1e8', label: 'S01E08', state: 'pending' },
+    ])
+    const line = screen.getByTestId('wb-grid-detail').textContent ?? ''
+    expect(line).toContain('S01E07')
+    expect(line).toContain('downloading')        // en 文案（用例用 en 渲染）
+    expect(line).toContain('subhd')              // 源站照原样（不是我们编的译名）
+    expect(line).toContain('下载失败：服务器内部错误，请稍后再试。')  // 人话理由**不翻译**（是事实）
+    expect(line).toContain('24s')                // 耗时
+  })
+
+  it('🔴 没有任何 detail（老后端/还没动）→ 一行都不画，不许编"正在准备"', () => {
+    renderGrid([
+      { key: 's1e7', label: 'S01E07', state: 'pending' },
+      { key: 's1e8', label: 'S01E08', state: 'pending' },
+    ])
+    expect(screen.queryByTestId('wb-grid-detail')).toBeNull()
+  })
+
+  it('🔴 只显示**最近动过的那一格**（优先 active），不把 24 格细节铺成日志', () => {
+    renderGrid([
+      { key: 's1e1', label: 'S01E01', state: 'pending', detail: withDetail({ step: 'search_source', note: '找到 44 个候选', source: null, ms: 5000 }) },
+      { key: 's1e2', label: 'S01E02', state: 'active', detail: withDetail({ step: 'get_candidate', source: 'zimuku', note: null, ms: 900 }) },
+    ])
+    const lines = screen.getAllByTestId('wb-grid-detail')
+    expect(lines, '只许有一行').toHaveLength(1)
+    expect(lines[0]!.textContent).toContain('S01E02')
+    expect(lines[0]!.textContent).toContain('zimuku')
+  })
+
+  it('工具名未知 → 照实显示工具名（比编一个动作更有用）', () => {
+    renderGrid([{ key: 'movie', label: '', state: 'active', detail: withDetail({ step: 'some_new_tool', source: null, note: null, ms: 1000 }) }])
+    const line = screen.getByTestId('wb-grid-detail').textContent ?? ''
+    expect(line).toContain('some_new_tool')
+  })
+
+  it('耗时按档位人读（秒 / 分秒 / 时分），不四舍五入到好看', () => {
+    const cases: Array<[number, string]> = [[45_000, '45s'], [80_000, '1m20s'], [3_720_000, '1h02m']]
+    for (const [ms, want] of cases) {
+      cleanup()
+      renderGrid([{ key: 'movie', label: '', state: 'active', detail: withDetail({ ms, source: null, note: null }) }])
+      expect(screen.getByTestId('wb-grid-detail').textContent).toContain(want)
+    }
+  })
+
+  it('电影流：状态丸 + 动作行并存（不因退化成一枚丸就丢掉细节）', () => {
+    renderGrid([{ key: 'movie', label: '', state: 'active', detail: withDetail({ step: 'search_source', source: null, note: '找到 44 个候选', ms: 5077 }) }])
+    expect(screen.getByTestId('wb-grid-pill')).toBeInTheDocument()
+    expect(screen.getByTestId('wb-grid-detail').textContent).toContain('找到 44 个候选')
+  })
+
+  it('searched > 1 才追加"已搜 N"（只搜过一次时不追加，避免噪音）', () => {
+    cleanup()
+    renderGrid([{ key: 'movie', label: '', state: 'active', detail: withDetail({ searched: 1, source: null, note: null }) }])
+    expect(screen.getByTestId('wb-grid-detail').textContent).not.toContain('searched 1')
+    cleanup()
+    renderGrid([{ key: 'movie', label: '', state: 'active', detail: withDetail({ searched: 3, source: null, note: null }) }])
+    expect(screen.getByTestId('wb-grid-detail').textContent).toContain('searched 3')
+  })
+})
+
 describe('CoverageGrid · 空数组沉默', () => {
   it('空数组 → 容器不渲染（返回 null）', () => {
     const { container } = renderGrid([])

@@ -612,6 +612,17 @@ export const zh = {
   wb_grid_active: '进行中',
   wb_grid_pending: '待处理',
   wb_grid_pending_source: '暂缺',
+  // ── wb_detail_*（REQ-1a，2026-09-23）：覆盖格下方那行"**这个文件现在在做什么**"。
+  // 全部是**光标签 / 无占位符**（t() 不插值），调用方按「标签 · 源站 · 人话 · 耗时」自己拼。
+  // `wb_detail_unknown` 只在**确实读不出工具名**时用——拿不到就说读不出，不编一个动作。
+  wb_detail_unknown: '处理中',
+  wb_detail_search_source: '正在搜源',
+  wb_detail_list_candidates: '正在翻候选',
+  wb_detail_get_candidate: '正在看候选',
+  wb_detail_download_candidate: '正在下载',
+  wb_detail_check_episode_code_safety: '正在核对季集',
+  wb_detail_install_subtitle: '正在装盘',
+  wb_detail_searched: '已搜',
   // ── wb_node_*：**步骤条节点名**（短名词）。两族分开是因为两个界面的需求相反：
   // 日志行是一句话，节点是巴掌大的一格。.wb-stage-label 是 nowrap + ellipsis，
   // 节点文案**不许共用首字**——2026-08-26 截图实测四个节点全被截成

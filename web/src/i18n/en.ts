@@ -681,6 +681,16 @@ export const en = {
   wb_grid_active: 'in progress',
   wb_grid_pending: 'pending',
   wb_grid_pending_source: 'unavailable',
+  // ── wb_detail_* (REQ-1a, 2026-09-23): the "what is happening to THIS file right now" line
+  // rendered under the coverage grid. Plain labels, no placeholders — t() does not interpolate.
+  wb_detail_unknown: 'working',
+  wb_detail_search_source: 'searching sources',
+  wb_detail_list_candidates: 'paging candidates',
+  wb_detail_get_candidate: 'inspecting candidate',
+  wb_detail_download_candidate: 'downloading',
+  wb_detail_check_episode_code_safety: 'checking episode code',
+  wb_detail_install_subtitle: 'installing',
+  wb_detail_searched: 'searched',
   // ── wb_node_*：**步骤条节点名**（短名词）。日志行要一句话，节点只有巴掌大一格，
   // 且 .wb-stage-label 是 nowrap + ellipsis → 节点文案必须短且不共用开头。
   // zh 侧同族词条附有 2026-08-26 的截图实测记录。

@@ -2575,6 +2575,17 @@ html {
   flex-wrap: wrap;
   gap: 3px;
 }
+/* REQ-1a：覆盖格下面那行"这个文件现在在做什么"。刻意与 .wb-grid-count 同字号同色阶，
+   让"计数行"和"当前动作行"读起来是一组读数，而不是抢视线的第三个东西。
+   单行省略：一行放不下时截断，**不换行**——换行会把卡片撑高、把下面的日志行挤走。 */
+.wb-grid-detail {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--color-weak);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 /* 14px 方格。四档状态靠 [data-state] 取色，**颜色不是唯一通道**：installed 实心、
    active 实心+脉冲、pending 暗底、pending-source 暗底+虚线边框——形状/边框各不同，
    色觉障碍下仍可分。 */
