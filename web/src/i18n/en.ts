@@ -629,6 +629,10 @@ export const en = {
   wb_inspect_idle: 'Last automatic check',
   wb_inspect_next: 'Next automatic check',
   wb_inspect_soon: 'due soon',
+  // ── P5 (2026-09-23): state the ACTUAL inspection cadence. A countdown alone does not answer
+  // "why hasn't it moved yet" — the user needs to know this box checks every 6h, not continuously.
+  wb_inspect_every: 'every',
+  wb_inspect_every_end: '',
   wb_inspect_run: 'Run now',
   wb_inspect_already: 'A check is already running',
   wb_inspect_run_failed: "Can't start a check right now",

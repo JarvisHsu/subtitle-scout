@@ -109,6 +109,22 @@ describe('msUntilNextInspect：优先后端 nextInspectAt，缺了才回落 last
     expect(msUntilNextInspect({ nextInspectAt: NOW - HOUR, lastInspectAt: NOW - 25 * HOUR }, NOW))
       .toBe(0)
   })
+
+  // 🔴 P5（2026-09-23）：回落时必须用**后端报来的间隔**，不许再写死 24h。
+  // 生产实测本机是 6h，而前端曾写死 24h ⇒ 倒计时长 4 倍（"再等 2 小时"被说成"再等 8 小时"）。
+  it('🔴 nextInspectAt 缺席 + 后端报 6h → 按 6h 回落（不是 24h）', () => {
+    expect(msUntilNextInspect(
+      { nextInspectAt: null, lastInspectAt: NOW - HOUR, inspectIntervalMs: 6 * HOUR }, NOW,
+    )).toBe(5 * HOUR)
+  })
+
+  it('inspectIntervalMs 脏值/缺席（老后端）→ 退回 24h 兜底，行为与改动前一致', () => {
+    for (const bad of [undefined, null, 0, -1, NaN]) {
+      expect(msUntilNextInspect(
+        { nextInspectAt: null, lastInspectAt: NOW - HOUR, inspectIntervalMs: bad as number | null | undefined }, NOW,
+      ), `inspectIntervalMs=${String(bad)}`).toBe(23 * HOUR)
+    }
+  })
 })
 
 describe('relAgo：与顶栏新鲜度行同一套粒度', () => {

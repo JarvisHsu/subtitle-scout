@@ -190,7 +190,35 @@ describe('GET /api/v2/health（Task ⑤）', () => {
     const { base } = await start()
     const { body } = await getHealth(base)
     expect(body.lastInspectAt).toBe(NOW)
+    // 未配 scan_interval_ms ⇒ clampInterval 回默认 24h（与改动前一致）
     expect(body.nextInspectAt).toBe(NOW + INSPECT_INTERVAL_MS)
+    expect(body.inspectIntervalMs).toBe(INSPECT_INTERVAL_MS)
+  })
+
+  // 🔴 P5（第 56 轮，2026-09-23）：nextInspectAt 必须按**实际生效的间隔**算。
+  // 生产实测：`settings.scan_interval_ms = 21600000`（6h）而这一行原先把 nextInspectAt
+  // 算成 lastInspectAt + 24h ⇒ 前端状态条的倒计时**长 4 倍**——把"再等 2 小时"说成
+  // "再等 8 小时"，正是用户问"它怎么还不动"时看到的那句。
+  it('🔴 配了 6h 的巡检间隔 → nextInspectAt 按 6h 算（不是 24h）', async () => {
+    db.prepare(`INSERT INTO meta (key, value) VALUES ('last_inspect_at', ?)`).run(String(NOW))
+    db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('scan_interval_ms', ?, ?)`)
+      .run(String(6 * 60 * 60 * 1000), NOW)
+    const { base } = await start()
+    const { body } = await getHealth(base)
+    expect(body.inspectIntervalMs, '间隔本身也要交出去，前端才能说清节奏').toBe(6 * 60 * 60 * 1000)
+    expect(body.nextInspectAt).toBe(NOW + 6 * 60 * 60 * 1000)
+    expect(body.nextInspectAt, '不许再是 24h').not.toBe(NOW + INSPECT_INTERVAL_MS)
+  })
+
+  it('🔴 越界的间隔照样被 clampInterval 钳（读侧与 daemon 同源，不各算一份）', async () => {
+    db.prepare(`INSERT INTO meta (key, value) VALUES ('last_inspect_at', ?)`).run(String(NOW))
+    // 10 天 > 上界 7 天 ⇒ 钳到 7 天（clampInterval 的既有口径）
+    db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('scan_interval_ms', ?, ?)`)
+      .run(String(10 * 24 * 60 * 60 * 1000), NOW)
+    const { base } = await start()
+    const { body } = await getHealth(base)
+    expect(body.inspectIntervalMs).toBe(7 * 24 * 60 * 60 * 1000)
+    expect(body.nextInspectAt).toBe(NOW + 7 * 24 * 60 * 60 * 1000)
   })
 
   it('lastInspectAt 脏值（非数字）→ null', async () => {
@@ -496,7 +524,7 @@ describe('GET /api/v2/health（Task ⑤）', () => {
     // 放在这里而不是别处，是因为回执那条路（`/library/inspect`）要求用户先点一次才看得见阶段，
     // 而"还在启动"恰恰是点之前就该知道的事。
     expect(Object.keys(body).sort()).toEqual(
-      ['currents', 'engineEnabled', 'lastInspectAt', 'nextInspectAt', 'roots', 'setupSatisfied', 'stalledJobs',
+      ['currents', 'engineEnabled', 'inspectIntervalMs', 'lastInspectAt', 'nextInspectAt', 'roots', 'setupSatisfied', 'stalledJobs',
        'startupPhase', 'unidentified', 'workPermitted'],
     )
     expect('queue' in body).toBe(false)

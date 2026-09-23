@@ -82,7 +82,7 @@ import { stepActionKey, stageOf } from './stepPhrase.js'
 // 前端只按当前 tab 取其中一条。事件流这侧只需要 laneOf（判 patrol / identify），
 // 不需要"事件 → tab"这层映射。
 // 函数本体保留在 workbenchRouting.ts（有测试、语义正确、导出可用），只是本页不 import 它。
-import { inspectFreshness, liveFreshness, relAgoLabel, relUntilLabel, msUntilNextInspect, workPermission, type LiveFreshness } from './inspectFreshness.js'
+import { inspectFreshness, liveFreshness, relAgoLabel, relUntilLabel, intervalLabel, msUntilNextInspect, workPermission, type LiveFreshness } from './inspectFreshness.js'
 import { RunCard, QueueCard, type WorkbenchCardFace } from './WorkbenchCards.js'
 // REQ-1c（2026-09-23）：事后可回看——最近一次字幕任务读 DB 出来的逐文件明细。
 import { LastRunCard } from './LastRunCard.js'
@@ -431,14 +431,20 @@ function StatusBar({
     inspectLine = `${t('wb_inspect_stale')}（${relAgoLabel(fresh.msSinceStart ?? 0, lang)}）`
   } else {
     const until = health ? msUntilNextInspect(health, now) : 0
+    // P5（2026-09-23）：把**实际生效的节奏**一并说出来。用户问"它怎么还不动"时，
+    // 光有倒计时不够——他得知道这台机器是"每 6 小时一次"，而不是"应该随时在跑"。
+    // 节奏取自 /health 的 inspectIntervalMs（后端按设置算好的那一份），前端不再手抄周期。
+    const cadence = health?.inspectIntervalMs
+      ? ` ${t('wb_inspect_every')}${intervalLabel(health.inspectIntervalMs, lang)}${t('wb_inspect_every_end')}`
+      : ''
     if (until <= 0) {
       inspectLine = lang === 'zh'
         ? `${t('wb_inspect_next')}${t('wb_inspect_soon')}`
         : `${t('wb_inspect_next')} ${t('wb_inspect_soon')}`
     } else {
       inspectLine = lang === 'zh'
-        ? `${t('wb_inspect_next')}${relUntilLabel(until, lang)}`
-        : `${t('wb_inspect_next')} ${relUntilLabel(until, lang)}`
+        ? `${t('wb_inspect_next')}${relUntilLabel(until, lang)}${cadence}`
+        : `${t('wb_inspect_next')} ${relUntilLabel(until, lang)}${cadence}`
     }
   }
 

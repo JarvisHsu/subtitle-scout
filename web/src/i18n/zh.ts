@@ -559,6 +559,11 @@ export const zh = {
   wb_inspect_stale: '自动检查好像没有在运行',
   wb_inspect_idle: '上次自动检查',
   wb_inspect_next: '下次自动检查',
+  /** P5（2026-09-23）：把**实际生效的巡检节奏**说出来。用户问"它怎么还不动"时，
+   *  单给一个倒计时不够——他得知道这台机器是"每 6 小时一次"而不是"随时会跑"。
+   *  用法：`t('wb_inspect_every') + 可读时长 + t('wb_inspect_every_end')`（t() 不插值）。 */
+  wb_inspect_every: '每',
+  wb_inspect_every_end: '检查一次',
   wb_inspect_soon: '即将开始',
   wb_inspect_run: '现在跑',
   wb_inspect_already: '已经在检查了',

@@ -504,8 +504,13 @@ export interface HealthDTO {
    *  而此刻**正在巡检中**。渲染成"上次巡检于 X 前"是在说一句半真的话。
    *  本 task 不消费它做任何判决（占位页不渲染时间），Task ⑨ 真要显示时必须先解决这条。 */
   lastInspectAt: number | null
-  /** 下次巡检预计时刻。`lastInspectAt` 为 null（冷启动）时为 null；否则 lastInspectAt + 24h。 */
+  /** 下次巡检预计时刻。`lastInspectAt` 为 null（冷启动）时为 null；
+   *  否则 `lastInspectAt + inspectIntervalMs`（**后端已按实际生效的间隔算好**）。 */
   nextInspectAt: number | null
+  /** P5（2026-09-23）：**实际生效的巡检间隔**（毫秒，来自设置里的 `scan_interval_ms`）。
+   *  🔴 前端此前自己写死 24h，而本机实际 6h ⇒ 倒计时**长 4 倍**（把"再等 2 小时"说成"再等 8 小时"）。
+   *  现在由后端给；缺席（老后端）时前端退回 24h 兜底。 */
+  inspectIntervalMs?: number | null
   /** **daemon 到底会不会干活**（= engineEnabled && setupSatisfied，后端同源计算）。
    *  这是回答"为什么什么都没发生"的那个字段。 */
   workPermitted: boolean

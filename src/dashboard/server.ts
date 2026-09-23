@@ -35,7 +35,11 @@ import { eventFrame, helloFrame, parseResumeToken, resolveReplayFrom } from '../
 // Task ⑤：GET /api/v2/health 的 `roots[].ok` 陈旧门以巡检周期为单位（见
 // ROOT_HEALTH_STALE_AFTER_MS 的论证——不在这里写死 48h）。**只引常量、不引 daemon 类**：
 // daemonV2 的模块图（48 个模块，已核）不含 dashboard/*，故无环。
-import { INSPECT_INTERVAL_MS } from '../v2/daemonV2.js'
+// `clampInterval`（P5）：把 settings.scan_interval_ms 解成生效间隔——与 daemon 的
+// `inspectEveryMs` 走**同一个函数**，杜绝"周期算两份"（本仓 D7/C30 的既有形态）。
+// `INSPECT_INTERVAL_MS` 仍用于 ROOT_HEALTH_STALE_AFTER_MS 这个 48h 陈旧门（那是"扫描"
+// 的容差，与用户可配的巡检节奏是两件事——不跟着一起漂）。
+import { INSPECT_INTERVAL_MS, clampInterval } from '../v2/daemonV2.js'
 import type { SubtitleFetchReceipt, SubtitleFetchTarget } from '../v2/subtitleScheduler.js'
 import { AuthService, AUTH_KEYS, safeStrEqual } from './auth.js'
 import {
@@ -261,8 +265,15 @@ export interface HealthRootDTO {
 /** GET /api/v2/health 的响应。 */
 export interface HealthDTO {
   lastInspectAt: number | null
-  /** 下次巡检预计时刻。`lastInspectAt` 为 null（冷启动）时为 null；否则 `lastInspectAt + INSPECT_INTERVAL_MS`。 */
+  /** 下次巡检预计时刻。`lastInspectAt` 为 null（冷启动）时为 null；
+   *  否则 `lastInspectAt + inspectIntervalMs`（**实际生效的间隔**，不再是那个 24h 常量——
+   *  见下方 `inspectIntervalMs` 与 nextInspectAt 赋值处的论证）。 */
   nextInspectAt: number | null
+  /** P5（2026-09-23）：**实际生效的巡检间隔**（毫秒），取自 `settings.scan_interval_ms`
+   *  经 `clampInterval` 防呆——与 daemon 的 `inspectEveryMs` 同源。
+   *  前端据此说"多久检查一次"并判"daemon 是不是没在跑"，**不许再手抄一份周期**
+   *  （此前 frontend 自己写死 24h，本机实际是 6h ⇒ 倒计时长 4 倍）。 */
+  inspectIntervalMs: number
   /**
    * **daemon 到底会不会干活**——判据与 daemon 的 `workPermitted` 逐字同源
    * （二者调用同一个 watchClients.workPermitted，不是两份实现）。
@@ -1165,12 +1176,29 @@ export function startDashboard(opts: DashboardOpts): Promise<Server> {
         // null，与"从没巡检过"撞车但过程不可见；显式判一次让两者走同一条诚实的 null。
         const lastInspectNum = inspectRow ? Number(inspectRow.value) : NaN
         const lastInspectAt = Number.isFinite(lastInspectNum) ? lastInspectNum : null
+        // P5：实际生效的巡检间隔。`clampInterval` 与 daemon 的 `inspectEveryMs` **同一个函数**，
+        // 输入也是同一个设置键 ⇒ 这里报出的节奏就是 daemon 据以开跑的节奏（不再有两份周期）。
+        const inspectIntervalMs = clampInterval(Number(settingsRepo.get('scan_interval_ms')))
         const rootRows = db
           .prepare('SELECT path, last_error, last_checked_at FROM media_roots ORDER BY path')
           .all() as Array<{ path: string; last_error: string | null; last_checked_at: number | null }>
         const body: HealthDTO = {
           lastInspectAt,
-          nextInspectAt: lastInspectAt === null ? null : lastInspectAt + INSPECT_INTERVAL_MS,
+          // 🔴 P5（第 56 轮，2026-09-23）：**用实际生效的巡检间隔**，不再用那个 24h 常量。
+          //
+          // 修的是什么（生产实测）：daemon 的闸取自 `settings.scan_interval_ms`
+          // （经 `clampInterval` 防呆），本机该键 = `21600000`（**6 小时**），daemon 日志也一直是
+          // `闸 360min`。而这一行原先把 `nextInspectAt` 算成 `lastInspectAt + INSPECT_INTERVAL_MS`
+          // （**24 小时**）⇒ 前端状态条的"下次自动检查还有多久"**长 4 倍**。
+          // 用户问的正是"它怎么还不动"——而我们给的是一个偏大的数字，等于把"再等 2 小时"
+          // 说成"再等 8 小时"。
+          //
+          // 判据只有一份：`clampInterval` 是 daemon 那条路**同一个**函数（空/NaN/0 回默认、
+          // 越界钳 [1h,7d]），故这里算出来的时刻与 daemon 真正据以开跑的时刻同源。
+          nextInspectAt: lastInspectAt === null ? null : lastInspectAt + inspectIntervalMs,
+          // 把间隔**本身**也交出去：前端才能说清"多久检查一次"（而不是自己再手抄一份周期，
+          // 那正是本次要消灭的第二份实现）。
+          inspectIntervalMs,
           // 三个布尔全部现取，且**判据只有一份**：workPermitted 就是 daemon 那个同名函数，
           // engineEnabled / setupSatisfied 是它的两个合取项各自单独摆出来（前端要能说出
           // 是"你把开关关了"还是"凭据没配好"——合成一个字段这两种就不可区分了）。

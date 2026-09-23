@@ -129,6 +129,22 @@ export function relAgoLabel(deltaMs: number, lang: Lang): string {
   return `${Math.floor(h / 24)} 天前`
 }
 
+/** 一个**周期长度**读成人话：`6 小时` / `30 分钟` / `1 天`。
+ *
+ *  P5（2026-09-23）新增：状态条要说"每 6 小时检查一次"，而那是**时长**不是倒计时——
+ *  拿 `relUntilLabel` 去拼会把"约"和"后"带进来（"约 6 小时后检查一次"），语义是错的。
+ *  单列一个函数比在调用处做字符串裁剪干净（也不必再写第三份时间格式）。 */
+export function intervalLabel(ms: number, lang: Lang): string {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  const en = lang !== 'zh'
+  if (s < 60) return en ? `${s}s` : `${s} 秒`
+  const m = Math.floor(s / 60)
+  if (m < 60) return en ? `${m}m` : `${m} 分钟`
+  const h = Math.floor(m / 60)
+  if (h < 24) return en ? `${h}h` : `${h} 小时`
+  return en ? `${Math.floor(h / 24)}d` : `${Math.floor(h / 24)} 天`
+}
+
 /** 相对时间的「后」方向（倒计时）。粒度同 relAgoLabel；delta<=0 返回空串，
  *  「即将开始」由 StatusBar 用 `wb_inspect_soon`，避免两处各写一句。 */
 export function relUntilLabel(deltaMs: number, lang: Lang): string {
@@ -143,15 +159,22 @@ export function relUntilLabel(deltaMs: number, lang: Lang): string {
   return `约 ${Math.floor(h / 24)} 天后`
 }
 
-/** 距下次自动检查还有多久。优先后端 `nextInspectAt`；缺席时才回落 lastInspectAt + 周期
- *  （那份 24h 已经在本文件，不在 ActivityPage 再抄第三份）。 */
+/** 距下次自动检查还有多久。优先后端 `nextInspectAt`（**后端已按实际生效的间隔算好**，
+ *  P5/2026-09-23）；缺席时才回落到 `lastInspectAt + 后端报来的间隔`。
+ *
+ *  🔴 P5：本文件曾写死 24h 当周期，而本机实际是 **6h** ⇒ 状态条的倒计时**长 4 倍**
+ *  （把"再等 2 小时"说成"再等 8 小时"，正是用户问"它怎么还不动"时看到的那句）。
+ *  现在周期由 `/health` 的 `inspectIntervalMs` 给；这里的 24h 只作为**老后端**的兜底。 */
 export function msUntilNextInspect(
-  health: { nextInspectAt?: number | null; lastInspectAt: number | null },
+  health: { nextInspectAt?: number | null; lastInspectAt: number | null; inspectIntervalMs?: number | null },
   now: number,
 ): number {
+  const interval = typeof health.inspectIntervalMs === 'number' && Number.isFinite(health.inspectIntervalMs) && health.inspectIntervalMs > 0
+    ? health.inspectIntervalMs
+    : INSPECT_INTERVAL_MS
   const due = health.nextInspectAt != null
     ? health.nextInspectAt
-    : (health.lastInspectAt !== null ? health.lastInspectAt + INSPECT_INTERVAL_MS : now)
+    : (health.lastInspectAt !== null ? health.lastInspectAt + interval : now)
   return Math.max(0, due - now)
 }
 
