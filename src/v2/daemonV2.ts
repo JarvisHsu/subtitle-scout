@@ -1152,7 +1152,7 @@ export class ScoutDaemonV2 {
       // ⚠️ 基线路径**也要**报超预算（第 46 轮的洞：它提前 return，所以那次 102 秒没有任何告警）
       this.deps.log(
         `库变更探测: 建立基线（深度 ${maxDepth}，${sig.size} 个目录，用时 ${Math.round(dur0 / 1000)}s` +
-        `${dur0 > PROBE_WARN_MS ? ' ⚠️ 超预算' : ''}）`,
+        `${dur0 > 10_000 ? ' ⚠️ 超预算' : ''}）`,
       )
       return []
     }
