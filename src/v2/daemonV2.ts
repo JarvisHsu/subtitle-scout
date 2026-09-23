@@ -481,9 +481,13 @@ export class ScoutDaemonV2 {
    *  requestInspect 靠它返回 already_running，而不是再排队第二轮。 */
   private inspecting = false
 
-  /** P1（2026-09-20）：上一次**媒体根变更探测**的名字级指纹（`目录 → 排序后名字串`）。
-   *  `null` = 还没建基线（启动后第一次探测只建基线、不当成"变化"，否则一启动就白踢一脚扫描）。 */
+  /** P1（2026-09-20，第 48 轮改两档）：媒体根变更探测的名字级指纹（键=`d<深度>:<目录>`）。
+   *  `null` = 还没建基线（第一次探测只建基线、不当成"变化"，否则一启动就白踢一脚扫描）。
+   *  两种深度**各存一套**（键前缀区分）：混在一张表里会互相制造假变化。 */
   private rootProbeSig: Map<string, string> | null = null
+  /** 上次**深探测**的时刻。实测（第 46 轮）：深探测 127 个目录在冷缓存下要 **102 秒**，
+   *  绝不能每拍做 ⇒ 拆成「每拍浅探测（根一级，约 2 次 readdir）+ 每 30 分钟深探测（≤3 层）」。 */
+  private rootProbeDeepAt = 0
 
   /** 按需取字幕的待办（openspec 第 12 组）。**只有主循环取件**：HTTP 线程在
    *  `requestSubtitleFetch` 里只 push + 叫醒 idle，绝不 await 跑流水线
@@ -932,9 +936,18 @@ export class ScoutDaemonV2 {
         // 而那一环会抛（既有用例 `rootsProvider 抛错后 inspecting 必须回落` 就靠这个）。
         // 探测只是增益，绝不许把主循环带走——与 boot 段每一步的隔离口径一致。
         try {
-          const changed = this.probeRootsChanged()
+          // 两档（第 48 轮）：**每拍浅探测**（只看根一级 ≈2 次 readdir，亚秒级 ⇒ 新加整部片
+          // 5 分钟内就动）；**每 30 分钟深探测**（≤3 层，127 个目录 ⇒ 覆盖"给老剧加一集"，
+          // 实测冷缓存 102 秒，绝不能每拍做）。
+          const deep = Date.now() - this.rootProbeDeepAt > 30 * 60 * 1000
+          const changed = this.probeRootsChanged(0)
+          if (deep) {
+            this.rootProbeDeepAt = Date.now()
+            changed.push(...this.probeRootsChanged(2))
+          }
           if (changed.length > 0) {
-            this.deps.log(`库变更探测: ${changed.length} 处变化（如 ${changed.slice(0, 3).join('、')}）→ 踢一脚扫描`)
+            const sample = [...new Set(changed)].slice(0, 3).join('、')
+            this.deps.log(`库变更探测: ${changed.length} 处变化（如 ${sample}）→ 踢一脚扫描`)
             this.requestScan()
           }
         } catch (e) {
@@ -1106,7 +1119,7 @@ export class ScoutDaemonV2 {
    *  预算取 20s：超了就说明这一拍太重，该降深度或降频（先量再调，不猜）。
    *
    *  返回**变化了的路径**（供日志说清"哪里变了"）。首次运行只建基线、不算变化。 */
-  private probeRootsChanged(): string[] {
+  private probeRootsChanged(maxDepth: number): string[] {
     const startedAt = Date.now()
     const sig = new Map<string, string>()
     const listNames = (d: string): string[] => {
@@ -1120,30 +1133,40 @@ export class ScoutDaemonV2 {
       } catch {
         return // 读不出来（权限/抖动）→ 这一支跳过，不让一个坏目录中断探测
       }
-      sig.set(dir, names.join('|'))
+      sig.set(`d${maxDepth}:${dir}`, names.join('|'))
       if (depth <= 0) return
       for (const name of names) {
         if (name.startsWith('.')) continue // 点前缀：沙盒/工具目录，不进
         walk(join(dir, name), depth - 1)
       }
     }
-    for (const root of this.writableRoots()) walk(root, 2)
+    for (const root of this.writableRoots()) walk(root, maxDepth)
 
+    // 合并而不是替换：两种深度共用一张表，替换会让另一种深度的键全部消失 ⇒ 下一次探测全判"变化"。
     const prev = this.rootProbeSig
-    this.rootProbeSig = sig
+    const next = prev === null ? new Map<string, string>() : new Map(prev)
+    for (const [k, v] of sig) next.set(k, v)
+    this.rootProbeSig = next
+    const dur0 = Date.now() - startedAt
     if (prev === null) {
-      this.deps.log(`库变更探测: 建立基线（${sig.size} 个目录；用时 ${Math.round((Date.now() - startedAt) / 1000)}s）`)
+      // ⚠️ 基线路径**也要**报超预算（第 46 轮的洞：它提前 return，所以那次 102 秒没有任何告警）
+      this.deps.log(
+        `库变更探测: 建立基线（深度 ${maxDepth}，${sig.size} 个目录，用时 ${Math.round(dur0 / 1000)}s` +
+        `${dur0 > PROBE_WARN_MS ? ' ⚠️ 超预算' : ''}）`,
+      )
       return []
     }
     const changed: string[] = []
-    for (const [dir, s] of sig) if (prev.get(dir) !== s) changed.push(dir)
-    for (const dir of prev.keys()) if (!sig.has(dir)) changed.push(dir) // 目录被删了也算变化
-    const dur = Date.now() - startedAt
-    // 预算 20s：超过就说明这一拍太重（该降深度或降频）。**先量再调**，不猜。
-    if (dur > 20_000) {
+    if (prev !== null) {
+      for (const [k, s] of sig) if (prev.get(k) !== s) changed.push(k.slice(k.indexOf(':') + 1))
+      // 本次深度内被删掉的目录也算变化（只比本深度的键，别把另一种深度的键当"被删"）
+      const prefix = `d${maxDepth}:`
+      for (const k of prev.keys()) if (k.startsWith(prefix) && !sig.has(k)) changed.push(k.slice(k.indexOf(':') + 1))
+    }
+    if (dur0 > 10_000) {
       this.deps.log(
-        `⚠️ 库变更探测用时 ${Math.round(dur / 1000)}s（预算 20s，${sig.size} 个目录）` +
-        `——抽样降深度或降频的时机到了`,
+        `⚠️ 库变更探测用时 ${Math.round(dur0 / 1000)}s（深度 ${maxDepth}，${sig.size} 个目录，预算 10s）` +
+        `——该降深度或降频了`,
       )
     }
     return changed
