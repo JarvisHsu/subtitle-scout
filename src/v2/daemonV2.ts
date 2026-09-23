@@ -2486,9 +2486,16 @@ export class ScoutDaemonV2 {
     // 🔴 #19：扫描收尾**无条件**打一行。（原来只有下面那条，而它挂在 `upserted > 0` 下面——
     // 没有任何新增/变化时**扫描全程一行日志都没有**，"扫完了没事"与"卡住了"在日志上完全同形。
     // 这就是那个 ≥14 分钟黑箱的另一半。）
+    // 🔴 P7（第 58 轮，2026-09-23）：这两个数原来被**混为一谈**——收尾那行写的是
+    // 「跳过的根 ${skipped} 个」，而 `skipped` 实际来自 `skipped += files.length - entries.length`
+    // = **本轮没在盘上找到的条目数**，与"根"毫无关系。两个数各有各的用处，故分开报：
+    //   · `skippedRoots.length` —— 整轮停摆的**根**数（R8 两道闸 + D20 嵌套），真·按根计；
+    //   · `skipped`             —— 库里在、盘上没找到的**条目**数（C47 那道比例闸的分子）。
+    // 用户在日志里问的是"我这几个目录它扫了吗"，那是**根**；条目数是排障读数。
     this.deps.log(
       `扫描结束：用时 ${Math.round((Date.now() - scanStartedAt) / 1000)}s，` +
-      `扫到 ${scanned} 个文件，入库/更新 ${upserted} 行，跳过的根 ${skipped} 个`,
+      `扫到 ${scanned} 个文件，入库/更新 ${upserted} 行，` +
+      `跳过的根 ${skippedRoots.length} 个，本轮没找到的条目 ${skipped} 条`,
     )
     if (upserted > 0) {
       this.deps.log(`scan: scanned=${scanned} upserted=${upserted} skipped=${skipped}`)

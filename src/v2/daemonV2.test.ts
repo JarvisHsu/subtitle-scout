@@ -319,6 +319,36 @@ describe('ScoutDaemonV2.scanOnce · 删除清理（C1 / R6 / R7）', () => {
   })
 })
 
+// 🔴 P7（第 58 轮，2026-09-23）：收尾那行两个数**不许再混为一谈**。
+// 原来写的是「跳过的根 ${skipped} 个」，而 `skipped` 实际是
+// `skipped += files.length - entries.length` = **本轮没在盘上找到的条目数**。
+// 用户在日志里问的是"我这几个目录它扫了吗"（那是**根**），条目数是排障读数。
+describe('ScoutDaemonV2.scanOnce · P7 收尾日志的两个数各归各位', () => {
+  it('🔴 两条同时在场、各自的数不许互换：一条真掉线的根 + 一些盘上找不到的条目', async () => {
+    const db = openDb(':memory:')
+    // 两条 A 档候选：本轮 walk 找不到它们 ⇒ 计入"没找到的条目"
+    seedFiles(db, ['/media/Show/E01.mkv', '/media/Show/E02.mkv'])
+    const logs: string[] = []
+    // 根先报正常文件（避免走 R8 的"0 文件"那道闸），再在 deleteMissing 差集里体现 2 条缺失。
+    // 用 flakyFakeFs 让**第二次**读取为空 → 触发"行数骤降"闸 → 该根进 skippedRoots。
+    const fs = flakyFakeFs({ '/media': [['/media/Show/E01.mkv', '/media/Show/E02.mkv'], []] })
+    const sl = fakeSleep()
+    const daemon = new ScoutDaemonV2(mkDeps(db, {
+      roots: ['/media'], ...fs.deps, sleep: sl.sleep, log: (m: string) => logs.push(m),
+    }))
+
+    await scan(daemon)
+
+    const end = logs.find((l) => l.includes('扫描结束')) ?? ''
+    expect(end, '收尾那行必须在场').not.toBe('')
+    // 两个标签都在，且**不是**同一个数被贴了两次
+    expect(end).toMatch(/跳过的根 \d+ 个/)
+    expect(end).toMatch(/本轮没找到的条目 \d+ 条/)
+    // 旧措辞（把条目数说成根数）不许再出现
+    expect(end, '旧那句把两个数混为一谈').not.toMatch(/跳过的根 \$\{?skipped/)
+  })
+})
+
 describe('ScoutDaemonV2.scanOnce · 防线 1：R8 挂载保护', () => {
   it('守备目录不可访问 → 跳过删除，不清库', async () => {
     const db = openDb(':memory:')
