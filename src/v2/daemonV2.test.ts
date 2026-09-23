@@ -2057,6 +2057,121 @@ function recheckAtOf(db: ReturnType<typeof openDb>, path: string): number | null
   return (db.prepare('SELECT sub_recheck_at FROM files WHERE path = ?').get(path) as { sub_recheck_at: number | null }).sub_recheck_at
 }
 
+// ── P4（第 55 轮，2026-09-23）：编号重复字幕要**独立于 7 天观察窗**被清掉 ──────────────
+// 生产实测：全库 15 个 `(n)` 文件，其中 14 个与规范件逐字节相同（可清），mtime 是 4~5 天前，
+// 而它们所在行的 `sub_recheck_at` 还有 2~3 天才到点 ⇒ 清理挂在 observeSubtitle 里，
+// 于是**装盘之后才产生的重复品要等下一个 7 天窗**。
+describe('ScoutDaemonV2.scanOnce · P4 编号重复字幕的独立清扫（摆脱 7 天观察窗）', () => {
+  const V = '/media/Show/E01.mkv'      // 已 covered、7 天窗未到点（重复品就挂在它旁边）
+  const V2 = '/media/Show/E02.mkv'     // 本轮新增（A 档）→ 它的观察会把这个目录读进缓存
+  const SUB = '/media/Show/E01.zh-Hans.srt'
+
+  /** 扫描的磁盘替身：列出两个视频 + 目录清单（目录清单是清扫的"零新 IO"门）。 */
+  function diskDeps(entries: string[]) {
+    const readdirCalls: string[] = []
+    return {
+      readdirCalls,
+      deps: {
+        ...fakeFs({ '/media': [V, V2] }),
+        readdir: (d: string) => { readdirCalls.push(d); return d === '/media/Show' ? entries : [] },
+      },
+    }
+  }
+  const ENTRIES = ['E01.mkv', 'E01.zh-Hans.srt', 'E02.mkv']
+
+  it('🔴 未到点的 covered 行：清扫照样跑到（这正是 7 天窗漏掉的那批）', async () => {
+    const db = openDb(':memory:')
+    // V 是"已 covered 且 sub_recheck_at 在未来"的那一行——生产里那 14 个的形态
+    seedRow(db, V, { sub_status: 'covered', sub_recheck_at: NOW + 5 * DAY })
+    const { deps } = diskDeps(ENTRIES)
+    const cleanup = vi.fn(() => [])
+    const daemon = new ScoutDaemonV2(mkDeps(db, {
+      roots: ['/media'], ...deps, fileExists: () => true, cleanupDuplicates: cleanup,
+    }))
+
+    await scan(daemon)
+
+    expect(cleanup, '未到点也必须被清扫到——否则重复品要等下一个 7 天窗').toHaveBeenCalled()
+    // 传的是**规范件**路径 + 本次扫描已缓存的那份目录清单（复用，不另发 readdir）。
+    // ⚠️ 路径由 `node:path.join` 拼出 ⇒ Windows 上是反斜杠，断言时归一化。
+    const [passedPath, passedEntries] = cleanup.mock.calls[0]! as [string, string[]]
+    expect(passedPath.replace(/\\/g, '/')).toBe(SUB)
+    expect(passedEntries).toEqual(ENTRIES)
+    // 观察窗不被这次清扫推动（清扫不是观察）
+    expect(recheckAtOf(db, V)).toBe(NOW + 5 * DAY)
+    db.close()
+  })
+
+  it('🔴 零新 IO：清扫不给这个目录增加 readdir 次数', async () => {
+    // 建立基线：**同一形态但无重复候选**时这个目录被读几次
+    const base = openDb(':memory:')
+    seedRow(base, V, { sub_status: 'covered', sub_recheck_at: NOW + 5 * DAY })
+    const d0 = diskDeps(['E01.mkv', 'E02.mkv'])
+    await scan(new ScoutDaemonV2(mkDeps(base, {
+      roots: ['/media'], ...d0.deps, fileExists: () => true, cleanupDuplicates: vi.fn(() => []),
+    })))
+    const baseline = d0.readdirCalls.filter((d) => d === '/media/Show').length
+    base.close()
+
+    const db = openDb(':memory:')
+    seedRow(db, V, { sub_status: 'covered', sub_recheck_at: NOW + 5 * DAY })
+    const { deps, readdirCalls } = diskDeps(ENTRIES)   // 这一份**有** (n) 候选
+    await scan(new ScoutDaemonV2(mkDeps(db, {
+      roots: ['/media'], ...deps, fileExists: () => true, cleanupDuplicates: vi.fn(() => []),
+    })))
+    const withSweep = readdirCalls.filter((d) => d === '/media/Show').length
+
+    expect(withSweep, `清扫给目录增加了 readdir（${baseline} → ${withSweep}）`).toBe(baseline)
+    db.close()
+  })
+
+  it('🔴 目录本轮没被读到（不在缓存里）⇒ 不清扫，把成本留给既有通路', async () => {
+    const db = openDb(':memory:')
+    seedRow(db, V, { sub_status: 'covered', sub_recheck_at: NOW + 5 * DAY })
+    // V2 已在库 ⇒ 无 A 档新增 ⇒ 这个目录本轮不会被读（只有 V 一条路会，但它未到点）
+    seedRow(db, V2, { sub_status: 'covered', sub_recheck_at: NOW + 5 * DAY })
+    const { deps, readdirCalls } = diskDeps(ENTRIES)
+    const cleanup = vi.fn(() => [])
+    const daemon = new ScoutDaemonV2(mkDeps(db, {
+      roots: ['/media'], ...deps, fileExists: () => true, cleanupDuplicates: cleanup,
+    }))
+
+    await scan(daemon)
+
+    expect(readdirCalls.filter((d) => d === '/media/Show')).toHaveLength(0)
+    expect(cleanup, '目录不在缓存里就不该清扫').not.toHaveBeenCalled()
+    db.close()
+  })
+
+  it('非 covered 的行不参与清扫（只清"磁盘上确实有目标语言字幕"的那些）', async () => {
+    const db = openDb(':memory:')
+    seedRow(db, V, { sub_status: null, sub_recheck_at: NOW + 5 * DAY })
+    const { deps } = diskDeps(ENTRIES)
+    const cleanup = vi.fn(() => [])
+    const daemon = new ScoutDaemonV2(mkDeps(db, {
+      roots: ['/media'], ...deps, fileExists: () => true, cleanupDuplicates: cleanup,
+    }))
+
+    await scan(daemon)
+
+    expect(cleanup, 'V 不是 covered ⇒ 不该对它跑清扫').not.toHaveBeenCalled()
+    db.close()
+  })
+
+  it('🔴 cleanupDuplicates 抛错被隔离：不许掀翻扫描（扫描是本体，清理是增益）', async () => {
+    const db = openDb(':memory:')
+    seedRow(db, V, { sub_status: 'covered', sub_recheck_at: NOW + 5 * DAY })
+    const { deps } = diskDeps(ENTRIES)
+    const daemon = new ScoutDaemonV2(mkDeps(db, {
+      roots: ['/media'], ...deps, fileExists: () => true,
+      cleanupDuplicates: () => { throw new Error('FUSE 删除失败') },
+    }))
+
+    await expect(scan(daemon)).resolves.toBeUndefined()
+    db.close()
+  })
+})
+
 describe('ScoutDaemonV2.scanOnce · R24 字幕存在性观察（covered 是事实观察，不是流程结果）', () => {
   const V = '/media/Show/E01.mkv'
 

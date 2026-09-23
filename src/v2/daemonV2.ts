@@ -2638,6 +2638,61 @@ export class ScoutDaemonV2 {
       this.deps.log(`scan: 字幕存在性观察 A档=${aPaths.length} B档=${checked - aPaths.length}`
         + `${skipped > 0 ? ` 跳过=${skipped}（D23 挂载保护）` : ''}（R24 / D12）`)
     }
+
+    // ── P4（第 55 轮，2026-09-23）：编号重复字幕的**独立**清扫 ─────────────────────
+    // 修的是什么（生产实测）：清理挂在 `observeSubtitle` 里，而它只对"本轮被观察到的"
+    // 文件跑；观察窗口受 `sub_recheck_at`（观察完推 +7 天）约束 ⇒ **装盘之后才被后端
+    // 创建的重复品，要等下一个 7 天窗口才会被看见**。
+    //   · 全库抽样（83 个一级目录 + ≤4 层递归）找到 **15 个** `(n)` 文件；
+    //   · 其中 **14 个与规范件逐字节相同**（清理的判据成立），mtime 是 4~5 天前；
+    //   · 它们所在行的 `sub_recheck_at` 还有 **2~3 天**才到点 ⇒ 正是那扇 7 天窗。
+    //
+    // ── 为什么只碰**已缓存**的目录 ──────────────────────────────────────────────
+    // `dirCache` 是本次扫描这一趟的真源。只对已经在缓存里的目录跑，就一笔新 readdir 都不发
+    // （`cleanupNumberedDuplicates` 本身也是先按文件名筛、命中 `(n)` 候选才读内容）。
+    // 没被读到的目录留给 `observeSubtitle` 那条既有通路，**不新增探测**。
+    //
+    // ⚠️ 判据仍归 `cleanupNumberedDuplicates`（逐字节相同才删）——这里**不**重写一份
+    // "看起来像重复就删"的逻辑：生产里就有 1 个 `(n)` 文件与规范件**内容不同**
+    // （117384B vs 78305B），它是两份不同的字幕，**绝不能删**。
+    let dupRemoved = 0
+    try {
+      const covered = db.prepare(
+        `SELECT path, dir FROM files WHERE sub_status = 'covered' AND dir IS NOT NULL`
+      ).all() as Array<{ path: string; dir: string }>
+      const coveredByDir = new Map<string, string[]>()
+      for (const r of covered) {
+        if (!dirCache.has(r.dir)) continue          // ← 零新 IO 的那道门
+        const list = coveredByDir.get(r.dir)
+        if (list === undefined) coveredByDir.set(r.dir, [r.path])
+        else list.push(r.path)
+      }
+      const cleanup = this.deps.cleanupDuplicates ?? cleanupNumberedDuplicates
+      const targetValues = new Set(tagsForLanguage(this.deps.targetLanguage))
+      for (const [dir, videoPaths] of coveredByDir) {
+        const listing = dirCache.get(dir) ?? null
+        if (listing === null) continue               // 缓存里是"读不出来"（FUSE 抖动）→ 跳过
+        for (const videoPath of videoPaths) {
+          for (const name of listTargetSidecarNames(videoPath, listing, targetValues)) {
+            try {
+              const notes = cleanup(join(dirname(videoPath), name), listing)
+              if (!Array.isArray(notes)) continue
+              for (const n of notes as InstallCleanupNote[]) {
+                if (n.warning) this.deps.log(`scan: ${n.warning}`)
+                else { dupRemoved++; this.deps.log(`scan: 清理了编号重复字幕 ${n.removed}`) }
+              }
+            } catch (e) {
+              // 单文件失败隔离：FUSE 上删除失败是预期内的，不许掀翻整轮扫描。
+              this.deps.log(`scan: 编号重复字幕清理失败（隔离）: ${videoPath}: ${String(e)}`)
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // 清理是增益，绝不许反噬扫描本体（同本文件各运维器官的既有口径）。
+      this.deps.log(`scan: 编号重复字幕清扫失败（隔离，不影响状态判定）: ${String(e)}`)
+    }
+    if (dupRemoved > 0) this.deps.log(`scan: 本轮共清理 ${dupRemoved} 个编号重复字幕`)
   }
 
   /** 观察单个视频：磁盘上现在有没有同名中文字幕，据此写 sub_status（R24 的本体）。
