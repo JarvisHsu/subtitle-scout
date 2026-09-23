@@ -928,10 +928,17 @@ export class ScoutDaemonV2 {
       //   扫描 → `newlyAdded` → **抢跑一轮巡检**（第 24 轮）→ 识别 → 字幕。
       // 巡检正在跑时跳过（那时扫描本来就要发生）。
       if (!this.inspecting && !this.stopping) {
-        const changed = this.probeRootsChanged()
-        if (changed.length > 0) {
-          this.deps.log(`库变更探测: ${changed.length} 处变化（如 ${changed.slice(0, 3).join('、')}）→ 踢一脚扫描`)
-          this.requestScan()
+        // ⚠️ **必须隔离**：本探测要读 `writableRoots()`（→ `rootsProvider()`），
+        // 而那一环会抛（既有用例 `rootsProvider 抛错后 inspecting 必须回落` 就靠这个）。
+        // 探测只是增益，绝不许把主循环带走——与 boot 段每一步的隔离口径一致。
+        try {
+          const changed = this.probeRootsChanged()
+          if (changed.length > 0) {
+            this.deps.log(`库变更探测: ${changed.length} 处变化（如 ${changed.slice(0, 3).join('、')}）→ 踢一脚扫描`)
+            this.requestScan()
+          }
+        } catch (e) {
+          this.deps.log(`warn: 库变更探测失败（隔离，不阻塞主循环）: ${String(e)}`)
         }
       }
 
