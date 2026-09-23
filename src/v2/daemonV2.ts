@@ -1148,21 +1148,28 @@ export class ScoutDaemonV2 {
     for (const [k, v] of sig) next.set(k, v)
     this.rootProbeSig = next
     const dur0 = Date.now() - startedAt
-    if (prev === null) {
-      // ⚠️ 基线路径**也要**报超预算（第 46 轮的洞：它提前 return，所以那次 102 秒没有任何告警）
-      this.deps.log(
-        `库变更探测: 建立基线（深度 ${maxDepth}，${sig.size} 个目录，用时 ${Math.round(dur0 / 1000)}s` +
-        `${dur0 > 10_000 ? ' ⚠️ 超预算' : ''}）`,
-      )
+
+    // 🔴 基线必须**按深度**分别建（第 48 轮验收逮到：深度 2 的第一次探测落在深度 0 已建过表之后，
+    //    于是 `prev` 里一个 `d2:` 键都没有 ⇒ 127 个键全被判"变化"，打出 **126 处变化** 的假告警
+    //    并白踢一次扫描）。判据只看本深度的键：本深度一个基线都没有 ⇒ 这一趟只建基线、不报变化。
+    const prefix = `d${maxDepth}:`
+    const hadBaseline = prev !== null && [...prev.keys()].some((k) => k.startsWith(prefix))
+    if (!hadBaseline) {
+      // ⚠️ 基线段**也要**报超预算（第 46 轮的洞：它提前 return，所以那次 102 秒没有任何告警）；
+      //    但只报超预算，不报"建立基线"——否则每拍一次的浅探测会刷屏。
+      if (dur0 > 10_000) {
+        this.deps.log(
+          `⚠️ 库变更探测基线用时 ${Math.round(dur0 / 1000)}s（深度 ${maxDepth}，${sig.size} 个目录，预算 10s）` +
+          `——该降深度或降频了`,
+        )
+      }
       return []
     }
     const changed: string[] = []
-    if (prev !== null) {
-      for (const [k, s] of sig) if (prev.get(k) !== s) changed.push(k.slice(k.indexOf(':') + 1))
-      // 本次深度内被删掉的目录也算变化（只比本深度的键，别把另一种深度的键当"被删"）
-      const prefix = `d${maxDepth}:`
-      for (const k of prev.keys()) if (k.startsWith(prefix) && !sig.has(k)) changed.push(k.slice(k.indexOf(':') + 1))
-    }
+    // 只比**本深度**的键：另一种深度的键不归这一趟管（它的值与基线由它自己维护）。
+    for (const [k, s] of sig) if (prev!.get(k) !== s) changed.push(k.slice(k.indexOf(':') + 1))
+    // 本次深度内被删掉的目录也算变化（只比本深度的键，别把另一种深度的键当"被删"）
+    for (const k of prev!.keys()) if (k.startsWith(prefix) && !sig.has(k)) changed.push(k.slice(k.indexOf(':') + 1))
     if (dur0 > 10_000) {
       this.deps.log(
         `⚠️ 库变更探测用时 ${Math.round(dur0 / 1000)}s（深度 ${maxDepth}，${sig.size} 个目录，预算 10s）` +
