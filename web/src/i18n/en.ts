@@ -768,6 +768,25 @@ export const en = {
   //     并交代改名后下轮自动检查会重试。
   //  ③ 不出现 park / parked / work_id / TMDB / agent / 404 / 退避 这类实现词。
   unidentified_note: "Tried but still can't recognise these folders",
+  // ── subgap_* (2026-09-23): the user's words — "if no subtitle is found I have no way to know"
+  // and "I need to retry or translate right away". Only actionable language; never internal strings.
+  subgap_note: '{n} file(s) still have no subtitle',
+  subgap_retry_hint: 'click to make the system search again right now',
+  subgap_reason_source_silent: 'subtitle source did not answer (rate limit or nothing yet)',
+  subgap_reason_no_match: 'searched, no usable subtitle',
+  subgap_reason_timeout: 'last run timed out',
+  subgap_reason_awaiting_translate: 'waiting for the translate track',
+  subgap_reason_other: 'last attempt failed',
+  subgap_accepted: 'queued, starting now',
+  subgap_accepted_starting: 'received; starts once the engine is up',
+  subgap_already_running: 'already searching',
+  subgap_reject_covered: 'it actually already has one',
+  subgap_reject_no_need: 'this file does not need a subtitle',
+  subgap_reject_translate: 'it belongs to the translate track',
+  subgap_reject_not_judged: 'not judged yet, give it a moment',
+  subgap_reject_work_gone: 'that work is no longer in the library',
+  subgap_reject_no_files: 'that work has no video files',
+  subgap_retry_failed: "couldn't retry this time, try again later",
   // ── P6 (2026-09-23): say WHICH of two situations this is, instead of one generic line.
   // The old line ("a clearly recognisable name helps most; renaming retries next check") misleads:
   //   · exhausted — the agent already searched the folder name and its denoised variants; TMDB

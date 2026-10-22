@@ -23,6 +23,8 @@ import {
 import { buildMediaLibrary, buildMediaLibraryDetail } from './mediaLibraryApi.js'
 import { buildActivity } from './activityApi.js'
 import { buildUnidentifiedHealth, type UnidentifiedHealthDTO } from './unidentifiedHealth.js'
+// 用户那句"没找到字幕我完全没办法知道"的读出面（2026-09-23）。
+import { buildSubtitleGaps, type SubtitleGapsDTO } from './subtitleGapsHealth.js'
 import { bindUnidentifiedDir, unbindUnidentifiedDir } from './identifyBindApi.js'
 import { buildStalledJobs, type StalledJobsDTO } from './stalledJobsHealth.js'
 // R-F3：通知页列表的读函数。**复用**，不在 dashboard 层重写查询——一周窗与倒序都长在
@@ -307,6 +309,14 @@ export interface HealthDTO {
    * R-F1 的「不给用户改」禁的是**编辑**，本字段是纯读，且不带任何可操作端点。
    */
   unidentified: UnidentifiedHealthDTO
+  /**
+   * 「**哪些文件还没有字幕**」——用户点名的痛点：「如果没有找到字幕，我发现现在我完全没办法知道」。
+   *
+   * 只报"**试过但没有**"的行（`sub_attempt >= 1` 或已停牌），**不报**"还没排队"的行——
+   * 谓词与理由见 `subtitleGapsHealth.ts` 的头注释。每条带四档原因、下次重试时刻、
+   * 以及"能不能立即重试"（`handoff_translate` 归翻译台，故不可催）。
+   */
+  subtitleGaps: SubtitleGapsDTO
   /**
    * 「有几件活记着失败了，而且再也没人去重试」——`jobs` 里该被领走而没被领走的行。
    *
@@ -1211,6 +1221,9 @@ export function startDashboard(opts: DashboardOpts): Promise<Server> {
           // 「有几个目录我认不出来」（病 A 第 7 例的读出面）。谓词与 identifyScheduler 的
           // 取件谓词**刻意不同**（要含 404 终态那批永不重试的）——见 buildUnidentifiedHealth。
           unidentified: buildUnidentifiedHealth(db),
+          // 「哪些文件还没有字幕」。只报"试过但没有"的行（含已停牌的）——谓词与理由见
+          // subtitleGapsHealth.ts 头注释。这是用户那句"没找到字幕我完全没办法知道"的读出面。
+          subtitleGaps: buildSubtitleGaps(db),
           // 「该被重试却一直没动的活」（🔴-4）。谓词是 claimNext 取件谓词的**真子集**
           // （同两条状态 + 一道时间门），故队列一旦被接回 claim，这一段自动归零。
           stalledJobs: buildStalledJobs(db, Date.now()),

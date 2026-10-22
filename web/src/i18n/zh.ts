@@ -686,6 +686,28 @@ export const zh = {
   // 且实测案例目录本来就是 片名 (年份) 只是括号全角，照旧提示改无从改起。
   // 诚实版：格式只是"最有帮助"，并交代改名后下轮巡检会重试。
   unidentified_note: '这些目录试过了还是认不出来',
+  // ── subgap_*（2026-09-23）：用户原话「没找到字幕我完全没办法知道」「我需要立即重试或者翻译」。
+  // 纪律：**只说用户能据以行动的话**；内部串（sub:retry-later 之类）一个字都不许上屏。
+  subgap_note: '有 {n} 个文件还没有字幕',
+  subgap_retry_hint: '点这里让系统立刻再找一次',
+  // 四档原因。每一档的"下一步"都不同，故不能合成一句。
+  subgap_reason_source_silent: '字幕源没回应（限流或暂时没有）',
+  subgap_reason_no_match: '搜过了，没有可用字幕',
+  subgap_reason_timeout: '上次跑超时了',
+  subgap_reason_awaiting_translate: '等翻译台处理',
+  subgap_reason_other: '上次没成',
+  // 受理回执（三种，与「立即巡检」同一套口径；不许把 accepted 与 already_running 混为一谈）。
+  subgap_accepted: '已经排上了，马上开始',
+  subgap_accepted_starting: '已收到，引擎起来就开始',
+  subgap_already_running: '已经在找了',
+  // 被拒的理由（后端的 reason 枚举 → 一句人话；**不贴枚举原文**）。
+  subgap_reject_covered: '其实已经有了',
+  subgap_reject_no_need: '这个文件不需要字幕',
+  subgap_reject_translate: '它在翻译台那边',
+  subgap_reject_not_judged: '还没判定它需不需要，稍等',
+  subgap_reject_work_gone: '这部作品不在库里了',
+  subgap_reject_no_files: '这部作品下没有视频文件',
+  subgap_retry_failed: '这次没能重试，稍后再点',
   /** P6（2026-09-23）：**按"我们到底试到什么程度"分两档说**，不再用一句通用话。
    *  原来那句「目录名清晰可辨最有帮助；改名后下轮巡检会重试」对下列处境是**误导**：
    *   · exhausted —— agent 已搜过全名与去噪变体、TMDB 上确实没有：改名白费力气，

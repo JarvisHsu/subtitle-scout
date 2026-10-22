@@ -507,8 +507,35 @@ export interface UnidentifiedHealthDTO {
   dirs: UnidentifiedDirDTO[]
 }
 
-export interface HealthDTO {
-  /** ⚠️ 语义警告（Task ⑤ 审计 🟡-3，**后端未修**）：这个字段落的是巡检的**开始时刻**，
+/** 🔴 「**哪些文件还没有字幕**」（2026-09-23，用户原话：「如果没有找到字幕，
+ *  我发现现在我完全没办法知道」）。
+ *
+ *  口径：只含"**试过但没有**"的行（`sub_attempt >= 1` 或已停牌），**不含**"还没排队"的——
+ *  后者是正常等待，混进来会让人以为系统全挂了。
+ *
+ *  ⚠️ 渲染纪律同 UnidentifiedHealthDTO：`count === 0` 整段不渲染；
+ *  说"有几个"一律用 `count`，**绝不许拿 `files.length` 当总数**（它是截断的）。 */
+export interface SubtitleGapFileDTO {
+  workId: string
+  title: string | null
+  filename: string
+  season: number | null
+  episode: number | null
+  /** 四档原因，各对应一句不同的话（**不**把 `sub:retry-later` 这种内部串贴给用户）。 */
+  reason: 'source-silent' | 'no-match' | 'timeout' | 'awaiting-translate' | 'other'
+  attempt: number
+  /** 系统计划的下次重试时刻；null = 没排期（等巡检自然轮到）。 */
+  nextRetryAt: number | null
+  /** 能不能「立即重试」。`awaiting-translate` 那档**不能**（归翻译台，点了会被拒）。 */
+  retryable: boolean
+}
+
+export interface SubtitleGapsDTO {
+  count: number
+  files: SubtitleGapFileDTO[]
+}
+
+export interface HealthDTO {  /** ⚠️ 语义警告（Task ⑤ 审计 🟡-3，**后端未修**）：这个字段落的是巡检的**开始时刻**，
    *  不是完成时刻。大库实测能跑 10h → 04:00 开始 14:00 结束，13:00 读到的是"9 小时前"
    *  而此刻**正在巡检中**。渲染成"上次巡检于 X 前"是在说一句半真的话。
    *  本 task 不消费它做任何判决（占位页不渲染时间），Task ⑨ 真要显示时必须先解决这条。 */
@@ -532,6 +559,9 @@ export interface HealthDTO {
   /** 「有几个目录我认不出来」。R-F2 的「孤儿不露出」作用域是**媒体库海报墙**（不给卡片），
    *  不是"数量不许被知道"；R-F1 的「不给用户改」禁的是编辑。故这里只读、无任何动作入口。 */
   unidentified: UnidentifiedHealthDTO
+  /** 「哪些文件还没有字幕」——2026-09-23 用户点名要的读出面。只含"试过但没有"的行。
+   *  **可选**（老后端没有）：缺席 ⇒ 组件返回 null（不知道就不说话，不报"全都有字幕"）。 */
+  subtitleGaps?: SubtitleGapsDTO
   /** daemon **启动阶段**的当前步骤标识；已进主循环或后端未接线时为 null/缺席（提案 10.1/10.3）。
    *
    *  为什么在 /health 里而不是只靠点火回执：回执那条路要求用户**先点一次**才看得见阶段，

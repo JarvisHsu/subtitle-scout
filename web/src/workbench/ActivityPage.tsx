@@ -69,6 +69,8 @@ import { useT, type Lang } from '../i18n/useT.js'
 import { localizeError } from '../lib/errorText.js'
 import { RootHealthNote } from '../shell/RootHealthNote.js'
 import { UnidentifiedNote } from './UnidentifiedNote.js'
+// 「哪些文件还没有字幕」+ 立即重试（2026-09-23，用户点名要的）。
+import { SubtitleGapNote } from './SubtitleGapNote.js'
 import { StalledJobsNote } from './StalledJobsNote.js'
 import type { EventsStatus, ScoutEvent } from '../events/types.js'
 import type { ActivityQueueItemDTO, HealthDTO, ScoutCurrentDTO } from '../api/types.js'
@@ -534,6 +536,15 @@ function StatusBar({
           `onBound={reloadHealth}`：绑定成功后立刻重拉 `/health`，让那一行从名单里消失。
           **不靠 SSE 撞运气**——本仓病 A 就是"加了能力却没定谁触发"。 */}
       <UnidentifiedNote unidentified={health?.unidentified} onBound={reloadHealth} />
+
+      {/* 🔴 2026-09-23（用户原话）：「**如果没有找到字幕，我发现现在我完全没办法知道**」
+          「如果没有找到字幕，我需要**立即重试**或者进行翻译」。
+          紧挨上面那行是刻意的：那行说"引擎认不认得我的库"，这一行说
+          "**我库里还有哪些片子没有字幕、我能不能催它**"——同一个问题的下一个侧面。
+          每个可催的文件名是一个按钮（按**作品**粒度发起，走既有的按需取字幕入口）；
+          归翻译台的那些渲成纯文本 + 说明，**不画点了会被拒的按钮**。
+          count 为 0 时组件自己返回 null，全都有字幕时一个字都不占屏。 */}
+      <SubtitleGapNote gaps={health?.subtitleGaps} onRetried={reloadHealth} />
 
       {/* 🔴-4 记着失败、却再也没被重试的活。紧挨上面两行是刻意的：那两行说
           "引擎看不看得见 / 认不认得我的库"，这一行说"引擎记着有活没干完"——

@@ -531,7 +531,7 @@ describe('GET /api/v2/health（Task ⑤）', () => {
     // 而"还在启动"恰恰是点之前就该知道的事。
     expect(Object.keys(body).sort()).toEqual(
       ['currents', 'engineEnabled', 'inspectIntervalMs', 'lastInspectAt', 'nextInspectAt', 'roots', 'setupSatisfied', 'stalledJobs',
-       'startupPhase', 'unidentified', 'workPermitted'],
+       'startupPhase', 'subtitleGaps', 'unidentified', 'workPermitted'],
     )
     expect('queue' in body).toBe(false)
     // 未接线 `startupPhase` 依赖时是 **null**，不是缺席、也不编一个阶段名——
