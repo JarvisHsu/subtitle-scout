@@ -555,9 +555,13 @@ describe('runSubtitleWorkDir（死循环修复回写）', () => {
     expect(subAttemptOf(db, p)).toBe(7)
     expect(subStatusOf(db, p)).toBe('unsolvable')
     expect(retryStreakOf(db, p)).toBe(0)
-    // 停牌写 +7 天（供阶段 2.6 复查闸取件 / D13），不是失败轨的"明天"
+    // 🔴 R26（2026-10-23）**推翻 D13 在这一格上的旧口径**：旧断言是"停牌一律写 +7 天"。
+    // 现在静默（'unanswered'）导致的 `unsolvable` 停牌写 **+1 天**，因为静默对
+    // "字幕是否存在"零信息，把它排到下周等于把"源站今天没回答"当成"这片没有字幕"。
+    // 信息性失败（真有 no-match 结论）仍写 +7 天——见下一条用例，两条是同一枚硬币的两面。
     const row = db.prepare('SELECT recheck_after FROM files WHERE path = ?').get(p) as any
-    expect(row.recheck_after).toBeGreaterThan(Date.now() + 6.5 * 24 * 60 * 60 * 1000)
+    expect(row.recheck_after).toBeGreaterThan(Date.now() + 0.5 * 24 * 60 * 60 * 1000)
+    expect(row.recheck_after).toBeLessThan(Date.now() + 1.5 * 24 * 60 * 60 * 1000)
   })
 
   it('🔴 retry_later 的 last_error 仍带 sub: 前缀（跨轨串味防线不许因新分支丢掉）', async () => {
@@ -1007,6 +1011,34 @@ describe('R21/D15 移交分流（sub_attempt >= 7）', () => {
       expect(row.recheck_after).toBeGreaterThan(Date.now() + 6.5 * 24 * 60 * 60 * 1000)
       expect(row.recheck_after).toBeLessThan(Date.now() + 7.5 * 24 * 60 * 60 * 1000)
     }
+  })
+
+  it('🔴🔴 R26：静默导致的 unsolvable 停牌写 +1 天（源站明天就该再问一次）', async () => {
+    // 生产实证（本战役第 N-2 轮）：`Kakegurui Twin` ep07/ep08 的 last_error 是
+    // `sub:retry-later`（纯静默，源站没回答），sub_attempt 却被折算吃到 8 →
+    // 停在 unsolvable，recheck_after 落在 5～6 天后。源站第二天就能回答的活被排到了下周。
+    const p = item.files[0].path
+    db.prepare('UPDATE files SET sub_attempt = 6, translatable = 0, sub_retry_streak = ? WHERE path = ?')
+      .run(RETRY_LATER_STREAK_CAP - 1, p)
+    const rl = async () => ({ installed: [], no_safe_match: [], retry_later: [{ itemId: 'tmdb:95897/s1e1', reason: 'quota' }], hardsub_assumed: [] })
+    await runSubtitleWorkDir(db, rl as any, item, 'zh')
+    expect(subStatusOf(db, p)).toBe('unsolvable')
+    const row = db.prepare('SELECT recheck_after FROM files WHERE path = ?').get(p) as any
+    expect(row.recheck_after).toBeGreaterThan(Date.now() + 0.5 * 24 * 60 * 60 * 1000)
+    expect(row.recheck_after).toBeLessThan(Date.now() + 1.5 * 24 * 60 * 60 * 1000)
+  })
+
+  it('🔴🔴 R26 的边界：静默但落 handoff_translate → 仍写 +7 天（归翻译台，不许被日频打扰）', async () => {
+    // 这一格刻意不跟着改：handoff_translate 的节奏由翻译台自己的 tr_recheck_after 管，
+    // 把它的 recheck_after 也改成日频，等于让停牌复查闸每天去碰飞行中的翻译。
+    const p = item.files[0].path
+    db.prepare('UPDATE files SET sub_attempt = 6, translatable = 1, sub_retry_streak = ? WHERE path = ?')
+      .run(RETRY_LATER_STREAK_CAP - 1, p)
+    const rl = async () => ({ installed: [], no_safe_match: [], retry_later: [{ itemId: 'tmdb:95897/s1e1', reason: 'quota' }], hardsub_assumed: [] })
+    await runSubtitleWorkDir(db, rl as any, item, 'zh')
+    expect(subStatusOf(db, p)).toBe('handoff_translate')
+    const row = db.prepare('SELECT recheck_after FROM files WHERE path = ?').get(p) as any
+    expect(row.recheck_after).toBeGreaterThan(Date.now() + 6.5 * 24 * 60 * 60 * 1000)
   })
 
   it('🔴 同一簇里的两个文件按各自的 translatable 分流（不许整簇一刀切）', async () => {

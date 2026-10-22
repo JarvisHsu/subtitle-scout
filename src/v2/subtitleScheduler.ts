@@ -662,8 +662,22 @@ export async function runSubtitleWorkDir(
       const parked = translatable === 1 ? 'handoff_translate' : 'unsolvable'
       // recheck_after=+7天：供阶段 2.6 停牌复查闸取件（D13/R25「每周找一次」）。
       // 若照失败轨写"明天"，复查会退化成日频；不写则停在上一次失败的"明天"，同样日频。
+      //
+      // 🔴 R26（2026-10-23）例外：**静默导致的 `unsolvable` 停牌按天复查**，不按周。
+      // 论证：`'unanswered'`（源站限流/5xx/超时键被拒）对"字幕是否存在"**零信息**——
+      // 它唯一的作用是限流自保，不是判据。让静默也停满 7 天，等于把"源站今天没回答"
+      // 判成"这片确实没字幕，一周内别找了"，而这正是用户可见的最差体验。
+      // 生产实证（第 N-2 轮）：`Kakegurui Twin` ep07/ep08 的 `last_error` 是
+      // `sub:retry-later`（纯静默），`sub_attempt` 却被折算吃到 8 → 停在 `unsolvable`，
+      // `recheck_after` 落在 5～6 天后。源站第二天就能回答的活，被排到了下周。
+      // 范围刻意为最小：只改"静默 ∧ 落 unsolvable"这一格。`handoff_translate`
+      // （归翻译台，另有 `tr_recheck_after`）与信息性失败（真有 no-match 结论）都**不动**。
+      const parkedRecheck =
+        parked === 'unsolvable' && outcome === 'unanswered'
+          ? now + DAY_MS
+          : now + PARK_RECHECK_MS
       db.prepare('UPDATE files SET sub_attempt = ?, sub_retry_streak = ?, sub_status = ?, recheck_after = ?, last_error = ?, updated_at = ? WHERE path = ?')
-        .run(attempt, streak, parked, now + PARK_RECHECK_MS, tagged, now, f.path)
+        .run(attempt, streak, parked, parkedRecheck, tagged, now, f.path)
       return
     }
     // sub_status **一列不动**（保持 NULL）：R17 废止了第五态 `unavailable`——"搜过确实没有"
